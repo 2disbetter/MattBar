@@ -1,0 +1,123 @@
+#include "audio.hpp"
+#include "bar.hpp"
+
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstring>
+
+// One `pactl subscribe` for the process.
+
+AudioEvents& audio_events() {
+    static AudioEvents a;
+    return a;
+}
+
+int AudioEvents::subscribe(Bar& bar, Callback cb) {
+    bar_ = &bar;
+    if (fd_ < 0 && retry_fd_ < 0) start(bar);
+    subs_.push_back({next_id_, std::move(cb)});
+    return next_id_++;
+}
+
+void AudioEvents::unsubscribe(int id) {
+    for (auto it = subs_.begin(); it != subs_.end(); ++it)
+        if (it->id == id) {
+            subs_.erase(it);
+            break;
+        }
+    // Stream stays up with zero subscribers: sleeping pactl is free.
+}
+
+void AudioEvents::start(Bar& bar) {
+    int p[2];
+    if (pipe2(p, O_CLOEXEC) != 0) return;
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(p[1], 1);
+        close(p[0]);
+        execlp("pactl", "pactl", "subscribe", (char*)nullptr);
+        _exit(127);
+    }
+    close(p[1]);
+    if (pid < 0) {
+        close(p[0]);
+        return;
+    }
+    pid_ = pid;
+    fd_  = p[0];
+    fcntl(fd_, F_SETFL, O_NONBLOCK);
+
+    if (query_fd_ < 0) {
+        query_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        bar.add_fd(query_fd_, [this](uint32_t) {
+            uint64_t n;
+            while (read(query_fd_, &n, sizeof n) > 0) {}
+            bool sink = q_sink_, src = q_source_;
+            q_sink_ = q_source_ = false;
+            if (!sink && !src) return;
+            for (auto& s : subs_) s.cb(sink, src);
+        }, "audio-events");
+    }
+
+    bar.add_fd(fd_, [this](uint32_t ev) {
+        char    buf[512];
+        ssize_t n;
+        bool    hit = false;
+        while ((n = read(fd_, buf, sizeof buf - 1)) > 0) {
+            buf[n] = 0;
+            if (strstr(buf, "on sink #")) q_sink_ = hit = true;
+            if (strstr(buf, "on source #")) q_source_ = hit = true;
+        }
+        if (ev & (EPOLLHUP | EPOLLERR)) {
+            // pactl died (audio restart or missing).
+            stop();
+            schedule_restart();
+            return;
+        }
+        if (hit) {
+            attempts_ = 0; // working stream clears failure budget
+            // Debounce: one callback per burst (volume-key repeat / slider).
+            itimerspec ts{};
+            ts.it_value.tv_nsec = 60 * 1000000L;
+            timerfd_settime(query_fd_, 0, &ts, nullptr);
+        }
+    }, "pactl-sub");
+}
+
+void AudioEvents::stop() {
+    if (bar_ && fd_ >= 0) bar_->remove_fd(fd_);
+    if (fd_ >= 0) close(fd_);
+    fd_ = -1;
+    if (pid_ > 0) {
+        kill(pid_, SIGTERM);
+        waitpid(pid_, nullptr, WNOHANG); // reap; ECHILD fine if early
+        pid_ = -1;
+    }
+}
+
+void AudioEvents::schedule_restart() {
+    if (!bar_) return;
+    if (++attempts_ > 5) {
+        fprintf(stderr,
+                "mattbar: audio: event stream failed %d times; consumers "
+                "fall back to polling\n",
+                attempts_ - 1);
+        return; // available() stays false -> consumers poll
+    }
+    if (retry_fd_ < 0) {
+        retry_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        bar_->add_fd(retry_fd_, [this](uint32_t) {
+            uint64_t n;
+            while (read(retry_fd_, &n, sizeof n) > 0) {}
+            if (fd_ < 0) start(*bar_);
+        }, "audio-retry");
+    }
+    itimerspec ts{};
+    ts.it_value.tv_sec = 1 << (attempts_ < 5 ? attempts_ : 5); // 2..32 s
+    timerfd_settime(retry_fd_, 0, &ts, nullptr);
+}

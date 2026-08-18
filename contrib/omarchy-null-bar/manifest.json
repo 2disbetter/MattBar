@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "mattbar.null-bar",
+  "name": "No bar (MattBar)",
+  "version": "1.0.0",
+  "author": "MattBar",
+  "description": "Empty bar option: disables the built-in Omarchy bar so an external bar (e.g. MattBar) can take over, while the rest of the shell keeps running.",
+  "kinds": ["bar"],
+  "entryPoints": { "bar": "Bar.qml" }
+}

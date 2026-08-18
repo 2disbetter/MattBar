@@ -1,0 +1,35 @@
+# MattBar as supervised session infrastructure.
+#
+# Bar is notification daemon, tray host, and OSD. Crash/wedged loop costs
+# a sub-second flicker: sd_notify watchdog from epoll loop, Restart=always,
+# history/DND restored from $XDG_STATE_HOME/mattbar (~500ms max loss).
+#
+# Install: cp contrib/mattbar.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload
+#          systemctl --user enable --now mattbar
+# Hyprland: replace `exec-once = mattbar` with
+#           `exec-once = systemctl --user start mattbar`
+
+[Unit]
+Description=MattBar status bar
+Documentation=file:///usr/local/share/doc/mattbar/README.md
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/mattbar
+# always (not on-failure): bar must return from ANY exit (resume-thaw used
+# to exit 0 and stay down). Burst window tolerates post-resume churn.
+Restart=always
+RestartSec=500ms
+StartLimitIntervalSec=60
+StartLimitBurst=60
+# Watchdog: pings at WatchdogSec/3 from event loop. 30s covers suspend/
+# resume freeze (pre-suspend age + post-thaw). Silent that long => gone.
+WatchdogSec=30
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

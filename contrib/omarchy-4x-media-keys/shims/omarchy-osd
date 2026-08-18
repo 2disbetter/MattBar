@@ -1,0 +1,5 @@
+#!/bin/sh
+# No-op omarchy-osd. Prepended in PATH by media keybinds so Omarchy scripts
+# do the work (sink, debounce, DDC, mic LED) while MattBar draws the OSD.
+# Other omarchy-osd callers (caps lock, etc.) are unaffected.
+exit 0
