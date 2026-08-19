@@ -29,5 +29,5 @@ o.bind("SUPER + CTRL + comma", "Toggle do-not-disturb", "pkill -RTMIN+5 mattbar"
 o.bind("SUPER + ALT + comma", "Invoke last notification", "pkill -RTMIN+4 mattbar")
 ```
 
-There are a few more things that you can do if you want to go further in your dedication to MattBar use, but these are optional. The bar is pretty flexible. You can just hide the Quattro bar with Super + Shift + Space. You don't have to terminate it, etc. 
+Please note that the installation.md explains the additional things you need to for brightness and volume pop-ups. The bar is pretty flexible. You can just hide the Quattro bar with Super + Shift + Space. You don't have to terminate it, etc. 
 I just REALLY prefer a taskbar that auto hides, and doesn't constantly changes the size of my open application windows. 
