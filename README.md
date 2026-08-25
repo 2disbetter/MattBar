@@ -1,9 +1,10 @@
 # MattBar
-<img width="1600" height="720" alt="image" src="https://github.com/user-attachments/assets/79846e09-ef13-4e43-8f5d-b0cb0bd544ea" />
 **Ultra-efficient, configurable drop-in replacement for Waybar and the Omarchy 4 / Quattro Quickshell bar.**
 
+<img width="1600" height="720" alt="image" src="https://github.com/user-attachments/assets/79846e09-ef13-4e43-8f5d-b0cb0bd544ea" />
+
 Written in C++ against raw `wayland-client` + Cairo — no GTK, no Qt.  
-~19–20 MB RSS, essentially zero CPU when idle/hidden, fully event-driven.
+~19–42 MB RSS, essentially zero CPU when idle/hidden, fully event-driven.
 
 MattBar lives on the layer-shell **overlay** layer with a **zero exclusive zone**, so windows never shrink or reflow. It auto-hides to a thin hot strip and reveals over your windows when you touch the edge (optional dwell delay + pin module). It docks to any edge (top/bottom/left/right), supports multi-monitor and HiDPI natively, and can optionally take over the entire Omarchy 4 Quickshell host (panels, menu, lock, polkit, wallpaper, idle) — see [SHELL.md](SHELL.md).
 
