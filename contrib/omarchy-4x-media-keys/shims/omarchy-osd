@@ -1,5 +1,8 @@
 #!/bin/sh
-# No-op omarchy-osd. Prepended in PATH by media keybinds so Omarchy scripts
-# do the work (sink, debounce, DDC, mic LED) while MattBar draws the OSD.
-# Other omarchy-osd callers (caps lock, etc.) are unaffected.
+# No-op omarchy-osd. Placed first in PATH by the keybinds in
+# mattbar-media-keys.lua so Omarchy's own media scripts do all the work
+# (sink resolution, debounce, DDC brightness, mic LED) while MattBar
+# draws the only on-screen display. Everything else that calls
+# omarchy-osd (caps lock, screen recording, ...) is unaffected because
+# the shim is only prepended for these specific bindings.
 exit 0

@@ -1,13 +1,30 @@
 -- MattBar media keys for Omarchy 4 ("Quattro").
 --
--- Quattro draws OSD via Quickshell only on explicit `omarchy-osd` call.
--- Suppress with no-op shim first in PATH for these bindings; keep Omarchy
--- scripts (sink resolution, debounce, DDC/Apple brightness, mic LED).
--- Brightness has native --no-osd. MattBar OSD is event-driven.
+-- Quattro replaced swayosd: the overlay is now drawn by the Quickshell
+-- shell, but only when a media script explicitly calls `omarchy-osd`
+-- (the OSD panel is IPC-triggered - it does not watch PipeWire or the
+-- backlight itself). That makes suppression clean: keep Omarchy's
+-- scripts, which carry real logic worth keeping (physical-sink
+-- resolution through DSP chains, mute-toggle debounce, DDC and Apple
+-- external-display brightness, the hardware mic-mute LED), and just
+-- null the one `omarchy-osd` call by putting a no-op shim first in
+-- PATH for these bindings only. Brightness doesn't even need the shim:
+-- the script grew a native --no-osd flag.
 --
--- Setup: mkdir -p ~/.config/mattbar/shims; cp shims/omarchy-osd there;
--- chmod +x. Paste into ~/.config/hypr/bindings.lua (after defaults),
--- reload. From 3.x: also remove old source=mattbar-media-keys.conf.
+-- MattBar's OSD is event-driven (PipeWire events + backlight uevents),
+-- so it reacts to the resulting change no matter what caused it.
+--
+-- One-time setup:
+--   mkdir -p ~/.config/mattbar/shims
+--   cp shims/omarchy-osd ~/.config/mattbar/shims/
+--   chmod +x ~/.config/mattbar/shims/omarchy-osd
+--
+-- Then paste this whole block into ~/.config/hypr/bindings.lua (it is
+-- loaded after the Omarchy defaults) and reload Hyprland. If you are
+-- upgrading from the 3.x drop-in, also delete the old
+-- `source = ...mattbar-media-keys.conf` line / file - Quattro's config
+-- is Lua now and the old hyprlang unbinds no longer apply, which is
+-- why the stock overlays came back after the upgrade.
 
 local no_osd = 'env PATH="' .. os.getenv("HOME")
     .. '/.config/mattbar/shims:$PATH" '
@@ -35,14 +52,17 @@ o.bind("ALT + XF86AudioLowerVolume", "Volume down precise",
   { locked = true, repeating = true })
 
 -- --- microphone -----------------------------------------------------------
--- Shim keeps hardware mic-mute LED (Quattro script drives it pre-OSD).
+-- The shim keeps the hardware mic-mute LED working (the 3.x drop-in had
+-- to trade the LED away; Quattro's script drives it before the OSD call).
 hl.unbind("XF86AudioMicMute")
 o.bind("XF86AudioMicMute", "Mute microphone",
   no_osd .. "omarchy-audio-input-mute", { locked = true })
 
 -- --- display brightness ---------------------------------------------------
--- Native --no-osd; keeps Omarchy stepping/DDC/Apple support. External DDC
--- monitors lack kernel backlight so MattBar shows no OSD (change still applies).
+-- Native --no-osd flag; keeps Omarchy's non-uniform stepping and DDC /
+-- Apple external-display support. Note: on external DDC monitors there
+-- is no kernel backlight device, so MattBar (which watches backlight
+-- uevents) shows no OSD for them - the change still applies silently.
 hl.unbind("XF86MonBrightnessUp")
 hl.unbind("XF86MonBrightnessDown")
 hl.unbind("SHIFT + XF86MonBrightnessUp")
@@ -69,8 +89,11 @@ o.bind("ALT + XF86MonBrightnessDown", "Brightness down precise",
   { locked = true, repeating = true })
 
 -- --- media transport (optional) --------------------------------------------
--- Quattro transport uses `omarchy-shell media ...` (popup inside shell,
--- shim can't intercept). Uncomment for plain playerctl (MattBar uses MPRIS):
+-- Quattro's transport keys go through `omarchy-shell media ...`, whose
+-- track-title popup is summoned *inside* the shell, not via omarchy-osd,
+-- so the shim can't intercept it. If you want those popups gone too,
+-- uncomment this block to use plain playerctl (MattBar's media module
+-- reflects state via MPRIS either way):
 --
 -- hl.unbind("XF86AudioNext")
 -- hl.unbind("XF86AudioPrev")

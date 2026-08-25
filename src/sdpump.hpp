@@ -8,7 +8,12 @@
 #include <cstring>
 #include <functional>
 
-// --------------------------------------------------------------------------- Shared sd-bus pump for event-driven bus modules (bluetooth: system bus, media: session bus).
+// ---------------------------------------------------------------------------
+// Shared sd-bus pump for event-driven bus modules (bluetooth: system bus,
+// media: session bus). Same contract the tray fought for: drain, poll with
+// exactly the events sd-bus wants, arm its absolute-monotonic deadline via
+// timerfd, and a barren-wake watchdog that tears down rather than spin.
+// ---------------------------------------------------------------------------
 struct SdPump {
     sd_bus*  bus      = nullptr;
     int      fd       = -1;

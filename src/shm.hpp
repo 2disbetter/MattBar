@@ -22,6 +22,7 @@ inline const wl_buffer_listener shm_buffer_listener = {
     .release = shm_buffer_release};
 
 // Returns a buffer whose backing memory is written through *out_data.
+// The buffer frees itself when the compositor releases it.
 inline wl_buffer* create_argb_buffer(wl_shm* shm, int w, int h,
                                      void** out_data) {
     const int    stride = w * 4;

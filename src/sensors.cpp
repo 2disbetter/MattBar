@@ -14,14 +14,14 @@ static std::string hwmon_base() {
     return env && *env ? env : "/sys/class/hwmon";
 }
 
-// Map raw hwmon labels to short bar text.
+// Map raw hwmon labels to concise bar text.
 static std::string display_for(const std::string& name,
                                const std::string& label) {
     if (label == "Tctl" || label == "Tdie" || label.rfind("Package", 0) == 0 ||
         label == "CPU")
         return "CPU";
     if (label == "Composite" || label.rfind("temp", 0) == 0 || label.empty())
-        return name; // generic: chip name is better (nvme, acpitz)
+        return name; // generic label: the chip name says more (nvme, acpitz)
     return label;    // "Core 3", "edge", "junction", ...
 }
 

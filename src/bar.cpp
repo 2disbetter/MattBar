@@ -1,19 +1,31 @@
 #include "bar.hpp"
 #include <systemd/sd-daemon.h>
 #include "cursor-shape-v1-client-protocol.h"
+#include "ext-idle-notify-v1-client-protocol.h"
+#include "ext-session-lock-v1-client-protocol.h"
 #include "idle-inhibit-unstable-v1-client-protocol.h"
 #include "config.hpp"
 #include "omarchy_theme.hpp"
 #include "notify.hpp"
+#include "idle.hpp"
+#include "lock.hpp"
+#include "qs_plugins.hpp"
 #include "settings.hpp"
+#include "shell.hpp"
 #include "shm.hpp"
+#include "wallpaper.hpp"
+#include "util.hpp"
 
 #include <cairo/cairo.h>
 #include <linux/input-event-codes.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -33,7 +45,9 @@ void set_color(cairo_t* cr, const Color& c) {
 }
 } // namespace
 
-// --------------------------------------------------------------------------- Registry --------------------------------...
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
 void Bar::on_global(void* data, wl_registry* reg, uint32_t name,
                     const char* iface, uint32_t version) {
     auto* self = static_cast<Bar*>(data);
@@ -45,8 +59,18 @@ void Bar::on_global(void* data, wl_registry* reg, uint32_t name,
         self->shm_ = static_cast<wl_shm*>(
             wl_registry_bind(reg, name, &wl_shm_interface, 1));
     } else if (!strcmp(iface, zwlr_layer_shell_v1_interface.name)) {
+        uint32_t ver = version < 4 ? version : 4;
+        self->layer_shell_ver_ = ver;
         self->layer_shell_ = static_cast<zwlr_layer_shell_v1*>(
-            wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 1));
+            wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, ver));
+    } else if (!strcmp(iface, ext_idle_notifier_v1_interface.name)) {
+        uint32_t ver = version < 1 ? version : 1;
+        self->idle_notif_ = static_cast<ext_idle_notifier_v1*>(
+            wl_registry_bind(reg, name, &ext_idle_notifier_v1_interface, ver));
+    } else if (!strcmp(iface, ext_session_lock_manager_v1_interface.name)) {
+        self->lock_mgr_ = static_cast<ext_session_lock_manager_v1*>(
+            wl_registry_bind(reg, name, &ext_session_lock_manager_v1_interface,
+                             1));
     } else if (!strcmp(iface, zwp_idle_inhibit_manager_v1_interface.name)) {
         self->idle_mgr_ = static_cast<zwp_idle_inhibit_manager_v1*>(
             wl_registry_bind(reg, name, &zwp_idle_inhibit_manager_v1_interface,
@@ -81,9 +105,16 @@ void Bar::on_global(void* data, wl_registry* reg, uint32_t name,
             .geometry = [](void*, wl_output*, int32_t, int32_t, int32_t,
                            int32_t, int32_t, const char*, const char*,
                            int32_t) {},
-            .mode = [](void*, wl_output*, uint32_t, int32_t, int32_t,
-                       int32_t) {},
-            // done arrives after name, and again on every hotplug/mode change: the cue to reconcile our surfaces with the outputs.
+            .mode = [](void* data, wl_output*, uint32_t flags, int32_t w,
+                       int32_t h, int32_t) {
+                if (flags & WL_OUTPUT_MODE_CURRENT) {
+                    auto* bo = static_cast<BarOutput*>(data);
+                    bo->px_w = w;
+                    bo->px_h = h;
+                }
+            },
+            // done arrives after name, and again on every hotplug/mode
+            // change: the cue to reconcile our surfaces with the outputs.
             .done = [](void* data, wl_output*) {
                 auto* bo = static_cast<BarOutput*>(data);
                 if (bo->bar) bo->bar->outputs_dirty_ = true;
@@ -92,7 +123,8 @@ void Bar::on_global(void* data, wl_registry* reg, uint32_t name,
                 auto* bo = static_cast<BarOutput*>(data);
                 if (f >= 1 && f != bo->scale) {
                     bo->scale = f;
-                    // .done follows and flags outputs_dirty_, where the affected surfaces get their redraw at the new scale.
+                    // .done follows and flags outputs_dirty_, where the
+                    // affected surfaces get their redraw at the new scale.
                 }
             },
             .name = [](void* data, wl_output*, const char* n) {
@@ -114,7 +146,8 @@ void Bar::on_global(void* data, wl_registry* reg, uint32_t name,
     }
 }
 
-// A monitor was unplugged (or the compositor dropped the global).
+// A monitor was unplugged (or the compositor dropped the global). Tear down
+// the bar that lived on it before releasing the wl_output it references.
 void Bar::on_global_remove(void* data, wl_registry*, uint32_t name) {
     auto* self = static_cast<Bar*>(data);
     for (auto it = self->outputs_.begin(); it != self->outputs_.end(); ++it) {
@@ -141,7 +174,9 @@ void Bar::on_global_remove(void* data, wl_registry*, uint32_t name) {
     }
 }
 
-// --------------------------------------------------------------------------- Seat / pointer --------------------------...
+// ---------------------------------------------------------------------------
+// Seat / pointer
+// ---------------------------------------------------------------------------
 void Bar::on_seat_caps(void* data, wl_seat* seat, uint32_t caps) {
     auto* self = static_cast<Bar*>(data);
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !self->pointer_) {
@@ -164,7 +199,8 @@ void Bar::on_seat_caps(void* data, wl_seat* seat, uint32_t caps) {
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && self->pointer_) {
         wl_pointer_destroy(self->pointer_);
         self->pointer_ = nullptr;
-        // no pointer -> no leave event will ever arrive; don't let the bars stay revealed forever on stale state
+        // no pointer -> no leave event will ever arrive; don't let the bars
+        // stay revealed forever on stale state
         self->ptr_surface_ = nullptr;
         self->cur_         = nullptr;
         for (auto* bs : self->surfaces_) {
@@ -174,10 +210,159 @@ void Bar::on_seat_caps(void* data, wl_seat* seat, uint32_t caps) {
         }
         DBG("seat lost pointer capability");
     }
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !self->keyboard_) {
+        if (!self->xkb_ctx_)
+            self->xkb_ctx_ = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        self->keyboard_ = wl_seat_get_keyboard(seat);
+        static const wl_keyboard_listener kb_listener = {
+            .keymap      = on_kb_keymap,
+            .enter       = on_kb_enter,
+            .leave       = on_kb_leave,
+            .key         = on_kb_key,
+            .modifiers   = on_kb_mods,
+            .repeat_info = on_kb_repeat,
+        };
+        wl_keyboard_add_listener(self->keyboard_, &kb_listener, self);
+        if (self->kb_repeat_fd_ < 0) {
+            self->kb_repeat_fd_ =
+                timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+            if (self->kb_repeat_fd_ >= 0)
+                self->add_fd(
+                    self->kb_repeat_fd_,
+                    [self](uint32_t) {
+                        uint64_t n;
+                        while (read(self->kb_repeat_fd_, &n, sizeof n) > 0) {
+                        }
+                        if (self->kb_repeat_code_)
+                            self->deliver_key(self->kb_repeat_ev_);
+                    },
+                    "key-repeat");
+        }
+    } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && self->keyboard_) {
+        self->arm_key_repeat(false);
+        wl_keyboard_destroy(self->keyboard_);
+        self->keyboard_  = nullptr;
+        self->kb_surface_ = nullptr;
+    }
+}
+
+uint32_t Bar::popup_kb_mode() const {
+    return layer_shell_ver_ >= 4
+               ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND
+               : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE;
+}
+
+void Bar::on_kb_keymap(void* data, wl_keyboard*, uint32_t format, int32_t fd,
+                       uint32_t size) {
+    auto* self = static_cast<Bar*>(data);
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || fd < 0 ||
+        !self->xkb_ctx_) {
+        if (fd >= 0) close(fd);
+        return;
+    }
+    char* map = static_cast<char*>(
+        mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
+    close(fd);
+    if (map == MAP_FAILED) return;
+    xkb_keymap* km = xkb_keymap_new_from_string(
+        self->xkb_ctx_, map, XKB_KEYMAP_FORMAT_TEXT_V1,
+        XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(map, size);
+    if (!km) return;
+    xkb_state* st = xkb_state_new(km);
+    if (self->xkb_state_) xkb_state_unref(self->xkb_state_);
+    if (self->xkb_keymap_) xkb_keymap_unref(self->xkb_keymap_);
+    self->xkb_keymap_ = km;
+    self->xkb_state_  = st;
+}
+
+void Bar::on_kb_enter(void* data, wl_keyboard*, uint32_t, wl_surface* surf,
+                      wl_array*) {
+    static_cast<Bar*>(data)->kb_surface_ = surf;
+}
+
+void Bar::on_kb_leave(void* data, wl_keyboard*, uint32_t, wl_surface* surf) {
+    auto* self = static_cast<Bar*>(data);
+    if (self->kb_surface_ == surf) self->kb_surface_ = nullptr;
+    self->arm_key_repeat(false);
+}
+
+void Bar::on_kb_key(void* data, wl_keyboard*, uint32_t, uint32_t, uint32_t key,
+                    uint32_t state) {
+    auto* self = static_cast<Bar*>(data);
+    if (!self->xkb_state_) return;
+    const xkb_keycode_t code = key + 8;
+    const bool pressed = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+    xkb_state_update_key(self->xkb_state_, code,
+                         pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+    KeyEvent ev;
+    ev.keycode = code;
+    ev.keysym  = xkb_state_key_get_one_sym(self->xkb_state_, code);
+    ev.pressed = pressed;
+    char utf[16]{};
+    int  n = xkb_state_key_get_utf8(self->xkb_state_, code, utf, sizeof utf);
+    if (n > 0 && utf[0] >= 32) ev.utf8.assign(utf, n);
+    ev.mods = 0;
+    if (xkb_state_mod_name_is_active(self->xkb_state_, XKB_MOD_NAME_SHIFT,
+                                     XKB_STATE_MODS_EFFECTIVE) > 0)
+        ev.mods |= KEY_MOD_SHIFT;
+    if (xkb_state_mod_name_is_active(self->xkb_state_, XKB_MOD_NAME_CTRL,
+                                     XKB_STATE_MODS_EFFECTIVE) > 0)
+        ev.mods |= KEY_MOD_CTRL;
+    if (xkb_state_mod_name_is_active(self->xkb_state_, XKB_MOD_NAME_ALT,
+                                     XKB_STATE_MODS_EFFECTIVE) > 0)
+        ev.mods |= KEY_MOD_ALT;
+    if (xkb_state_mod_name_is_active(self->xkb_state_, XKB_MOD_NAME_LOGO,
+                                     XKB_STATE_MODS_EFFECTIVE) > 0)
+        ev.mods |= KEY_MOD_SUPER;
+    self->deliver_key(ev);
+    bool repeats = pressed && self->xkb_keymap_ &&
+                   xkb_keymap_key_repeats(self->xkb_keymap_, code);
+    self->kb_repeat_code_ = repeats ? code : 0;
+    self->kb_repeat_ev_   = ev;
+    self->kb_repeat_ev_.pressed = true;
+    self->arm_key_repeat(repeats);
+}
+
+void Bar::on_kb_mods(void* data, wl_keyboard*, uint32_t, uint32_t depressed,
+                     uint32_t latched, uint32_t locked, uint32_t group) {
+    auto* self = static_cast<Bar*>(data);
+    if (self->xkb_state_)
+        xkb_state_update_mask(self->xkb_state_, depressed, latched, locked, 0,
+                              0, group);
+}
+
+void Bar::on_kb_repeat(void* data, wl_keyboard*, int32_t rate, int32_t delay) {
+    auto* self = static_cast<Bar*>(data);
+    if (rate > 0) self->kb_repeat_rate_ = rate;
+    if (delay > 0) self->kb_repeat_delay_ = delay;
+}
+
+void Bar::deliver_key(const KeyEvent& ev) {
+    if (!kb_surface_) return;
+    auto it = extra_surfaces_.find(kb_surface_);
+    if (it != extra_surfaces_.end() && it->second.key) it->second.key(ev);
+}
+
+void Bar::arm_key_repeat(bool on) {
+    if (kb_repeat_fd_ < 0) return;
+    itimerspec ts{};
+    if (on && kb_repeat_rate_ > 0) {
+        ts.it_value.tv_sec  = kb_repeat_delay_ / 1000;
+        ts.it_value.tv_nsec = (kb_repeat_delay_ % 1000) * 1000000L;
+        long ns = 1000000000L / kb_repeat_rate_;
+        ts.it_interval.tv_sec  = ns / 1000000000L;
+        ts.it_interval.tv_nsec = ns % 1000000000L;
+    }
+    timerfd_settime(kb_repeat_fd_, 0, &ts, nullptr);
 }
 
 void Bar::set_cursor(wl_pointer* ptr, uint32_t serial) {
-    // Preferred path: hand the compositor a shape enum and let IT render the cursor.
+    // Preferred path: hand the compositor a shape enum and let IT render
+    // the cursor. Zero cursor pixels live in this process — the multi-MB
+    // wl_cursor theme pool below is never allocated on compositors with
+    // cursor-shape-v1 (Hyprland has it), and fractional scales come out
+    // right for free.
     if (cursor_shape_mgr_) {
         if (!cursor_shape_dev_)
             cursor_shape_dev_ = wp_cursor_shape_manager_v1_get_pointer(
@@ -188,6 +373,9 @@ void Bar::set_cursor(wl_pointer* ptr, uint32_t serial) {
         return;
     }
     // Fallback: classic client-side cursor from the theme.
+    // HiDPI: load the theme at 24 × the highest output scale so the cursor
+    // is crisp everywhere, and declare the buffer scale so mixed-DPI
+    // setups show it at the right SIZE on every monitor.
     int maxsc = 1;
     for (auto* o : outputs_) maxsc = std::max(maxsc, (int)o->scale);
     if (cursor_theme_ && cursor_scale_ != maxsc) {
@@ -235,7 +423,9 @@ void Bar::on_ptr_enter(void* data, wl_pointer* ptr, uint32_t serial,
         if (cfg.multi_monitor && cfg.reveal_all_monitors)
             for (auto* o : self->surfaces_) o->arm_hide(false);
         if (!bs->expanded) {
-            // Optional dwell requirement: the pointer must STAY in the hot zone for reveal_delay_ms before the bar shows, so brushi...
+            // Optional dwell requirement: the pointer must STAY in the hot
+            // zone for reveal_delay_ms before the bar shows, so brushing
+            // the screen edge doesn't misfire the reveal.
             if (cfg.reveal_delay_ms <= 0) {
                 bs->set_expanded(true);
                 if (cfg.multi_monitor && cfg.reveal_all_monitors)
@@ -323,7 +513,9 @@ void Bar::on_ptr_axis(void* data, wl_pointer*, uint32_t, uint32_t axis,
     }
 }
 
-// --------------------------------------------------------------------------- BarSurface — one bar on one output ------...
+// ---------------------------------------------------------------------------
+// BarSurface — one bar on one output
+// ---------------------------------------------------------------------------
 bool BarSurface::owner_vertical() const { return cfg_vertical(); }
 
 int BarSurface::hidden_thickness() const {
@@ -364,13 +556,16 @@ void BarSurface::on_configure(void* data, zwlr_layer_surface_v1* ls,
 }
 
 void BarSurface::on_closed(void* data, zwlr_layer_surface_v1*) {
-    // The compositor closed this one bar (output going away). Drop it, but keep the process alive for the other monitors.
+    // The compositor closed this one bar (output going away). Drop it, but
+    // keep the process alive for the other monitors.
     auto* bs = static_cast<BarSurface*>(data);
     if (bs->owner) bs->owner->outputs_dirty_ = true;
     bs->destroy();
 }
 
-// The scale to render at: the pinned output's, or — for a compositor-picked surface — whatever output the compositor put us on (learned from wl_surface.enter).
+// The scale to render at: the pinned output's, or — for a
+// compositor-picked surface — whatever output the compositor put us on
+// (learned from wl_surface.enter). set_buffer_scale needs wl_surface >= 3.
 int BarSurface::scale() const {
     if (!owner || !surf || wl_surface_get_version(surf) < 3) return 1;
     return owner->scale_of(out ? out : entered_out);
@@ -386,7 +581,8 @@ void BarSurface::create(Bar& b, wl_output* o, const std::string& n) {
             auto* bs = static_cast<BarSurface*>(data);
             if (bs->entered_out == wo) return;
             bs->entered_out = wo;
-            // A compositor-picked bar just learned (or changed) its output: repaint if that moves the scale.
+            // A compositor-picked bar just learned (or changed) its
+            // output: repaint if that moves the scale.
             if (!bs->out && bs->scale() != bs->drawn_scale) {
                 bs->hidden_frame_valid = false;
                 bs->dirty = true;
@@ -412,7 +608,8 @@ void BarSurface::create(Bar& b, wl_output* o, const std::string& n) {
     };
     zwlr_layer_surface_v1_add_listener(ls, &lst, this);
     zwlr_layer_surface_v1_set_anchor(ls, anchors_for_position());
-    // THE auto-hide core: zero exclusive zone -> windows keep full height and never move; the bar simply overlays them when...
+    // THE auto-hide core: zero exclusive zone -> windows keep full height
+    // and never move; the bar simply overlays them when revealed.
     zwlr_layer_surface_v1_set_exclusive_zone(ls, 0);
     zwlr_layer_surface_v1_set_keyboard_interactivity(ls, 0);
     if (cfg_vertical())
@@ -515,10 +712,16 @@ void BarSurface::apply_geometry() {
 }
 
 Module* BarSurface::hit(double along_px, double* relx) {
-    for (auto& r : hits)
-        if (along_px >= r.x && along_px < r.x + r.w) {
-            *relx = along_px - r.x;
-            return r.mod;
+    // Reverse order: slots are appended in draw order (left, center,
+    // right), so the last match is the topmost-drawn module. Normally the
+    // rects are disjoint and this changes nothing, but when the expanded
+    // tray makes the right group overrun the center modules, the pointer
+    // must resolve to what the user actually sees on top — otherwise
+    // hovers and clicks over the tray icons land on the buried text.
+    for (auto it = hits.rbegin(); it != hits.rend(); ++it)
+        if (along_px >= it->x && along_px < it->x + it->w) {
+            *relx = along_px - it->x;
+            return it->mod;
         }
     return nullptr;
 }
@@ -529,7 +732,9 @@ double BarSurface::slot_along(Module* m) const {
     return -1;
 }
 
-// --------------------------------------------------------------------------- Init ------------------------------------...
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
 bool Bar::init() {
     display_ = wl_display_connect(nullptr);
     if (!display_) {
@@ -556,14 +761,16 @@ bool Bar::init() {
     // event loop plumbing
     epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
     tick_fd_  = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-    // NOTE: tick timer starts DISARMED; the bars begin hidden and an idle hidden bar schedules zero wakeups.
+    // NOTE: tick timer starts DISARMED; the bars begin hidden and an idle
+    // hidden bar schedules zero wakeups. It is armed on the first reveal.
     add_fd(tick_fd_, [this](uint32_t) {
         uint64_t n;
         while (read(tick_fd_, &n, sizeof n) > 0) {}
         if (any_expanded()) tick_modules();
     }, "tick-timer");
 
-    // One bar per wanted output (or exactly one, wherever the compositor puts it, when multi-monitor is off).
+    // One bar per wanted output (or exactly one, wherever the compositor
+    // puts it, when multi-monitor is off).
     sync_surfaces();
     if (surfaces_.empty()) {
         fprintf(stderr, "mattbar: no matching output; no bar to show\n");
@@ -572,7 +779,8 @@ bool Bar::init() {
 
     setup_omarchy_theme_watch();
 
-    // ALL registered modules initialize (fds, D-Bus, ...) regardless of where — or whether — the current layout places them.
+    // ALL registered modules initialize (fds, D-Bus, ...) regardless of
+    // where — or whether — the current layout places them.
     rebuild_layout();
     for (auto& [id, m] : modules_) m->init(*this);
     return true;
@@ -599,8 +807,12 @@ void Bar::rebuild_layout() {
     left.clear();
     center.clear();
     right.clear();
-    for (int z = 0; z < 3; ++z) {
-        auto* dst = z == 0 ? &left : z == 1 ? &center : &right;
+    more.clear();
+    for (int z = 0; z < 4; ++z) {
+        auto* dst = z == 0   ? &left
+                    : z == 1 ? &center
+                    : z == 2 ? &right
+                             : &more;
         for (auto& id : cfg.layout_get(z)) {
             auto it = modules_.find(id);
             if (it != modules_.end()) dst->push_back(it->second);
@@ -670,9 +882,20 @@ void Bar::register_surface(wl_surface* s, SurfaceHooks hooks) {
 void Bar::unregister_surface(wl_surface* s) {
     extra_surfaces_.erase(s);
     if (ptr_surface_ == s) ptr_surface_ = nullptr;
+    if (kb_surface_ == s) {
+        kb_surface_ = nullptr;
+        arm_key_repeat(false);
+    }
 }
 
-// --------------------------------------------------------------------------- Auto-hide / pin / hold --------------------------------------------------------------------------- --------------------------------------------------------------------------- Bar facade: "the bar" means the surface currently being drawn or handling input; outside that context it means the primary one (or "any", for state queries like expanded()).
+// ---------------------------------------------------------------------------
+// Auto-hide / pin / hold
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Bar facade: "the bar" means the surface currently being drawn or handling
+// input; outside that context it means the primary one (or "any", for
+// state queries like expanded()).
+// ---------------------------------------------------------------------------
 BarSurface* Bar::surface_for(wl_surface* s) const {
     if (!s) return nullptr;
     for (auto* bs : surfaces_)
@@ -686,7 +909,8 @@ bool Bar::any_pointer_inside() const {
     return false;
 }
 
-// With reveal_all on, the bars behave as one: enter anywhere reveals every bar, and hiding waits until the pointer has ...
+// With reveal_all on, the bars behave as one: enter anywhere reveals every
+// bar, and hiding waits until the pointer has left them all.
 void Bar::reveal_all() {
     for (auto* bs : surfaces_)
         if (!bs->expanded) bs->set_expanded(true);
@@ -744,6 +968,33 @@ wl_output* Bar::current_output() const {
     return bs ? bs->out : nullptr;
 }
 
+wl_output* Bar::input_output() const {
+    return cur_ ? cur_->out : nullptr;
+}
+
+wl_output* Bar::output_named(const std::string& name) const {
+    if (name.empty()) return nullptr;
+    for (auto* o : outputs_)
+        if (o->name == name) return o->wl;
+    return nullptr;
+}
+
+wl_output* Bar::focused_output() const {
+    // hyprctl -j activeworkspace is a small JSON blob with "monitor":"DP-1".
+    std::string j = cmd_output("hyprctl -j activeworkspace 2>/dev/null");
+    auto k = j.find("\"monitor\"");
+    if (k != std::string::npos) {
+        auto q = j.find('"', j.find(':', k));
+        if (q != std::string::npos) {
+            auto e = j.find('"', q + 1);
+            if (e != std::string::npos)
+                if (wl_output* o = output_named(j.substr(q + 1, e - q - 1)))
+                    return o;
+        }
+    }
+    return nullptr;
+}
+
 wl_output* Bar::primary_output() const {
     return primary_ ? primary_->out : nullptr;
 }
@@ -759,7 +1010,14 @@ bool Bar::current_is_primary() const {
 
 double Bar::slot_along(Module* m) const {
     BarSurface* bs = current();
-    return bs ? bs->slot_along(m) : -1;
+    if (!bs) return -1;
+    double a = bs->slot_along(m);
+    if (a >= 0) return a;
+    // Overflow modules are not on the bar; hang their popups off More.
+    auto it = modules_.find("more");
+    if (it != modules_.end() && it->second != m)
+        return bs->slot_along(it->second);
+    return -1;
 }
 
 int Bar::scale_of(wl_output* o) const {
@@ -783,11 +1041,27 @@ std::vector<std::string> Bar::output_names() const {
     return v;
 }
 
-// --------------------------------------------------------------------------- Reconcile bar surfaces with the outputs the config asks for.
+std::vector<Bar::OutputRef> Bar::output_list() const {
+    std::vector<OutputRef> v;
+    for (auto* o : outputs_) {
+        int sc = o->scale > 0 ? o->scale : 1;
+        v.push_back({o->wl, o->name, sc, sc ? o->px_w / sc : 0,
+                     sc ? o->px_h / sc : 0});
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile bar surfaces with the outputs the config asks for. This is the
+// single entry point for startup, monitor hotplug, and settings changes, so
+// there is only ever one rule deciding which monitors carry a bar.
+// ---------------------------------------------------------------------------
 void Bar::sync_surfaces() {
     if (!compositor_ || !layer_shell_) return;
 
-    // A surface the compositor closed under us (output going away mid-frame) leaves a husk behind; drop those first so the ...
+    // A surface the compositor closed under us (output going away mid-frame)
+    // leaves a husk behind; drop those first so the logic below can decide
+    // freshly whether that monitor should get a bar again.
     for (auto it = surfaces_.begin(); it != surfaces_.end();) {
         if ((*it)->surf == nullptr) {
             if (cur_ == *it) cur_ = nullptr;
@@ -800,7 +1074,9 @@ void Bar::sync_surfaces() {
     }
 
     if (!cfg.multi_monitor) {
-        // Single-bar mode, unchanged from before: one surface, pinned to cfg.output when it names a connected monitor, otherwis...
+        // Single-bar mode, unchanged from before: one surface, pinned to
+        // cfg.output when it names a connected monitor, otherwise wherever
+        // the compositor decides to put it.
         wl_output* want = pick_output();
         std::string want_name;
         for (auto* o : outputs_)
@@ -849,7 +1125,9 @@ void Bar::sync_surfaces() {
         surfaces_.push_back(bs);
     }
 
-    // A compositor that reports no output names (wl_output < v4) would otherwise leave us with no bar at all.
+    // A compositor that reports no output names (wl_output < v4) would
+    // otherwise leave us with no bar at all. Fall back to one
+    // compositor-placed bar rather than showing nothing.
     if (surfaces_.empty() && !outputs_.empty()) {
         fprintf(stderr,
                 "mattbar: no output matched (multi-monitor); falling back to "
@@ -859,7 +1137,8 @@ void Bar::sync_surfaces() {
         surfaces_.push_back(bs);
     }
 
-    // An output's scale may have changed (that is one of the events that lands us here): repaint any bar whose committed bu...
+    // An output's scale may have changed (that is one of the events that
+    // lands us here): repaint any bar whose committed buffer is stale.
     for (auto* bs : surfaces_) {
         if (bs->scale() != bs->drawn_scale) {
             bs->hidden_frame_valid = false;
@@ -867,7 +1146,9 @@ void Bar::sync_surfaces() {
         }
     }
 
-    // Elect the primary: the configured one if it is present, else the first bar we have.
+    // Elect the primary: the configured one if it is present, else the
+    // first bar we have. Everything singleton (tray, settings window,
+    // notification and OSD popups) follows this election.
     BarSurface* want_primary = nullptr;
     if (!cfg.primary_output.empty())
         for (auto* bs : surfaces_)
@@ -878,16 +1159,23 @@ void Bar::sync_surfaces() {
         primary_ = want_primary;
         if (primary_)
             DBG("primary bar is %s", primary_->name.c_str());
-        // The tray only draws on the primary bar, so a re-election means both the old and the new primary need a repaint.
+        // The tray only draws on the primary bar, so a re-election means
+        // both the old and the new primary need a repaint.
         for (auto* bs : surfaces_) bs->hidden_frame_valid = false;
         request_draw();
     }
+    wallpaper_apply();
 }
 
-// The tick timer runs while ANY bar is revealed, and is fully disarmed once every bar is hidden — the zero-wakeup idle ...
+// The tick timer runs while ANY bar is revealed, and is fully disarmed once
+// every bar is hidden — the zero-wakeup idle property survives multi-monitor.
 void Bar::update_tick() { arm_tick(any_expanded()); }
 
 void Bar::tick_modules() {
+    qs_plugins_reap();
+    // Overflow children first so the More popup redraws with fresh text.
+    for (auto* m : more)
+        if (m->enabled()) m->tick();
     for (auto* lst : {&left, &center, &right})
         for (auto* m : *lst)
             if (m->enabled()) m->tick();
@@ -895,7 +1183,8 @@ void Bar::tick_modules() {
 
 void Bar::toggle_pinned() {
     pinned_ = !pinned_;
-    // Pin is global: one click keeps every bar up, so a glance at another monitor doesn't collapse the one you pinned.
+    // Pin is global: one click keeps every bar up, so a glance at another
+    // monitor doesn't collapse the one you pinned.
     for (auto* bs : surfaces_) {
         if (pinned_) {
             bs->arm_hide(false);
@@ -917,10 +1206,20 @@ void Bar::toggle_settings() {
 
 void Bar::close_settings_later() { settings_close_pending_ = true; }
 
+void Bar::refresh_settings() {
+    if (settings_) settings_->refresh();
+}
+
 void Bar::apply_config() {
+    // Sidecar first: restore user shell.json before notifyd relaunches
+    // a full Omarchy shell, and skip notifyd's kill while plugins run.
+    qs_plugins_apply(*this);
     if (notify_daemon()) notify_daemon()->apply_enabled();
+    if (mattbar_shell()) mattbar_shell()->apply_takeover();
+    more_close();
     rebuild_layout();
-    // A settings change may have switched multi-monitor on/off, edited the monitor list, or moved the primary: reconcile be...
+    // A settings change may have switched multi-monitor on/off, edited the
+    // monitor list, or moved the primary: reconcile before re-geometry.
     sync_surfaces();
     for (auto* bs : surfaces_) bs->apply_geometry();
     update_tick();  // pick up a changed tick interval / revealed state
@@ -929,12 +1228,16 @@ void Bar::apply_config() {
 }
 
 void Bar::setup_omarchy_theme_watch() {
-    // Watch even while the toggle is off, so enabling it later still tracks live; theme swaps are rare, and without an Omar...
+    // Watch even while the toggle is off, so enabling it later still tracks
+    // live; theme swaps are rare, and without an Omarchy install there is
+    // no watch (and no wakeups) at all.
     std::string dir = omarchy_theme_watch_dir();
     if (dir.empty()) return;
     omarchy_inotify_fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (omarchy_inotify_fd_ < 0) return;
-    // A theme swap replaces the "theme" entry in .../omarchy/current (rm -rf + mv in current Omarchy, ln -nsf in early vers...
+    // A theme swap replaces the "theme" entry in .../omarchy/current
+    // (rm -rf + mv in current Omarchy, ln -nsf in early versions); watching
+    // the parent survives the replacement.
     if (inotify_add_watch(omarchy_inotify_fd_, dir.c_str(),
                           IN_CREATE | IN_MOVED_TO | IN_DELETE |
                               IN_CLOSE_WRITE) < 0) {
@@ -988,14 +1291,24 @@ void Bar::arm_tick(bool arm) {
     DBG("tick timer %s", arm ? "armed" : "disarmed");
 }
 
-// --------------------------------------------------------------------------- Input routing ---------------------------...
+// ---------------------------------------------------------------------------
+// Input routing
+// ---------------------------------------------------------------------------
 void Bar::route_click(int button) {
     BarSurface* bs = cur_;
     if (!bs || !bs->expanded) return;
     double relx;
     Module* m = bs->hit(cfg_vertical() ? bs->ptr_y : bs->ptr_x, &relx);
-    // Observer sees every bar click (m may be null for dead space) so a module can react to interaction elsewhere on the bar — e.g.
+    // Observer sees every bar click (m may be null for dead space) so a
+    // module can react to interaction elsewhere on the bar — e.g. the
+    // agents dropdown dismissing itself.
     if (click_observer_) click_observer_(m);
+    auto mit = modules_.find("more");
+    if (mit != modules_.end() && m != mit->second && more_is_open())
+        more_close();
+    auto pit = modules_.find("plugins");
+    if (pit != modules_.end() && m != pit->second && plugins_is_open())
+        plugins_close();
     if (m && m->on_click(relx, button)) request_draw();
 }
 
@@ -1007,7 +1320,9 @@ void Bar::route_scroll(int dir) {
         if (m->on_scroll(relx, dir)) request_draw();
 }
 
-// --------------------------------------------------------------------------- Drawing ---------------------------------...
+// ---------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------
 void BarSurface::draw() {
     if (!configured || w == 0 || h == 0 || !surf) return;
     if (!expanded && hidden_frame_valid) return; // nothing visible changed
@@ -1015,7 +1330,8 @@ void BarSurface::draw() {
         h);
     ++owner->draw_count_;
 
-    // Module code asks the bar which surface it is rendering for (workspaces filters by monitor, popups open on the monitor...
+    // Module code asks the bar which surface it is rendering for (workspaces
+    // filters by monitor, popups open on the monitor you clicked).
     BarSurface* prev = owner->cur_;
     owner->cur_ = this;
     struct Restore {
@@ -1023,12 +1339,17 @@ void BarSurface::draw() {
         ~Restore() { b->cur_ = p; }
     } restore{owner, prev};
 
-    // HiDPI: the buffer is scale× the logical size; a global cairo scale keeps every module drawing in logical coordinates, so no drawing code anywhere needs to know.
+    // HiDPI: the buffer is scale× the logical size; a global cairo scale
+    // keeps every module drawing in logical coordinates, so no drawing code
+    // anywhere needs to know. Hit rects and pointer coords stay logical.
     const int sc = scale();
     drawn_scale  = sc;
     const int wi = static_cast<int>(w);
     const int hi = static_cast<int>(h);
-    // Buffer size: exact fractional pixels when the compositor prefers a non-integer scale (frac.active()), else logical x integer scale.
+    // Buffer size: exact fractional pixels when the compositor prefers a
+    // non-integer scale (frac.active()), else logical x integer scale. The
+    // cairo transform maps logical drawing onto whichever buffer this is,
+    // so no module code changes either way.
     const int bw = frac.active() ? frac.px(wi) : wi * sc;
     const int bh = frac.active() ? frac.px(hi) : hi * sc;
     void* data = nullptr;
@@ -1048,6 +1369,8 @@ void BarSurface::draw() {
 
     if (!expanded_) {
         // hidden state: fully transparent except the visible strip line.
+        // Interactivity is limited to the hover zone by the input region
+        // below, so clicks in the transparent area reach the windows.
         cairo_set_source_rgba(cr, 0, 0, 0, 0);
         cairo_paint(cr);
         set_color(cr, cfg.c_strip);
@@ -1067,7 +1390,8 @@ void BarSurface::draw() {
         set_color(cr, cfg.c_bg);
         cairo_paint(cr);
         cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-        // Custom modules may select their own font, so re-select the default before every measure/draw call.
+        // Custom modules may select their own font, so re-select the default
+        // before every measure/draw call.
         auto setfont = [&] {
             cairo_select_font_face(cr, cfg.font.c_str(),
                                    CAIRO_FONT_SLANT_NORMAL,
@@ -1079,7 +1403,8 @@ void BarSurface::draw() {
             Placed out;
             for (auto* m : list) {
                 if (!m->enabled()) continue;
-                // Singleton modules (the tray) render on the primary bar only: a second SNI host would fight the first.
+                // Singleton modules (the tray) render on the primary bar
+                // only: a second SNI host would fight the first.
                 if (m->primary_only() && !primary) continue;
                 setfont();
                 double mw = m->width(cr);
@@ -1123,13 +1448,25 @@ void BarSurface::draw() {
     wl_surface_commit(surf);
 }
 
-// --------------------------------------------------------------------------- Main loop -------------------------------...
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+static int g_stop_fd = -1;
+
+void Bar::request_stop() {
+    running_ = 0;
+    if (g_stop_fd >= 0) {
+        uint64_t one = 1;
+        (void)!write(g_stop_fd, &one, sizeof one);
+    }
+}
+
 void Bar::flush_wayland() {
     while (wl_display_prepare_read(display_) != 0) {
         if (wl_display_dispatch_pending(display_) < 0) {
             fprintf(stderr, "mattbar: wayland error %d, exiting\n",
                     wl_display_get_error(display_));
-            running_ = false;
+            running_ = 0;
             return;
         }
     }
@@ -1143,13 +1480,32 @@ void Bar::run() {
     ev.data.fd = wl_fd;
     epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wl_fd, &ev);
 
-    // Under a Type=notify unit: declare readiness, then ping the watchdog from a timerfd *inside* this loop — so the ping is a liveness proof of the event loop itself, not of a side thread.
+    // Under a Type=notify unit: declare readiness, then ping the watchdog
+    // from a timerfd *inside* this loop — so the ping is a liveness proof
+    // of the event loop itself, not of a side thread. A wedged loop (the
+    // exact failure the 7s-freeze taught us to fear) stops pinging and
+    // systemd restarts us; with notification state persisted, the visible
+    // cost is a sub-second flicker. Outside systemd: no-ops.
     uint64_t wd_usec = 0;
     int      wd_fd   = -1;
+    if (g_stop_fd < 0) {
+        g_stop_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (g_stop_fd >= 0)
+            add_fd(g_stop_fd, [this](uint32_t) {
+                uint64_t x;
+                while (read(g_stop_fd, &x, sizeof x) > 0) {}
+                running_ = 0;
+            }, "stop");
+    }
+
     sd_notify(0, "READY=1");
     if (sd_watchdog_enabled(0, &wd_usec) > 0 && wd_usec > 0) {
         wd_usec_ = wd_usec;
-        // Ping at a third of the budget (not half): suspend/resume kills happen because the pre-suspend ping age PLUS the post-...
+        // Ping at a third of the budget (not half): suspend/resume kills
+        // happen because the pre-suspend ping age PLUS the post-resume
+        // thaw window must fit inside WatchdogSec, and the process is
+        // frozen for the whole overlap — the only defences are a small
+        // ping age going into suspend and unit-side headroom.
         wd_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
         if (wd_fd >= 0) {
             itimerspec ts{};
@@ -1174,11 +1530,14 @@ void Bar::run() {
             delete settings_;
             settings_ = nullptr;
         }
-        // Monitor hotplug (or a wl_output name landing late) asks for a reconcile; doing it here keeps surface creation out of ...
+        // Monitor hotplug (or a wl_output name landing late) asks for a
+        // reconcile; doing it here keeps surface creation out of callbacks.
         if (outputs_dirty_) {
             outputs_dirty_ = false;
             sync_surfaces();
+            lock_sync_outputs();
         }
+        lock_flush();
         for (auto* bs : surfaces_) {
             if (bs->dirty && bs->configured && !bs->awaiting_configure) {
                 bs->dirty = false;
@@ -1189,8 +1548,16 @@ void Bar::run() {
         flush_wayland();
 
         epoll_event evs[16];
-        // Bounded wait + overdue check: after a resume the loop pings on its very first iteration instead of waiting for a time...
+        // Bounded wait + overdue check: after a resume the loop pings on
+        // its very first iteration instead of waiting for a timer slot,
+        // and a callback storm can never starve the ping for a full
+        // budget.
         int n = epoll_wait(epoll_fd_, evs, 16, wd_usec_ ? 2000 : -1);
+        // Capture errno before ping_watchdog()/clock_gettime. After
+        // hibernate thaw, sd_notify can fail with EPERM and clobber a
+        // real EINTR — we then exited, Hyprland kept the session lock,
+        // and the password field was gone.
+        int ep_err = n < 0 ? errno : 0;
         if (wd_usec_) {
             timespec tsn;
             clock_gettime(CLOCK_MONOTONIC, &tsn);
@@ -1200,9 +1567,16 @@ void Bar::run() {
         }
         if (n < 0) {
             wl_display_cancel_read(display_);
-            if (errno == EINTR) continue;
+            if (ep_err == EINTR || ep_err == EAGAIN || ep_err == EPERM) {
+                if (ep_err != EINTR)
+                    fprintf(stderr,
+                            "mattbar: event loop: epoll %s after wait; "
+                            "retrying (do not drop a live lock client)\n",
+                            strerror(ep_err));
+                continue;
+            }
             fprintf(stderr, "mattbar: event loop: epoll failed: %s — "
-                    "exiting for restart\n", strerror(errno));
+                    "exiting for restart\n", strerror(ep_err));
             exit_code_ = 1; // abnormal: systemd must restart us
             break;
         }
@@ -1215,7 +1589,10 @@ void Bar::run() {
 
         if (wl_ready) {
             if (wl_display_read_events(display_) < 0) {
-                // Resume-thaw and compositor churn can error the Wayland connection.
+                // Resume-thaw and compositor churn can error the Wayland
+                // connection. This exit used to return SUCCESS, which
+                // made Restart=on-failure leave the bar down after
+                // suspend once the watchdog no longer fired first.
                 int werr = wl_display_get_error(display_);
                 fprintf(stderr, "mattbar: event loop: wayland read "
                         "failed (display error %d, errno %s) — exiting "
@@ -1230,13 +1607,16 @@ void Bar::run() {
             int d = wl_display_dispatch_pending(display_);
             if (dbg() && d > 0) wl_event_count_ += d;
         }
+        lock_flush();
         profiler_report();
 
         for (int i = 0; i < n; ++i) {
             if (evs[i].data.fd == wl_fd) continue;
             auto it = fd_cbs_.find(evs[i].data.fd);
             if (it != fd_cbs_.end()) {
-                // Copy before invoking: a callback may remove_fd(itself) (e.g.
+                // Copy before invoking: a callback may remove_fd(itself)
+                // (e.g. a stream hitting EOF); calling through the map
+                // reference would destroy the std::function mid-execution.
                 auto cb = it->second;
                 cb(evs[i].events);
             }
@@ -1245,7 +1625,9 @@ void Bar::run() {
 }
 
 void Bar::shutdown() {
-    running_ = false;
+    running_ = 0;
+    idle_shutdown();
+    qs_plugins_stop();
     delete settings_;
     settings_ = nullptr;
     for (auto& [id, m] : modules_) delete m;
@@ -1261,6 +1643,24 @@ void Bar::shutdown() {
     left.clear();
     center.clear();
     right.clear();
+    more.clear();
+    arm_key_repeat(false);
+    if (keyboard_) {
+        wl_keyboard_destroy(keyboard_);
+        keyboard_ = nullptr;
+    }
+    if (xkb_state_) {
+        xkb_state_unref(xkb_state_);
+        xkb_state_ = nullptr;
+    }
+    if (xkb_keymap_) {
+        xkb_keymap_unref(xkb_keymap_);
+        xkb_keymap_ = nullptr;
+    }
+    if (xkb_ctx_) {
+        xkb_context_unref(xkb_ctx_);
+        xkb_ctx_ = nullptr;
+    }
     if (wm_base_) xdg_wm_base_destroy(wm_base_);
     if (cursor_shape_dev_) wp_cursor_shape_device_v1_destroy(cursor_shape_dev_);
     if (cursor_shape_mgr_) wp_cursor_shape_manager_v1_destroy(cursor_shape_mgr_);

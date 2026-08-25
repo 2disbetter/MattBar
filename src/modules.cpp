@@ -1,6 +1,8 @@
 #include "modules.hpp"
 #include "bar.hpp"
 #include "config.hpp"
+#include "nightlight.hpp"
+#include "shell.hpp"
 #include "idle-inhibit-unstable-v1-client-protocol.h"
 #include "notify.hpp"
 #include "sdpump.hpp"
@@ -8,6 +10,7 @@
 #include "popup.hpp"
 #include "sensors.hpp"
 #include "util.hpp"
+#include "wallpaper.hpp"
 
 #include <csignal>
 #include <dirent.h>
@@ -30,6 +33,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <ctime>
 #include <map>
@@ -47,17 +51,107 @@
     } while (0)
 #endif
 
-// Launch a command fully detached; never blocks the bar.
+// Launch a command fully detached; never blocks the bar. Double-fork +
+// setsid so the child is not in MattBar's systemd cgroup. `system("foo &")`
+// left browsers/IDEs in mattbar.service; a restart then SIGTERM'd them
+// (Brave/Spotify/Signal dumped core) and hung 90s on jetbrainsd (16.7G
+// attributed to the unit).
 void spawn_detached(const std::string& c) {
     if (c.empty()) return;
-    (void)!system((c + " >/dev/null 2>&1 &").c_str());
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid > 0) {
+        waitpid(pid, nullptr, 0);
+        return;
+    }
+    if (setsid() < 0) _exit(127);
+    pid_t g = fork();
+    if (g < 0) _exit(127);
+    if (g > 0) _exit(0);
+    uid_t uid = getuid();
+    char cg[160];
+    snprintf(cg, sizeof cg,
+             "/sys/fs/cgroup/user.slice/user-%u.slice/user@%u.service/"
+             "cgroup.procs",
+             (unsigned)uid, (unsigned)uid);
+    int cfd = open(cg, O_WRONLY | O_CLOEXEC);
+    if (cfd >= 0) {
+        char b[32];
+        int n = snprintf(b, sizeof b, "%d\n", (int)getpid());
+        (void)!write(cfd, b, (size_t)n);
+        close(cfd);
+    }
+    int z = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (z >= 0) {
+        dup2(z, 0);
+        dup2(z, 1);
+        dup2(z, 2);
+        if (z > 2) close(z);
+    }
+    execl("/bin/sh", "sh", "-c", c.c_str(), (char*)nullptr);
+    _exit(127);
 }
 
-// --------------------------------------------------------------------------- AsyncCmd --------------------------------...
+static const char* kPowerStateDir =
+    "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/powerprofiles";
+
+void persist_power_profile(const std::string& profile) {
+    if (profile.empty()) return;
+    // Quote via single quotes after rejecting quotes in the profile name
+    // (PPD profiles are power-saver|balanced|performance).
+    for (char c : profile)
+        if (c == '\'' || c == '/' || c == '\n') return;
+    spawn_detached(std::string("d=\"") + kPowerStateDir +
+                   "\"; mkdir -p \"$d\"; printf '%s\\n' '" + profile +
+                   "' >\"$d/ac\"; printf '%s\\n' '" + profile +
+                   "' >\"$d/battery\"; powerprofilesctl set '" + profile +
+                   "' >/dev/null 2>&1 || true");
+}
+
+std::string with_preserved_power_profile(const std::string& cmd) {
+    // Pin first (so QS autodetect reads the right files), run the command,
+    // then set again after a delay so a UPower.onBatteryChanged on QS
+    // startup cannot leave balanced in place of power-saver.
+    return std::string("p=$(powerprofilesctl get 2>/dev/null || true); "
+                       "d=\"") +
+           kPowerStateDir +
+           "\"; "
+           "if [ -n \"$p\" ]; then "
+           "mkdir -p \"$d\"; printf '%s\\n' \"$p\" >\"$d/ac\"; "
+           "printf '%s\\n' \"$p\" >\"$d/battery\"; fi; "
+           "(" +
+           cmd +
+           "); st=$?; "
+           "if [ -n \"$p\" ]; then "
+           "sleep 1; powerprofilesctl set \"$p\" >/dev/null 2>&1 || true; "
+           "fi; exit $st";
+}
+
+std::string live_panel_click(const std::string& stored, const char* overlay_id) {
+    auto* sh = mattbar_shell();
+    // Second click on the same module closes our TUI, even if Quickshell
+    // is still the default for opening (same as Omarchy's bar buttons).
+    if (sh && overlay_id && *overlay_id && sh->is_open(overlay_id)) {
+        sh->hide(overlay_id);
+        return {};
+    }
+    if (!cfg.quickshell_shutdown || !overlay_id || !*overlay_id) return stored;
+    const bool stock = stored.find(overlay_id) != std::string::npos ||
+                       stored.find("omarchy-launch-") != std::string::npos ||
+                       stored.find("omarchy-shell") != std::string::npos ||
+                       stored.find("mattbarctl") != std::string::npos;
+    if (!stock) return stored;
+    return std::string("mattbarctl shell toggle ") + overlay_id;
+}
+
+// ---------------------------------------------------------------------------
+// AsyncCmd
+// ---------------------------------------------------------------------------
 void AsyncCmd::run(Bar& bar, const std::string& cmd, Done cb,
-                   int timeout_ms) {
+                   int timeout_ms, Line on_line) {
     bar_        = &bar;
     cb_         = std::move(cb);
+    on_line_    = std::move(on_line);
     timeout_ms_ = timeout_ms;
     if (pid_ > 0) { // coalesce: latest request wins, runs after current
         pending_     = true;
@@ -73,6 +167,7 @@ void AsyncCmd::start(const std::string& cmd) {
     pid_t pid = fork();
     if (pid == 0) {
         dup2(p[1], 1);
+        dup2(p[1], 2);
         close(p[0]);
         execl("/bin/sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
         _exit(127);
@@ -85,11 +180,15 @@ void AsyncCmd::start(const std::string& cmd) {
     pid_ = pid;
     fd_  = p[0];
     buf_.clear();
+    line_pos_ = 0;
     fcntl(fd_, F_SETFL, O_NONBLOCK);
     bar_->add_fd(fd_, [this](uint32_t ev) {
         char    b[1024];
         ssize_t n;
-        while ((n = read(fd_, b, sizeof b)) > 0) buf_.append(b, n);
+        while ((n = read(fd_, b, sizeof b)) > 0) {
+            buf_.append(b, n);
+            drain_lines();
+        }
         if (ev & (EPOLLHUP | EPOLLERR)) {
             int st = -1, ws = 0;
             if (waitpid(pid_, &ws, 0) == pid_ && WIFEXITED(ws))
@@ -115,7 +214,26 @@ void AsyncCmd::start(const std::string& cmd) {
     timerfd_settime(timer_fd_, 0, &ts, nullptr);
 }
 
+void AsyncCmd::drain_lines() {
+    if (!on_line_) return;
+    size_t p;
+    while ((p = buf_.find('\n', line_pos_)) != std::string::npos) {
+        on_line_(buf_.substr(line_pos_, p - line_pos_));
+        line_pos_ = p + 1;
+    }
+}
+
+void AsyncCmd::cancel() {
+    pending_ = false;
+    if (pid_ <= 0) return;
+    kill(pid_, SIGTERM);
+}
+
 void AsyncCmd::finish(int status) {
+    if (on_line_ && line_pos_ < buf_.size()) {
+        on_line_(buf_.substr(line_pos_));
+        line_pos_ = buf_.size();
+    }
     itimerspec off{};
     if (timer_fd_ >= 0) timerfd_settime(timer_fd_, 0, &off, nullptr);
     if (fd_ >= 0) {
@@ -126,6 +244,7 @@ void AsyncCmd::finish(int status) {
     pid_ = -1;
     std::string out = std::move(buf_);
     buf_.clear();
+    line_pos_ = 0;
     if (cb_) cb_(out, status);
     if (pending_) {
         pending_ = false;
@@ -142,7 +261,9 @@ AsyncCmd::~AsyncCmd() {
     if (timer_fd_ >= 0) close(timer_fd_);
 }
 
-// --------------------------------------------------------------------------- helpers ---------------------------------...
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
 namespace {
 
 void col(cairo_t* cr, const Color& c, double a = -1) {
@@ -217,14 +338,27 @@ protected:
 
 } // namespace
 
-// --------------------------------------------------------------------------- Clock -----------------------------------...
+// ---------------------------------------------------------------------------
+// Clock
+// ---------------------------------------------------------------------------
 namespace {
 class ClockModule : public TextModule {
 public:
     bool enabled() const override { return cfg.show_clock; }
     void init(Bar& bar) override { bar_ = &bar; tick(); }
-    // Left-click drops a month calendar below the clock (on the monitor whose clock you clicked); click again to put it away.
+    // Left-click drops a month calendar below the clock (on the monitor
+    // whose clock you clicked); click again to put it away.
     bool on_click(double, int button) override {
+        if (button == BTN_RIGHT) {
+            clock_cycle_format();
+            tick();
+            return true;
+        }
+        if (button == BTN_MIDDLE) {
+            auto* sh = mattbar_shell();
+            if (sh) sh->toggle("omarchy.clock-timezone", "");
+            return true;
+        }
         if (button != BTN_LEFT || !cfg.calendar_enabled || !bar_) return false;
         calendar_toggle(*bar_, this);
         return true;
@@ -246,8 +380,27 @@ private:
 } // namespace
 Module* make_clock() { return new ClockModule; }
 
+void clock_cycle_format() {
+    static const char* ring[][2] = {
+        {"%a %d %b  %H:%M", "%H:%M"},
+        {"%a %d %b  %I:%M %p", "%I:%M"},
+        {"%a %d %b  %H:%M:%S", "%H:%M"},
+        {"%H:%M", "%H:%M"},
+        {"%a %H:%M", "%H:%M"},
+    };
+    constexpr int n = 5;
+    int i = 0;
+    for (; i < n; ++i)
+        if (cfg.clock_format == ring[i][0]) break;
+    i = (i + 1) % n;
+    cfg.clock_format          = ring[i][0];
+    cfg.clock_format_vertical = ring[i][1];
+    cfg.save();
+}
 
-// Hyprland IPC helpers defined further down; declared inside the unnamed namespace so these names unify with their inte...
+
+// Hyprland IPC helpers defined further down; declared inside the unnamed
+// namespace so these names unify with their internal-linkage definitions.
 namespace {
 std::string hypr_socket_dir();
 int         unix_connect(const std::string& path);
@@ -256,12 +409,23 @@ bool        hypr_dispatch2(const std::string& dir, const std::string& legacy,
                            const std::string& lua);
 } // namespace
 
-// --------------------------------------------------------------------------- AI agent usage — a reader of Omarchy Quattro's agents data contract.
+// ---------------------------------------------------------------------------
+// AI agent usage — a reader of Omarchy Quattro's agents data contract.
+// Collectors (omarchy-agent-usage-*) write one display-ready JSON record per
+// agent into $XDG_STATE_HOME/omarchy/agents/usage/; the Quickshell shell
+// keeps them fresh on its own timers (it stays running even under the
+// null-bar plugin). This module never collects anything: it watches the
+// directory and shows the worst rate-limit percentage across ready agents.
+// No records (Omarchy 3.x, shell stopped, no agents) => module hides.
+// ---------------------------------------------------------------------------
 class AgentsModule : public TextModule {
 public:
+    static AgentsModule* g;
     bool enabled() const override { return cfg.show_agents; }
 
+    AgentsModule() { g = this; }
     ~AgentsModule() override {
+        if (g == this) g = nullptr;
         if (ino_fd_ >= 0) close(ino_fd_);
         if (deb_fd_ >= 0) close(deb_fd_);
         if (sock2_fd_ >= 0) close(sock2_fd_);
@@ -297,7 +461,10 @@ public:
                 while (read(deb_fd_, &x, sizeof x) > 0) {}
                 rescan();
             }, "agents-debounce");
-        // Terminal-session popup plumbing: a socket2 stream tells us when our terminal appears (openwindow), dies (closewindow)...
+        // Terminal-session popup plumbing: a socket2 stream tells us when
+        // our terminal appears (openwindow), dies (closewindow), and when
+        // focus leaves it (activewindow) — which, under focus-follows-
+        // mouse, IS the mouse-out signal that dismisses the popup.
         hdir_ = hypr_socket_dir();
         DBG("agents: popup term='%s' class='%s' hypr-sockets=%s",
             cfg.agents_term.c_str(), cfg.agents_term_class.c_str(),
@@ -305,7 +472,13 @@ public:
         if (!hdir_.empty()) {
             sock2_fd_ = unix_connect(hdir_ + "/.socket2.sock");
             if (sock2_fd_ >= 0) {
-                // unix_connect() returns a BLOCKING socket (fine for the one-shot request path).
+                // unix_connect() returns a BLOCKING socket (fine for the
+                // one-shot request path). A level-triggered drain loop on a
+                // blocking fd hangs the event loop on the read after the
+                // last byte — which the sd_notify watchdog then correctly
+                // "fixes" by having systemd kill the bar, taking the pactl
+                // subscribe child with it, in a 10-second loop. Nonblocking
+                // is not optional here.
                 fcntl(sock2_fd_, F_SETFL, O_NONBLOCK);
                 bar.add_fd(sock2_fd_, [this](uint32_t) {
                     char buf[2048];
@@ -318,7 +491,8 @@ public:
                         sock2_buf_.erase(0, p + 1);
                     }
                     if (n == 0) { // EOF: Hyprland restarted. A closed
-                        // stream in level-triggered epoll spins forever; tear down and degrade the popup to panel-only.
+                        // stream in level-triggered epoll spins forever;
+                        // tear down and degrade the popup to panel-only.
                         bar_->remove_fd(sock2_fd_);
                         close(sock2_fd_);
                         sock2_fd_  = -1;
@@ -330,7 +504,10 @@ public:
                 }, "agents-socket2");
             }
         }
-        // A spawn that never produces a window we recognise must not latch into a silent click.
+        // A spawn that never produces a window we recognise must not latch
+        // into a silent click. This timer is armed with each spawn dispatch
+        // and disarmed on adoption; if it fires, the click falls back to
+        // the shell panel so the user always gets SOMETHING.
         spawn_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
         if (spawn_fd_ >= 0)
             bar.add_fd(spawn_fd_, [this](uint32_t) {
@@ -343,7 +520,13 @@ public:
                     SPAWN_TIMEOUT_MS);
                 open_panel(false);
             }, "agents-spawn-timeout");
-        // The compositor chatter below (rules, fallthrough probe, session discovery) is up to ~13 sequential socket requests with second-scale timeouts.
+        // The compositor chatter below (rules, fallthrough probe,
+        // session discovery) is up to ~13 sequential socket requests
+        // with second-scale timeouts. Running it synchronously in init —
+        // before the event loop starts pinging — let a slow/wedged
+        // Hyprland stall past WatchdogSec and produce the 10-second
+        // watchdog restart storms seen in the field. Deferred onto the
+        // loop via a one-shot timer, with explicit pings between steps.
         init_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
         if (init_fd_ >= 0) {
             itimerspec its{};
@@ -364,12 +547,19 @@ public:
                     DBG("agents: found existing session window 0x%s from "
                         "a previous run (shown=%d)", term_addr_.c_str(),
                         (int)shown_);
+                placed_size_ = popup_size();
                 bar.ping_watchdog();
             }, "agents-deferred-init");
         }
         bar.set_click_observer([this](Module* m) {
-            // The popup lives on a special workspace: while it is up, outside clicks land on the desktop layer (no fallthrough) and never change focus, so the focus-based dismissal can't see them.
-            if (m != static_cast<Module*>(this) && shown_ && on_special_) {
+            // The popup lives on a special workspace: while it is up,
+            // outside clicks land on the desktop layer (no fallthrough)
+            // and never change focus, so the focus-based dismissal can't
+            // see them. Interaction with the BAR is visible to us though
+            // — any click that isn't on this module hides the dropdown.
+            if (m == static_cast<Module*>(this)) return;
+            sync_shown();
+            if (shown_ && on_special_) {
                 DBG("agents: bar interaction elsewhere; hiding the popup");
                 show(false);
             }
@@ -378,23 +568,48 @@ public:
     }
 
     void tick() override {
-        // usage dir may not exist yet (fresh install, first agent run): cheap re-attempt while revealed, nothing scheduled whil...
+        // usage dir may not exist yet (fresh install, first agent run):
+        // cheap re-attempt while revealed, nothing scheduled while hidden
         if (ino_fd_ >= 0 && watch_ < 0) {
             try_watch();
             if (watch_ >= 0) rescan();
+        }
+        // Settings steppers persist agents_popup_size then apply_config
+        // ticks modules: resize the live grok window in place.
+        if (init_done_) {
+            std::string sz = popup_size();
+            if (sz != placed_size_) {
+                placed_size_ = sz;
+                if (!hdir_.empty()) preinstall_rules();
+                sync_shown();
+                if (term_open_ && on_special_ && shown_) place_popup();
+            }
         }
     }
 
     bool on_click(double, int button) override {
         if (button == BTN_RIGHT) {
-            // Eject: promote the popup session to a normal window on the current workspace and release it from bar management.
+            // Eject a live terminal popup; otherwise the same picker
+            // Omarchy's agents widget launches.
             if (term_open_) { eject(); return true; }
-            DBG("agents: right-click ignored (eject needs a live popup "
-                "session)");
-            return false;
+            spawn_detached("omarchy-agent --pick");
+            return true;
         }
-        if (button != BTN_LEFT) return false;
-        // Native panel when the shell can MEANINGFULLY represent the default agent; terminal-session popup when it cannot.
+        if (button == BTN_MIDDLE) {
+            auto* sh = mattbar_shell();
+            if (sh && sh->is_open("omarchy.agents")) {
+                sh->call("omarchy.agents", "next", "");
+                return true;
+            }
+        }
+        if (button != BTN_LEFT && button != BTN_MIDDLE) return false;
+        // Native panel when the shell can MEANINGFULLY represent the
+        // default agent; terminal-session popup when it cannot. "Has a
+        // usage record" is not enough: a stub or stale record (ready but
+        // no limit percentages — e.g. a hand-rolled grok.json) gives the
+        // panel nothing to show, while the terminal session is exactly
+        // the task view the user wants for such agents. No default
+        // chosen => panel, whose selection prompt is the right guidance.
         const std::string def = default_agent();
         bool panelable = def.empty();
         if (!def.empty()) {
@@ -420,6 +635,19 @@ public:
             open_panel(popup_possible);
             return false;
         }
+        // Glyph click is a real toggle. If the compositor already has the
+        // popup up, hide it — never spawn a replacement. A mouse-out hide
+        // that fires while the pointer travels onto this glyph must not
+        // be followed by an immediate re-open (the field "click several
+        // times to dismiss" loop).
+        if (!term_open_) discover_session();
+        suppress_dismiss_until_ = now_ms() + 400;
+        sync_shown();
+        if (term_open_ && on_special_ &&
+            (shown_ || (hid_ms_ && now_ms() - hid_ms_ < 400))) {
+            if (shown_) show(false);
+            return true;
+        }
         return spawn_popup(true);
     }
 
@@ -432,7 +660,10 @@ private:
     const std::string& glyph() const {
         return resolved_.empty() ? cfg.agents_glyph : resolved_;
     }
-    // Same coverage check the bluetooth/brightness glyphs use: ask the scaled font for real glyph indices and fall back down the chain on any .notdef.
+    // Same coverage check the bluetooth/brightness glyphs use: ask the
+    // scaled font for real glyph indices and fall back down the chain on
+    // any .notdef. Configured glyph -> nf-md-robot (Nerd Fonts v3) ->
+    // FA robot (v2 fonts) -> plain "AI".
     void resolve_glyph(cairo_t* cr) {
         if (checked_ == cfg.font + cfg.agents_glyph) return;
         checked_ = cfg.font + cfg.agents_glyph;
@@ -460,8 +691,20 @@ private:
     }
 
     static constexpr int SPAWN_TIMEOUT_MS = 6000;
-    // The panel toggle used to be fire-and-forget — a dead or missing shell made it a perfectly silent click (Quattro shells that died, e.g.
+    // The panel toggle used to be fire-and-forget — a dead or missing
+    // shell made it a perfectly silent click (Quattro shells that died,
+    // e.g. to the old notifyd takeover, receive the toggle into the
+    // void). Run it observably instead: a clear failure (command missing
+    // or nonzero exit) falls back to the terminal popup when one is
+    // possible. A timeout kill is NOT treated as failure — a customised
+    // long-running agents_click is presumed to be doing its job.
     void open_panel(bool can_fallback) {
+        if (auto* sh = mattbar_shell()) {
+            if (cfg.quickshell_shutdown || sh->is_open("omarchy.agents")) {
+                sh->toggle("omarchy.agents", "");
+                return;
+            }
+        }
         if (cfg.agents_click.empty()) {
             DBG("agents: agents_click is empty; nothing to open");
             if (can_fallback) spawn_popup(false);
@@ -477,7 +720,12 @@ private:
                        },
                        3000);
     }
-    // A session that exits within 2 s of mapping is invisible to the user.
+    // A session that exits within 2 s of mapping is invisible to the
+    // user. After the first such exit, the NEXT spawn wraps the stock
+    // launcher in a hold-open shim: the popup then stays up displaying
+    // omarchy-agent's output and exit status instead of vanishing — the
+    // error diagnoses itself. Only the recognisable "... omarchy-agent"
+    // stock tail is wrapped; a custom command is never rewritten.
     std::string spawn_cmd() const {
         const std::string& t = cfg.agents_term;
         if (!hold_next_) return t;
@@ -492,7 +740,10 @@ private:
         }
         return t; // custom command: never rewritten
     }
-    // Place the popup so it visually hangs off the bar instead of floating mid-screen: flush to the bar's edge, aligned toward the right module cluster where the agents glyph lives.
+    // Place the popup so it visually hangs off the bar instead of
+    // floating mid-screen: flush to the bar's edge, aligned toward the
+    // right module cluster where the agents glyph lives. Everything is
+    // computed in monitor-% so one rule works on any resolution.
     static std::string popup_move() {
         int w = 36, h = 44;
         sscanf(popup_size().c_str(), "%d%% %d%%", &w, &h);
@@ -505,12 +756,93 @@ private:
         if (y < 0) y = 0;
         return std::to_string(x) + "% " + std::to_string(y) + "%";
     }
-    std::string term_sel() const {
-        return "address:" + (term_addr_.rfind("0x", 0) == 0
-                                 ? term_addr_
-                                 : "0x" + term_addr_);
+    static std::string addr_norm(std::string a) {
+        if (a.rfind("0x", 0) == 0 || a.rfind("0X", 0) == 0) a = a.substr(2);
+        return a;
     }
-    // Focus the popup right after revealing it.
+    std::string term_sel() const {
+        return "address:0x" + addr_norm(term_addr_);
+    }
+    bool special_is_shown() {
+        if (hdir_.empty()) return false;
+        std::string mons = hypr_request(hdir_, "j/monitors");
+        size_t      p    = 0;
+        while ((p = mons.find("\"specialWorkspace\"", p)) !=
+               std::string::npos) {
+            size_t brace = mons.find('{', p);
+            if (brace == std::string::npos) break;
+            size_t end = mons.find('}', brace);
+            if (end == std::string::npos) break;
+            std::string block = mons.substr(brace, end - brace + 1);
+            if (block.find("special:mbagent") != std::string::npos)
+                return true;
+            p = end + 1;
+        }
+        return false;
+    }
+    void sync_shown() { shown_ = special_is_shown(); }
+    // Hyprland 0.56 Lua `window.resize`/`window.move` take pixel coords.
+    // Percent sizes in `resizewindowpixel` are a Lua syntax error there
+    // and silently leave the default 800x600 float.
+    struct PopupPx {
+        int w, h, x, y;
+    };
+    PopupPx popup_px() {
+        int pw = 36, ph = 44;
+        sscanf(popup_size().c_str(), "%d%% %d%%", &pw, &ph);
+        int         mw = 0, mh = 0;
+        std::string mons = hypr_request(hdir_, "j/monitors");
+        size_t      f    = mons.find("\"focused\": true");
+        if (f == std::string::npos) f = mons.find("\"focused\":true");
+        auto jint = [&](const char* k, size_t around) {
+            size_t lo = around > 800 ? around - 800 : 0;
+            size_t hi = std::min(mons.size(), around + 800);
+            std::string slice = mons.substr(lo, hi - lo);
+            std::string key   = std::string("\"") + k + "\":";
+            size_t      p     = slice.find(key);
+            if (p == std::string::npos) return 0;
+            p += key.size();
+            while (p < slice.size() &&
+                   (slice[p] == ' ' || slice[p] == '\t'))
+                ++p;
+            return atoi(slice.c_str() + p);
+        };
+        if (f != std::string::npos) {
+            mw = jint("width", f);
+            mh = jint("height", f);
+        }
+        if (mw <= 0) mw = 1920;
+        if (mh <= 0) mh = 1080;
+        int w = mw * pw / 100, h = mh * ph / 100;
+        if (w < 200) w = 200;
+        if (h < 150) h = 150;
+        int x, y;
+        if (cfg.position == "bottom") {
+            x = mw - w - mw / 100;
+            y = mh - h - mh * 4 / 100;
+        } else if (cfg.position == "left") {
+            x = mw * 2 / 100;
+            y = mh * 3 / 100;
+        } else if (cfg.position == "right") {
+            x = mw - w - mw * 2 / 100;
+            y = mh * 3 / 100;
+        } else {
+            x = mw - w - mw / 100;
+            y = mh * 3 / 100;
+        }
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        return {w, h, x, y};
+    }
+    // Focus the popup right after revealing it. This does two jobs: it
+    // undoes the reveal-race focus bounce at the source (instead of
+    // merely tolerating it through the grace period), and it makes
+    // "click anywhere outside" dismiss the popup — with focus ON the
+    // popup, any click on another window changes activewindow, which the
+    // mouse-out handler already turns into a hide.
+    // Right-click discoverability: the eject gesture lives on the bar
+    // module (a terminal cannot host bar buttons) and has gone unnoticed
+    // for several rounds — say so once per run via a notification.
     void hint_eject() {
         if (hinted_) return;
         hinted_ = true;
@@ -520,9 +852,12 @@ private:
     }
     void focus_popup() {
         if (term_addr_.empty()) return;
+        // Focus the agent window by address. A workspace-wide focus
+        // raises every client on special:mbagent — including Brave
+        // windows that inherited the special via xdg-activation.
         if (!hypr_dispatch2(hdir_, "dispatch focuswindow " + term_sel(),
-                            "dispatch hl.dsp.focus({ workspace = "
-                            "\"special:mbagent\" })"))
+                            "dispatch hl.dsp.focus({ window = \"" +
+                                term_sel() + "\" })"))
             DBG("agents: focus dispatch failed "
                 "(click-outside dismissal degraded to focus-change only)");
         verify_focus(); // informational: arming is the event handler's
@@ -547,7 +882,9 @@ private:
                     c[e] != '\n') ++e;
         return c.substr(p, e - p);
     }
-    // MEASURE what the compositor actually did instead of trusting "ok" replies — this build's whole history is dispatches that report success and change nothing.
+    // MEASURE what the compositor actually did instead of trusting "ok"
+    // replies — this build's whole history is dispatches that report
+    // success and change nothing. Returns whether the window is floating.
     bool verify_place() {
         std::string c = client_chunk();
         if (c.empty()) {
@@ -568,7 +905,21 @@ private:
         DBG("agents: verify focus: popup %s focused", ok ? "IS" : "is NOT");
         return ok;
     }
-    // Best-effort compositor-side rules for our class, installed once per run: if they take, every popup window gets its geometry at map time and the per-window dispatches become idempotent no-ops.
+    // Best-effort compositor-side rules for our class, installed once per
+    // run: if they take, every popup window gets its geometry at map time
+    // and the per-window dispatches become idempotent no-ops. Replies are
+    // logged, not trusted; the dispatch + verify path remains the source
+    // of truth.
+    // The keyword error text itself said "Use eval." — the Lua-parser
+    // socket accepts `eval <code>`. Use it to flip
+    // input:special_fallthrough so clicks OUTSIDE the popup pass through
+    // to the windows beneath instead of being captured by the special's
+    // blocking layer (the field-reported "layer underneath the popup").
+    // The setter name is probed and VERIFIED via the documented
+    // hl.get_config(); every attempt is logged.
+    // eval replies only ok/error — no return values. Smuggle values out
+    // through the error message instead: error("MBVAL:"..v) puts v in
+    // the reply text.
     std::string eval_get(const std::string& expr) {
         std::string r = hypr_request(
             hdir_, "eval error(\"MBVAL:\" .. tostring(" + expr + "))");
@@ -589,7 +940,8 @@ private:
         std::string before = get();
         DBG("agents: special_fallthrough before: '%.30s'", before.c_str());
         if (before.rfind("true", 0) == 0) return;
-        // hl.config({...}) replied ok in the field; try it first, then the other spellings.
+        // hl.config({...}) replied ok in the field; try it first, then
+        // the other spellings.
         const char* setters[] = {
             "eval hl.config({ input = { special_fallthrough = true } })",
             "eval hl.set_config(\"input:special_fallthrough\", true)",
@@ -610,7 +962,9 @@ private:
             "may stay captured (bar clicks & foreign windows still "
             "dismiss)");
     }
-    // A window mapped before our rule existed keeps its stale geometry forever (rules apply at map).
+    // A window mapped before our rule existed keeps its stale geometry
+    // forever (rules apply at map). Detect it: not floating, or sitting
+    // at Hyprland's default 800x600 float.
     bool stale_geometry() {
         std::string c = client_chunk();
         if (c.empty()) return false;
@@ -619,7 +973,14 @@ private:
     }
     void preinstall_rules() {
         const std::string cls = cfg.agents_term_class;
-        // The socket evaluates `dispatch <arg>` as `return hl.dispatch(<arg>)` (its own error text revealed the wrapper), so <arg> can be any Lua expression: call the DOCUMENTED hl.window_rule() config API for its side effect, then hand hl.dispatch a harmless dispatcher so the call as a whole succeeds.
+        // The socket evaluates `dispatch <arg>` as `return
+        // hl.dispatch(<arg>)` (its own error text revealed the wrapper),
+        // so <arg> can be any Lua expression: call the DOCUMENTED
+        // hl.window_rule() config API for its side effect, then hand
+        // hl.dispatch a harmless dispatcher so the call as a whole
+        // succeeds. If the rule takes, every popup window gets
+        // float/size/move compositor-side AT MAP TIME — no per-window
+        // dispatch games at all.
         const std::string lua =
             "dispatch (function() hl.window_rule({ enabled = true, "
             "match = { class = \"" + cls + "\" }, float = true, size = "
@@ -640,44 +1001,62 @@ private:
             r2.c_str(), r3.c_str(), r4.c_str());
     }
     // Give the freshly adopted (still hidden) popup its real geometry.
+    // exec_cmd's Lua rule table silently drops STATIC rules — float,
+    // size, move — while honouring workspace; field-verified: the popup
+    // arrived TILED, alone on the special, filling the whole monitor and
+    // reading as "fullscreen". So geometry is enforced here with plain
+    // address-targeted dispatchers, identical on hyprlang and Lua builds
+    // (quoted-string dispatch on Lua builds). Order matters: a tiled window ignores resize and
+    // move, so float comes first. On builds where the exec rules DID
+    // apply, every step is an idempotent no-op.
     void place_popup() {
-        const std::string           sel = term_sel();
-        const struct { const char* what; std::string arg; } steps[] = {
-            {"float", "setfloating " + sel},
-            {"size", "resizewindowpixel exact " + popup_size() + "," + sel},
-            {"move", "movewindowpixel exact " + popup_move() + "," + sel},
-        };
-        for (const auto& st : steps)
-            if (!hypr_dispatch2(hdir_, "dispatch " + st.arg,
-                                "dispatch \"" + st.arg + "\""))
-                DBG("agents: popup %s dispatch rejected", st.what);
+        const std::string sel = term_sel();
+        const std::string win = lua_str(sel);
+        PopupPx           g   = popup_px();
+        const std::string wx  = std::to_string(g.w), hy = std::to_string(g.h),
+                          px  = std::to_string(g.x), py = std::to_string(g.y);
+        // Hyprland 0.56 `window.float` is a toggle even with action=set.
+        // Calling it on an already-floating leftover tiles the session
+        // into a full special workspace. Only float when it isn't.
+        if (!verify_place())
+            hypr_dispatch2(
+                hdir_, "dispatch setfloating " + sel,
+                "dispatch hl.dsp.window.float({ window = \"" + win +
+                    "\", action = \"toggle\" })");
+        // Pixel resize/move: percent args to resizewindowpixel are a Lua
+        // syntax error on 0.56 and leave the default 800x600 float.
+        hypr_dispatch2(
+            hdir_,
+            "dispatch resizewindowpixel exact " + wx + " " + hy + "," +
+                sel,
+            "dispatch hl.dsp.window.resize({ window = \"" + win +
+                "\", exact = true, x = " + wx + ", y = " + hy + " })");
+        hypr_dispatch2(
+            hdir_,
+            "dispatch movewindowpixel exact " + px + " " + py + "," + sel,
+            "dispatch hl.dsp.window.move({ window = \"" + win +
+                "\", exact = true, x = " + px + ", y = " + py + " })");
         if (!verify_place())
             DBG("agents: popup is STILL NOT FLOATING after geometry "
                 "dispatches — this Hyprland accepts them without acting; "
                 "the preinstalled window rules are the remaining hope");
     }
-    // Right-click: hand the live session over to the user as a normal window on their current workspace.
+    // Right-click: hand the live session over to the user as a normal
+    // window on their current workspace. The bar stops managing it
+    // entirely; the next left-click starts a fresh popup session.
     void eject() {
-        // Target = the underlying normal workspace, read from j/monitors (activeWorkspace stays the normal one even while a spe...
-        std::string mons = hypr_request(hdir_, "j/monitors");
-        std::string ws;
-        size_t p = mons.find("\"activeWorkspace\"");
-        if (p != std::string::npos) p = mons.find("\"id\":", p);
-        if (p != std::string::npos) {
-            p += 5;
-            while (p < mons.size() &&
-                   (mons[p] == ' ' || mons[p] == '\n' || mons[p] == '\t'))
-                ++p;
-            while (p < mons.size() && (isdigit((unsigned char)mons[p]) ||
-                                       mons[p] == '-'))
-                ws += mons[p++];
-        }
+        // Target = the underlying normal workspace, read from j/monitors
+        // (activeWorkspace stays the normal one even while a special is
+        // overlaid on top of it).
+        std::string ws = normal_ws_id();
         if (ws.empty()) {
             DBG("agents: eject: could not resolve the target workspace; "
                 "keeping the popup");
             return;
         }
-        // The only documented Lua move acts on the ACTIVE window, so the move is gated on VERIFIED popup focus — it can never r...
+        // The only documented Lua move acts on the ACTIVE window, so the
+        // move is gated on VERIFIED popup focus — it can never relocate
+        // some other window.
         if (!shown_) { show(true); }
         focus_popup();
         if (!verify_focus()) {
@@ -715,9 +1094,81 @@ private:
         term_addr_.clear();
         term_cls_.clear();
     }
-    // Find a session window that already exists on our special workspace — e.g.
+    static bool is_agent_special(const std::string& name) {
+        return name == "special:mbagent" ||
+               name.rfind("special:mbagent", 0) == 0;
+    }
+    bool is_agent_class(const std::string& cls) const {
+        return !cls.empty() && cls == cfg.agents_term_class;
+    }
+    std::string normal_ws_id() {
+        std::string mons = hypr_request(hdir_, "j/monitors");
+        std::string ws;
+        size_t p = mons.find("\"activeWorkspace\"");
+        if (p != std::string::npos) p = mons.find("\"id\":", p);
+        if (p != std::string::npos) {
+            p += 5;
+            while (p < mons.size() &&
+                   (mons[p] == ' ' || mons[p] == '\n' || mons[p] == '\t'))
+                ++p;
+            while (p < mons.size() && (isdigit((unsigned char)mons[p]) ||
+                                       mons[p] == '-'))
+                ws += mons[p++];
+        }
+        return ws;
+    }
+    // Agent terminals on special:mbagent open links in Brave; Hyprland
+    // then maps those windows onto the same special (xdg-activation /
+    // opener workspace). togglespecialworkspace would raise them with
+    // the popup. Send every non-agent client back to the real workspace.
+    void evict_strays() {
+        if (hdir_.empty()) return;
+        std::string dest = normal_ws_id();
+        if (dest.empty()) dest = "1";
+        std::string j   = hypr_request(hdir_, "j/clients");
+        size_t      pos = 0;
+        while (true) {
+            size_t a = j.find("\"address\": \"", pos);
+            if (a == std::string::npos) break;
+            a += 12;
+            size_t e = j.find('"', a);
+            if (e == std::string::npos) break;
+            size_t next = j.find("\"address\": \"", e);
+            std::string chunk =
+                j.substr(e, (next == std::string::npos ? j.size() : next) - e);
+            pos = e;
+            if (chunk.find("\"name\": \"special:mbagent\"") ==
+                std::string::npos)
+                continue;
+            std::string cls;
+            size_t c = chunk.find("\"class\": \"");
+            if (c != std::string::npos) {
+                c += 10;
+                size_t ce = chunk.find('"', c);
+                if (ce != std::string::npos) cls = chunk.substr(c, ce - c);
+            }
+            if (is_agent_class(cls)) continue;
+            std::string addr = j.substr(a, e - a);
+            std::string sel =
+                addr.rfind("0x", 0) == 0 ? addr : "0x" + addr;
+            hypr_dispatch2(
+                hdir_,
+                "dispatch movetoworkspacesilent " + dest + ",address:" +
+                    sel,
+                "dispatch \"movetoworkspacesilent " + dest + ",address:" +
+                    sel + "\"");
+            DBG("agents: evicted stray class='%s' addr=%s -> workspace %s",
+                cls.c_str(), sel.c_str(), dest.c_str());
+        }
+    }
+    // Find a session window that already exists on our special workspace
+    // — e.g. from a previous MattBar run — and adopt it instead of ever
+    // spawning a duplicate. Only the configured agent class is ours:
+    // browsers opened from the agent inherit the special and must not
+    // be treated as the session window.
     bool discover_session() {
         if (hdir_.empty()) return false;
+        evict_strays();
         std::string j = hypr_request(hdir_, "j/clients");
         size_t      pos = 0;
         int         extras = 0;
@@ -733,15 +1184,21 @@ private:
                 j.substr(e, (next == std::string::npos ? j.size() : next) - e);
             if (chunk.find("\"name\": \"special:mbagent\"") !=
                 std::string::npos) {
+                std::string here;
+                size_t c = chunk.find("\"class\": \"");
+                if (c != std::string::npos) {
+                    c += 10;
+                    size_t ce = chunk.find('"', c);
+                    if (ce != std::string::npos)
+                        here = chunk.substr(c, ce - c);
+                }
+                if (!is_agent_class(here)) {
+                    pos = e;
+                    continue;
+                }
                 if (addr.empty()) {
-                    addr     = j.substr(a, e - a);
-                    size_t c = chunk.find("\"class\": \"");
-                    if (c != std::string::npos) {
-                        c += 10;
-                        size_t ce = chunk.find('"', c);
-                        if (ce != std::string::npos)
-                            cls = chunk.substr(c, ce - c);
-                    }
+                    addr = j.substr(a, e - a);
+                    cls  = here;
                 } else {
                     ++extras;
                 }
@@ -749,32 +1206,36 @@ private:
             pos = e;
         }
         if (addr.empty()) return false;
-        if (addr.rfind("0x", 0) == 0) addr = addr.substr(2);
-        term_addr_  = addr;
+        term_addr_  = addr_norm(addr);
         term_cls_   = cls;
         term_open_  = true;
         on_special_ = true;
         adopt_ms_   = now_ms();
-        // An adopted leftover says nothing about our spawn command: its exit must not feed the fast-exit failure streak.
+        // An adopted leftover says nothing about our spawn command: its
+        // exit must not feed the fast-exit failure streak.
         spawned_by_us_ = false;
-        // Is the special currently revealed? (Bookkeeping must match reality or the first toggle goes the wrong way.)
-        std::string mons = hypr_request(hdir_, "j/monitors");
-        shown_ = mons.find("\"name\": \"special:mbagent\"") !=
-                 std::string::npos;
+        // Is the special currently revealed? (Bookkeeping must match
+        // reality or the first toggle goes the wrong way.)
+        sync_shown();
         if (extras)
             DBG("agents: %d additional leftover session(s) on the "
                 "special; each will be adopted as the current one exits",
                 extras);
         return true;
     }
-    // Terminal-session popup: toggle a live session, or spawn one onto the hidden special workspace and let sock2 adoption reveal it.
+    // Terminal-session popup: toggle a live session, or spawn one onto
+    // the hidden special workspace and let sock2 adoption reveal it.
+    // panel_on_fail guards against ping-pong when we arrived here FROM a
+    // failed panel attempt.
     bool spawn_popup(bool panel_on_fail) {
         if (hdir_.empty() || sock2_fd_ < 0) {
             DBG("agents: popup unavailable (no hypr sockets)");
             return false;
         }
         if (now_ms() < fail_until_) {
-            // Two sessions in a row died within seconds of opening: the COMMAND is broken, not the popup — respawning would just flash invisibly forever.
+            // Two sessions in a row died within seconds of opening: the
+            // COMMAND is broken, not the popup — respawning would just
+            // flash invisibly forever. Route to the panel and say so.
             DBG("agents: session command keeps exiting immediately; "
                 "run this in a terminal to see why:  %s",
                 cfg.agents_term.c_str());
@@ -786,32 +1247,18 @@ private:
                 "(no new process spawned)", term_addr_.c_str());
             place_popup(); // leftovers from old builds may still be tiled
         }
-        if (term_open_) { // session lives: toggle the dropdown
+        if (term_open_) { // session lives: reveal (hide is on_click's job)
             if (!on_special_) {
-                // Adopted, but stranded on a normal workspace (exec rules were lost and the first repair failed): each click re-attempt...
+                // Adopted, but stranded on a normal workspace (exec rules
+                // were lost and the first repair failed): each click
+                // re-attempts the move instead of piling up sessions.
                 repair(term_addr_);
                 return true;
             }
-            if (!shown_ && !spawned_by_us_ && !migrated_ &&
-                stale_geometry()) {
-                // A pre-rule leftover can't be resized in place on this build: reveal it, confirm focus, close it, and respawn a rule-g...
-                migrated_ = true;
-                show(true);
-                focus_popup();
-                if (verify_focus()) {
-                    DBG("agents: pre-rule session has stale geometry; "
-                        "migrating (close + rule-governed respawn)");
-                    migrate_respawn_ = true;
-                    hypr_dispatch2(hdir_,
-                                   "dispatch closewindow " + term_sel(),
-                                   "dispatch hl.dsp.window.close()");
-                    return true;
-                }
-                DBG("agents: migration skipped (focus unconfirmed)");
-                return true;
-            }
-            if (!shown_) place_popup(); // idempotent; also fixes
-            show(!shown_);              // init-discovered leftovers
+            // Never closewindow a live session to "fix" 800x600 leftovers.
+            // Hyprland 0.56 can resize in place via hl.dsp.window.resize.
+            if (!shown_) place_popup();
+            show(true);
             if (shown_) {
                 focus_popup();
                 hint_eject();
@@ -832,8 +1279,9 @@ private:
                 "special:mbagent silent] " + cmd,
                 "dispatch hl.dsp.exec_cmd(\"" + lua_str(cmd) +
                     "\", { float = true, size = \"" + sz +
-                    "\", workspace = \"special:mbagent silent\" })")) {
-            // Both dialects rejected the exec (or Hyprland timed out). Never latch a dead state behind a silent click.
+                    "\", workspace = \"special:mbagent\" })")) {
+            // Both dialects rejected the exec (or Hyprland timed out).
+            // Never latch a dead state behind a silent click.
             spawning_ = false;
             DBG("agents: terminal spawn dispatch failed%s",
                 panel_on_fail ? "; panel fallback" : "");
@@ -854,7 +1302,9 @@ private:
         }
         timerfd_settime(spawn_fd_, 0, &ts, nullptr);
     }
-    // Escape a string for embedding in a double-quoted Lua literal (the command travels inside hl.dsp.exec_cmd("...")): a u...
+    // Escape a string for embedding in a double-quoted Lua literal (the
+    // command travels inside hl.dsp.exec_cmd("...")): a user-configured
+    // agents_term containing quotes must not break out of the string.
     static std::string lua_str(const std::string& s) {
         std::string o;
         o.reserve(s.size());
@@ -864,7 +1314,9 @@ private:
         }
         return o;
     }
-    // The popup size is spliced into dispatch strings for BOTH dialects, so it is validated down to digits/%/space; anythin...
+    // The popup size is spliced into dispatch strings for BOTH dialects,
+    // so it is validated down to digits/%/space; anything else falls back
+    // to the stock footprint rather than risking a malformed dispatch.
     static std::string popup_size() {
         const std::string& v = cfg.agents_popup_size;
         int fields = 0;
@@ -876,7 +1328,11 @@ private:
         }
         return (ok && fields == 2) ? v : "36% 44%";
     }
-    // Exec rules got lost (Hyprland 0.55 Lua exec_cmd matches rules by the spawned PID; terminals that hand off to a running instance defeat it): the session window is real but sitting on a normal workspace.
+    // Exec rules got lost (Hyprland 0.55 Lua exec_cmd matches rules by the
+    // spawned PID; terminals that hand off to a running instance defeat
+    // it): the session window is real but sitting on a normal workspace.
+    // Move it onto our special by address, then reveal. Event addresses
+    // come without the 0x selector prefix.
     void repair(const std::string& addr) {
         std::string sel = "address:" +
                           (addr.rfind("0x", 0) == 0 ? addr : "0x" + addr);
@@ -891,7 +1347,9 @@ private:
             show(true);          // ...and drops back down managed
             focus_popup();
         } else {
-            // Can't re-home it. The window is at least VISIBLE where it is — degrade to that honestly instead of hiding a live sess...
+            // Can't re-home it. The window is at least VISIBLE where it
+            // is — degrade to that honestly instead of hiding a live
+            // session: no auto-dismiss, next click retries the move.
             on_special_ = false;
             shown_      = true;
             DBG("agents: repair move failed; session left on the current "
@@ -907,17 +1365,28 @@ private:
         return f;
     }
     void show(bool want) {
+        sync_shown();
         if (want == shown_) return;
+        if (want) evict_strays();
         DBG("agents: %s the popup (togglespecialworkspace mbagent)",
             want ? "revealing" : "hiding");
         hypr_dispatch2(hdir_, "dispatch togglespecialworkspace mbagent",
                        "dispatch hl.dsp.workspace.toggle_special("
                        "\"mbagent\")");
-        shown_ = want;
-        if (want) {
+        // Bookkeeping follows the compositor, not the request. Optimistic
+        // shown_=want plus togglespecialworkspace is how a leftover
+        // desync made glyph clicks alternate show/hide (or never hide).
+        shown_ = special_is_shown();
+        if (shown_ != want)
+            DBG("agents: special did not %s (compositor shown=%d)",
+                want ? "show" : "hide", (int)shown_);
+        if (want && shown_) {
             reveal_ms_     = now_ms();
             popup_focused_ = false;
             foreign_seen_  = false;
+            hid_ms_        = 0;
+        } else if (!want && !shown_) {
+            hid_ms_ = now_ms();
         }
     }
     static uint64_t now_ms() {
@@ -936,27 +1405,39 @@ private:
             std::string ws  = rest.substr(a + 1, b - a - 1);
             std::string cls = rest.substr(b + 1, c - b - 1);
             if (!spawning_) {
-                // A foreign window appearing while the dropdown is up means the user is acting elsewhere (their outside clicks reach th...
-                const std::string& ours = term_cls_.empty()
-                                              ? cfg.agents_term_class
-                                              : term_cls_;
-                if (shown_ && on_special_ && cls != ours &&
-                    ws != "special:mbagent") {
+                // A foreign window appearing while the dropdown is up
+                // means the user is acting elsewhere (their outside
+                // clicks reach the desktop layer and can launch things —
+                // observed in the field: Omarchy's background selector).
+                if (is_agent_special(ws) && !is_agent_class(cls)) {
+                    DBG("agents: stray '%s' mapped on the special; "
+                        "evicting",
+                        cls.c_str());
+                    evict_strays();
+                    return;
+                }
+                if (shown_ && on_special_ && !is_agent_class(cls) &&
+                    !is_agent_special(ws)) {
                     DBG("agents: foreign window '%s' opened; hiding the "
                         "popup", cls.c_str());
                     show(false);
                 }
                 return;
             }
-            bool ours_ws  = ws == "special:mbagent";
-            bool ours_cls = cls == cfg.agents_term_class;
+            bool ours_ws  = is_agent_special(ws);
+            bool ours_cls = is_agent_class(cls);
             DBG("agents: openwindow addr=%s ws='%s' class='%s' -> %s",
                 rest.substr(0, a).c_str(), ws.c_str(), cls.c_str(),
-                ours_ws   ? "ADOPT (our workspace)"
-                : ours_cls ? "ADOPT (our class, wrong workspace)"
-                           : "not ours");
-            if (!ours_ws && !ours_cls) return;
-            term_addr_ = rest.substr(0, a);
+                ours_cls && ours_ws    ? "ADOPT"
+                : ours_cls             ? "ADOPT (our class, wrong workspace)"
+                : ours_ws              ? "stray on special (evict)"
+                                       : "not ours");
+            if (ours_ws && !ours_cls) {
+                evict_strays();
+                return;
+            }
+            if (!ours_cls) return;
+            term_addr_ = addr_norm(rest.substr(0, a));
             term_cls_  = cls;
             term_open_ = true;
             spawning_  = false;
@@ -975,7 +1456,8 @@ private:
                 repair(term_addr_);
             }
         } else if (l.rfind("closewindow>>", 0) == 0) {
-            if (term_open_ && l.substr(13) == term_addr_) {
+            if (term_open_ &&
+                addr_norm(l.substr(13)) == addr_norm(term_addr_)) {
                 const uint64_t age = now_ms() - adopt_ms_;
                 DBG("agents: session window closed after %llu ms",
                     (unsigned long long)age);
@@ -1008,22 +1490,53 @@ private:
                 on_special_ = false;
                 term_addr_.clear();
                 term_cls_.clear();
-                if (migrate_respawn_) {
-                    migrate_respawn_ = false;
-                    DBG("agents: spawning the rule-governed replacement");
-                    spawn_popup(false);
-                }
+            }
+        } else if (l.rfind("activespecial>>", 0) == 0) {
+            // WORKSPACE,MONITOR — empty workspace means no special is
+            // overlaid. Keep shown_ in lockstep with the compositor so
+            // the next glyph click doesn't toggle the wrong way.
+            std::string rest = l.substr(15);
+            size_t      c    = rest.find(',');
+            std::string ws   = c == std::string::npos ? rest
+                                                      : rest.substr(0, c);
+            bool vis = is_agent_special(ws) || ws == "mbagent";
+            if (shown_ != vis) {
+                DBG("agents: compositor special %s (activespecial '%s')",
+                    vis ? "shown" : "hidden", ws.c_str());
+                shown_ = vis;
+                if (!vis) hid_ms_ = now_ms();
             }
         } else if (l.rfind("activewindow>>", 0) == 0) {
-            // CLASS,TITLE — focus-follows-mouse makes this the mouse-out signal.
+            // CLASS,TITLE — focus-follows-mouse makes this the mouse-out
+            // signal. Empty class (focus on nothing) keeps the popup up.
+            // Compare against the class the window actually reported, and
+            // only auto-dismiss a session we manage on the special (a
+            // repaired-in-place session has nowhere to hide to).
+            //
+            // Reveal race: the popup spawns `silent` (unfocused), and
+            // revealing the special while the pointer sits on the BAR
+            // makes Hyprland hand focus to the toplevel near the cursor —
+            // the user's own terminal. That foreign activewindow arrives
+            // one frame after our reveal and is NOT a mouse-out. So
+            // dismissal only arms once the popup has actually been
+            // focused (the user moused into it), or after a grace period
+            // long past any focus-shuffle the reveal itself causes.
             std::string cls = l.substr(14, l.find(',', 14) - 14);
             const std::string& ours =
                 term_cls_.empty() ? cfg.agents_term_class : term_cls_;
-            if (!shown_ || !on_special_ || cls.empty()) return;
+            if (!on_special_) return;
+            if (now_ms() < suppress_dismiss_until_) return;
+            sync_shown();
+            if (!shown_) return;
             const uint64_t since = now_ms() - reveal_ms_;
             if (cls == ours) {
-                // Hyprland auto-focuses the special's window the moment it is re-revealed — that is NOT the user entering the popup and must not arm dismissal (field bug: instant re-reveals dismissed during bar->popup travel).
-                if (!popup_focused_ && (foreign_seen_ || since > 800)) {
+                // Hyprland auto-focuses the special's window the moment
+                // it is re-revealed — that is NOT the user entering the
+                // popup and must not arm dismissal (field bug: instant
+                // re-reveals dismissed during bar->popup travel). USER
+                // entry is an our-class focus that follows travel (a
+                // foreign crossing) or comes well after reveal.
+                if (!popup_focused_ && (foreign_seen_ || since > 400)) {
                     popup_focused_ = true;
                     DBG("agents: popup entered "
                         "(mouse-out dismissal armed)");
@@ -1032,15 +1545,18 @@ private:
                 }
                 return;
             }
-            if (!popup_focused_ && since <= 1500) {
-                // Focus-follows-mouse firing while the pointer crosses windows on its way to the popup: travel, not mouse-out.
+            if (!popup_focused_ && since <= 400) {
+                // Focus-follows-mouse firing while the pointer crosses
+                // windows on its way to the popup: travel, not mouse-out.
                 foreign_seen_ = true;
                 DBG("agents: ignoring focus '%s' (travel toward the "
                     "popup)", cls.c_str());
                 return;
             }
+            // Empty class: focus on wallpaper / a layer surface (the
+            // bar). After the reveal bounce, that is an outside click.
             DBG("agents: mouse-out (focus moved to '%s'); hiding",
-                cls.c_str());
+                cls.empty() ? "(none)" : cls.c_str());
             show(false);
         }
     }
@@ -1051,7 +1567,8 @@ private:
                                        IN_DELETE);
     }
 
-    // Targeted field extraction (house style; records are machine-written, flat, sort_keys=true).
+    // Targeted field extraction (house style; records are machine-written,
+    // flat, sort_keys=true). "percent" occurs only inside limit entries.
     static double max_percent(const std::string& j, bool& ready) {
         ready    = j.find("\"ready\":true") != std::string::npos;
         double m = -1;
@@ -1108,18 +1625,27 @@ private:
     bool        init_done_ = false;
     uint64_t    adopt_ms_ = 0, fail_until_ = 0; // fast-exit detection
     uint64_t    reveal_ms_ = 0;                 // dismissal grace anchor
+    uint64_t    hid_ms_ = 0;                    // last successful hide
+    uint64_t    suppress_dismiss_until_ = 0;    // glyph-click race guard
     int         fail_streak_ = 0;
     bool        hold_next_ = false, popup_focused_ = false;
     bool        foreign_seen_ = false;
     bool        spawned_by_us_ = false;
-    bool        migrated_ = false, migrate_respawn_ = false;
     bool        hinted_ = false;
     bool        term_open_ = false, shown_ = false, spawning_ = false;
     bool        on_special_ = false; // window actually lives on the special
+    std::string placed_size_;        // last applied agents_popup_size
 };
 
 
-// --------------------------------------------------------------------------- Microphone: default-source state beside the volume module.
+// ---------------------------------------------------------------------------
+// Microphone: default-source state beside the volume module. On hardware
+// like the MattBook — where the analog mic is a phantom and Bluetooth
+// earbuds are the only real capture device — "which source is default and
+// is it muted" is load-bearing: the bluez rune means a microphone that
+// actually hears you. Event-driven off the shared pactl stream; writes use
+// the same accumulate-and-drain pattern as the volume module.
+// ---------------------------------------------------------------------------
 class MicrophoneModule : public TextModule {
 public:
     bool enabled() const override { return cfg.show_microphone; }
@@ -1141,7 +1667,7 @@ public:
 
     bool on_click(double, int button) override {
         if (button == BTN_LEFT) {
-            spawn_detached(cfg.mic_click);
+            spawn_detached(live_panel_click(cfg.mic_click, "omarchy.audio"));
             return false;
         }
         if (button == BTN_RIGHT) {
@@ -1218,7 +1744,13 @@ private:
     bool     pend_toggle_ = false;
 };
 
-// --------------------------------------------------------------------------- Screen-recording indicator: a red light while a recorder process runs, invisible otherwise.
+// ---------------------------------------------------------------------------
+// Screen-recording chip. Same contract as Omarchy's QS ScreenRecording
+// indicator: the recorder itself is `omarchy-capture-screenrecording`
+// (gpu-screen-recorder). Idle click opens Omarchy's capture submenu
+// (audio / mic / webcam options); click while recording stops. Detection
+// is an in-process /proc scan, only while a bar is revealed.
+// ---------------------------------------------------------------------------
 class ScreenRecordModule : public TextModule {
 public:
     bool enabled() const override { return cfg.show_screenrecord; }
@@ -1232,21 +1764,30 @@ public:
         if (rec != rec_ || !init_) {
             rec_  = rec;
             init_ = true;
-            set_text(*bar_, rec_ ? cfg.screenrecord_glyph : "", cfg.c_urgent);
+            set_text(*bar_, cfg.screenrecord_glyph,
+                     rec_ ? cfg.c_urgent : cfg.c_dim);
             DBG("screenrecord: %s", rec_ ? "recording" : "idle");
         }
     }
     bool on_click(double, int button) override {
-        if (button == BTN_LEFT && rec_) {
+        if (button != BTN_LEFT) return false;
+        if (rec_) {
             spawn_detached(cfg.screenrecord_stop);
             return true;
         }
-        return false;
+        if (auto* sh = mattbar_shell()) {
+            sh->toggle("omarchy.menu",
+                       "{\"menu\":\"trigger.capture.screenrecord\"}");
+            return true;
+        }
+        spawn_detached("omarchy-menu toggle trigger.capture.screenrecord");
+        return true;
     }
 
 private:
     bool recorder_running() const {
-        // comma-separated command prefixes, e.g.
+        // comma-separated command prefixes, e.g. gpu-screen-recorder (4.x),
+        // wf-recorder (3.x). Prefix-match on /proc/<pid>/cmdline argv[0].
         DIR* d = opendir("/proc");
         if (!d) return false;
         bool found = false;
@@ -1286,7 +1827,9 @@ private:
     bool rec_  = false, init_ = false;
 };
 
-// --------------------------------------------------------------------------- Hyprland workspaces ---------------------...
+// ---------------------------------------------------------------------------
+// Hyprland workspaces
+// ---------------------------------------------------------------------------
 namespace {
 
 std::string hypr_socket_dir() {
@@ -1305,7 +1848,12 @@ std::string hypr_socket_dir() {
 int unix_connect(const std::string& path) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
-    // Bounded I/O, always. At session start (or during a config reload) Hyprland can sit on its command socket for a long t...
+    // Bounded I/O, always. At session start (or during a config reload)
+    // Hyprland can sit on its command socket for a long time; an unbounded
+    // connect/read here starves the sd_notify watchdog pings and systemd
+    // kills the whole cgroup — the bar AND its pactl subscribe child. Any
+    // single stall is now capped well under WatchdogSec. (Streams that get
+    // O_NONBLOCK afterwards are unaffected by these timeouts.)
     timeval tv{2, 0};
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -1328,6 +1876,7 @@ std::string hypr_request(const std::string& dir, const std::string& cmd) {
     char buf[4096];
     ssize_t n;
     // SO_RCVTIMEO bounds each read; the deadline bounds a slow trickle.
+    // Worst case for the whole request stays far below the 10 s watchdog.
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     const long deadline = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L + 3000;
@@ -1342,7 +1891,14 @@ std::string hypr_request(const std::string& dir, const std::string& cmd) {
     return out;
 }
 
-// Hyprland >= 0.55 with a Lua config (what Omarchy Quattro converts every install to) evaluates a socket1 `dispatch X` as Lua: `hl.dispatch(X)`.
+// Hyprland >= 0.55 with a Lua config (what Omarchy Quattro converts every
+// install to) evaluates a socket1 `dispatch X` as Lua: `hl.dispatch(X)`.
+// The hyprlang form `workspace 3` is a Lua syntax error there — swallowed,
+// so clicks silently do nothing. A .conf config still takes the legacy
+// dispatcher-table path, and each config type rejects the other's syntax.
+// So: send the form that last worked; on a reply that isn't "ok", try the
+// other and remember. Costs one extra round-trip per config-type change,
+// i.e. approximately never.
 bool hypr_dispatch2(const std::string& dir, const std::string& legacy,
                     const std::string& lua) {
     static int mode = 0; // 0 unknown, 1 legacy hyprlang, 2 lua (shared:
@@ -1377,6 +1933,8 @@ std::vector<int> extract_ids(const std::string& json) {
 }
 
 // Pull (workspace id, monitor name) pairs out of Hyprland's j/workspaces.
+// Same no-JSON-dependency approach as extract_ids: each workspace object
+// carries "id" and "monitor", and they appear in that order.
 std::vector<std::pair<int, std::string>> extract_ws_monitors(
     const std::string& json) {
     std::vector<std::pair<int, std::string>> out;
@@ -1400,7 +1958,8 @@ std::vector<std::pair<int, std::string>> extract_ws_monitors(
     return out;
 }
 
-// monitor name -> its active workspace id, from j/monitors. "name" precedes "activeWorkspace" in each monitor object.
+// monitor name -> its active workspace id, from j/monitors. "name" precedes
+// "activeWorkspace" in each monitor object.
 std::map<std::string, int> extract_active_per_monitor(
     const std::string& json) {
     std::map<std::string, int> out;
@@ -1450,7 +2009,10 @@ public:
         }
     }
 
-    // With multi-monitor on, each bar shows the workspaces that live on ITS monitor; the bar being drawn tells us which one that is.
+    // With multi-monitor on, each bar shows the workspaces that live on ITS
+    // monitor; the bar being drawn tells us which one that is. With it off
+    // (or on a compositor-picked surface with no name) every workspace is
+    // shown, exactly as before.
     std::vector<int> visible() const {
         std::string mon = bar_ ? bar_->current_output_name() : std::string();
         if (!cfg.multi_monitor || mon.empty()) return workspaces_;
@@ -1539,7 +2101,8 @@ private:
         std::sort(ws.begin(), ws.end());
         auto act = extract_ids(hypr_request(dir_, "j/activeworkspace"));
         int active = act.empty() ? -1 : act.front();
-        // Only ask for the per-monitor picture when it can matter; on a single-bar setup this is one IPC round-trip saved per r...
+        // Only ask for the per-monitor picture when it can matter; on a
+        // single-bar setup this is one IPC round-trip saved per refresh.
         std::map<std::string, int> actmon;
         if (cfg.multi_monitor)
             actmon = extract_active_per_monitor(
@@ -1559,7 +2122,8 @@ private:
         ssize_t n;
         bool relevant = false;
         while ((n = read(ev_fd_, buf, sizeof buf)) > 0) {
-            // Hyprland's socket2 fires for every focus/window change too; only workspace-affecting events warrant a re-query.
+            // Hyprland's socket2 fires for every focus/window change too;
+            // only workspace-affecting events warrant a re-query.
             static const char* keys[] = {"workspace>>",     "workspacev2>>",
                                          "createworkspace", "destroyworkspace",
                                          "moveworkspace",   "renameworkspace",
@@ -1594,7 +2158,9 @@ private:
 } // namespace
 Module* make_workspaces() { return new WorkspacesModule; }
 
-// --------------------------------------------------------------------------- Battery ---------------------------------...
+// ---------------------------------------------------------------------------
+// Battery
+// ---------------------------------------------------------------------------
 namespace {
 class BatteryModule : public TextModule {
 public:
@@ -1626,7 +2192,9 @@ public:
         std::string t;
         if (cfg.battery_show_time && !cfg_vertical() &&
             (status == "Discharging" || status == "Charging")) {
-            // energy_*/power_now (µWh/µW) on most laptops; charge_*/ current_now (µAh/µA) on the rest — the ratio is hours either way.
+            // energy_*/power_now (µWh/µW) on most laptops; charge_*/
+            // current_now (µAh/µA) on the rest — the ratio is hours either
+            // way. Time-to-empty when draining, time-to-full when charging.
             double now  = atof(slurp(path_ + "/energy_now").c_str());
             double full = atof(slurp(path_ + "/energy_full").c_str());
             double rate = atof(slurp(path_ + "/power_now").c_str());
@@ -1645,7 +2213,10 @@ public:
                 }
             }
         }
-        set_text(*bar_, prefix + std::to_string(cap) + "%" + sym + t, c);
+        if (!cfg.power_show_pct && !cfg_vertical())
+            set_text(*bar_, (sym.empty() ? std::string("BAT") : sym), c);
+        else
+            set_text(*bar_, prefix + std::to_string(cap) + "%" + sym + t, c);
         // Alerts: once per threshold crossing, reset when charging resumes.
         if (status == "Discharging") {
             if (cap <= 5 && !warned5_) {
@@ -1663,6 +2234,18 @@ public:
             warned15_ = warned5_ = false;
         }
     }
+    bool on_click(double, int button) override {
+        if (path_.empty()) return false;
+        if (button == BTN_RIGHT) {
+            cfg.power_show_pct = !cfg.power_show_pct;
+            cfg.save();
+            tick();
+            return true;
+        }
+        auto* sh = mattbar_shell();
+        if (sh) sh->toggle("omarchy.power", "");
+        return true;
+    }
 private:
     Bar* bar_ = nullptr;
     std::string path_;
@@ -1671,9 +2254,16 @@ private:
 } // namespace
 Module* make_battery() { return new BatteryModule; }
 
-// --------------------------------------------------------------------------- Network (default route interface + SSID i...
+// ---------------------------------------------------------------------------
+// Network (default route interface + SSID if wireless)
+// ---------------------------------------------------------------------------
 namespace {
-// -------------------------------------------------------------------------- nl80211: fetch the SSID of an associated wireless interface without spawning iw.
+// --------------------------------------------------------------------------
+// nl80211: fetch the SSID of an associated wireless interface without
+// spawning iw. Family id resolved once via the genetlink controller, then
+// NL80211_CMD_GET_INTERFACE per query; the kernel includes NL80211_ATTR_SSID
+// while associated. Returns "" on any failure.
+// --------------------------------------------------------------------------
 std::string wifi_ssid(const std::string& iface) {
     unsigned idx = if_nametoindex(iface.c_str());
     if (!idx) return {};
@@ -1758,7 +2348,11 @@ public:
     bool enabled() const override { return cfg.show_network; }
     void init(Bar& bar) override {
         bar_ = &bar;
-        // Event-driven: an rtnetlink socket delivers link and route changes — interface up/down, Wi-Fi (re)association, default route moves — so `iw` runs only when the network actually changed, not every 5 seconds of visibility.
+        // Event-driven: an rtnetlink socket delivers link and route
+        // changes — interface up/down, Wi-Fi (re)association, default
+        // route moves — so `iw` runs only when the network actually
+        // changed, not every 5 seconds of visibility. SSID changes always
+        // ride a reassociation, so link events cover them.
         nl_fd_ = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
                         NETLINK_ROUTE);
         if (nl_fd_ >= 0) {
@@ -1771,7 +2365,8 @@ public:
             }
         }
         if (nl_fd_ >= 0) {
-            // Debounce: a Wi-Fi association is a burst of link + route messages; one query 300 ms after the burst settles.
+            // Debounce: a Wi-Fi association is a burst of link + route
+            // messages; one query 300 ms after the burst settles.
             debounce_fd_ =
                 timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
             bar.add_fd(debounce_fd_, [this](uint32_t) {
@@ -1799,7 +2394,7 @@ public:
     }
     bool on_click(double, int button) override {
         if (button != BTN_LEFT) return false;
-        spawn_detached(cfg.network_click); // e.g. omarchy-launch-wifi
+        spawn_detached(live_panel_click(cfg.network_click, "omarchy.network"));
         return false;
     }
     void tick() override {
@@ -1822,7 +2417,12 @@ private:
             set_text(*bar_, iface); // wired: nothing to ask
             return;
         }
-        // In-process nl80211 query — the last steady-state external binary (iw) is gone.
+        // In-process nl80211 query — the last steady-state external binary
+        // (iw) is gone. One genetlink round-trip to the local kernel is
+        // microseconds, the same latency class as the /proc/net/route read
+        // above, so no async machinery: it cannot stall the way a
+        // mid-association iw could. Empty answer (not associated, exotic
+        // kernel) degrades to the interface name, as before.
         std::string ssid = wifi_ssid(iface);
         set_text(*bar_, ssid.empty() ? iface : ssid);
     }
@@ -1846,14 +2446,19 @@ private:
 } // namespace
 Module* make_network() { return new NetworkModule; }
 
-// --------------------------------------------------------------------------- Volume (PipeWire via wpctl, fallback pactl).
+// ---------------------------------------------------------------------------
+// Volume (PipeWire via wpctl, fallback pactl). Scroll to adjust, click mutes.
+// ---------------------------------------------------------------------------
 namespace {
 class VolumeModule : public TextModule {
 public:
     bool enabled() const override { return cfg.show_volume; }
     void init(Bar& bar) override {
         bar_ = &bar;
-        // Event-driven: the shared pactl-subscribe stream tells us when the sink actually changed; that is the only time the mixer is asked.
+        // Event-driven: the shared pactl-subscribe stream tells us when the
+        // sink actually changed; that is the only time the mixer is asked.
+        // While hidden nothing is spawned — the change is marked stale and
+        // the query happens at the moment of reveal, workspace-style.
         audio_events().subscribe(bar, [this](bool sink, bool) {
             if (!sink) return;
             if (bar_->expanded()) refresh();
@@ -1871,7 +2476,7 @@ public:
     }
     bool on_click(double, int button) override {
         if (button == BTN_LEFT) { // Omarchy convention: open the mixer
-            spawn_detached(cfg.volume_click);
+            spawn_detached(live_panel_click(cfg.volume_click, "omarchy.audio"));
             return false;
         }
         if (button == BTN_RIGHT) { // mute toggle, async (see flush_set)
@@ -1886,7 +2491,17 @@ public:
         flush_set();
         return true;
     }
-    // ---- async volume/mute writes ---------------------------------------- The old code ran system() per input event: bounded by `timeout 0.4`, but during an audio-stack storm (the exact scenario v1.23.1 exists for) every scroll notch could block the event loop up to 400ms.
+    // ---- async volume/mute writes ----------------------------------------
+    // The old code ran system() per input event: bounded by `timeout 0.4`,
+    // but during an audio-stack storm (the exact scenario v1.23.1 exists
+    // for) every scroll notch could block the event loop up to 400ms.
+    // AsyncCmd's latest-wins coalescing can't be used directly for setters
+    // — it would drop scroll notches — so state accumulates here and one
+    // in-flight subprocess drains it: a six-notch flick becomes at most two
+    // forks (the running one, then a single summed `N%+`), the final volume
+    // is identical, and the event loop never waits. The in-shell `timeout
+    // 0.4` stays so a hung wpctl still falls through to the pactl fallback;
+    // AsyncCmd's own 1500ms kill is the backstop for a hung shell.
     void flush_set() {
         if (set_cmd_.running()) return; // completion callback re-drains
         std::string cmd;
@@ -1918,7 +2533,12 @@ public:
         }, 1500);
     }
 private:
-    // One compound shell invocation gathers everything the module needs — sink properties (headset detection), volume+mute (wpctl, pactl fallback), and the wired-jack active port — separated by markers, parsed when the ASYNC result arrives.
+    // One compound shell invocation gathers everything the module needs —
+    // sink properties (headset detection), volume+mute (wpctl, pactl
+    // fallback), and the wired-jack active port — separated by markers,
+    // parsed when the ASYNC result arrives. One subprocess per refresh,
+    // zero milliseconds of event-loop blocking, storms coalesced by
+    // AsyncCmd into at most one queued follow-up.
     static std::string prop_of(const std::string& out, const char* key) {
         auto p = out.find(key);
         if (p == std::string::npos) return {};
@@ -1971,7 +2591,8 @@ private:
                     : out.substr(m1 + 8, m2 - m1 - 8);
             std::string port =
                 m2 == std::string::npos ? std::string() : out.substr(m2 + 8);
-            // Detection cadence: every refresh in event mode (the refresh IS a device change); every 5th in poll-fallback mode.
+            // Detection cadence: every refresh in event mode (the refresh
+            // IS a device change); every 5th in poll-fallback mode.
             if (audio_events().available() || detect_ctr_++ % 5 == 0)
                 headset_ = detect_from(inspect, port);
             apply_volume(vol);
@@ -2004,7 +2625,9 @@ private:
         }
     }
     double width(cairo_t* cr) override {
-        // Rune fallback runs at the first paint (needs cairo): configured glyph, then the MD headphones rune, then "HP".
+        // Rune fallback runs at the first paint (needs cairo): configured
+        // glyph, then the MD headphones rune, then "HP". A change of font
+        // or glyph in settings re-resolves and recomposes the label.
         if (checked_ != cfg.font + cfg.volume_headset_glyph) {
             checked_ = cfg.font + cfg.volume_headset_glyph;
             auto mapped = [&](const std::string& t) {
@@ -2046,7 +2669,15 @@ private:
 } // namespace
 Module* make_volume() { return new VolumeModule; }
 
-// --------------------------------------------------------------------------- Bluetooth (BlueZ over the system bus).
+// ---------------------------------------------------------------------------
+// Bluetooth (BlueZ over the system bus). Fully event-driven, MattBar-style:
+// one async GetManagedObjects at startup, then bus-daemon-filtered signals
+// (InterfacesAdded/Removed and PropertiesChanged, both sender-scoped to
+// org.bluez) keep the state current. No polling, no timers beyond sd-bus's
+// own drive-me-at-this-deadline contract — an idle adapter costs zero
+// wakeups. Left-click launches cfg.bluetooth_click (Omarchy's bluetui by
+// default); right-click toggles adapter power straight through BlueZ.
+// ---------------------------------------------------------------------------
 namespace {
 static uint64_t bt_mono_ms() {
     timespec ts;
@@ -2073,7 +2704,11 @@ public:
             refresh();
             schedule_retry(why); // reconnect with backoff, not death
         };
-        // Recovery timer, armed only while something is wrong: a bar started before bluetoothd is up (login races), a D-Bus restart, or a transient GetManagedObjects failure heals itself with bounded exponential backoff.
+        // Recovery timer, armed only while something is wrong: a bar started
+        // before bluetoothd is up (login races), a D-Bus restart, or a
+        // transient GetManagedObjects failure heals itself with bounded
+        // exponential backoff. Healthy state arms nothing: zero idle
+        // wakeups, exactly as before.
         retry_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
         bar.add_fd(retry_fd_, [this](uint32_t) {
             uint64_t n;
@@ -2090,7 +2725,9 @@ public:
                 pump_.process();
             }
         }, "bluez-retry");
-        // transport watcher plumbing: grace timer, reconnect delay timer, and the shared pactl event stream (sink appear/vanish...
+        // transport watcher plumbing: grace timer, reconnect delay timer,
+        // and the shared pactl event stream (sink appear/vanish is the
+        // authoritative signal; each event triggers one async re-check)
         grace_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
         bar.add_fd(grace_fd_, [this](uint32_t) {
             uint64_t n;
@@ -2135,10 +2772,17 @@ public:
         timerfd_settime(retry_fd_, 0, &ts, nullptr);
     }
 
-    // No periodic work; tick() only recomposes after live orientation flips (TextModule::width calls it when the bar turns ...
+    // No periodic work; tick() only recomposes after live orientation flips
+    // (TextModule::width calls it when the bar turns vertical/horizontal).
     void tick() override { refresh(); }
 
-    // The configured glyph is Nerd Font PUA; whether it renders depends on the font cfg.font actually resolves to (Omarchy 3.8 dropped the Cascadia package MattBar's default family comes from, so fontconfig may substitute a glyph-less font).
+    // The configured glyph is Nerd Font PUA; whether it renders depends on
+    // the font cfg.font actually resolves to (Omarchy 3.8 dropped the
+    // Cascadia package MattBar's default family comes from, so fontconfig
+    // may substitute a glyph-less font). width() runs with the bar font
+    // already selected on cr — verify the glyph maps there (unmapped text
+    // yields glyph index 0 = .notdef) and fall back to the Material Design
+    // rune, then to plain "bt", so the module is never invisible or tofu.
     double width(cairo_t* cr) override {
         resolve_glyph(cr);
         if (glyph_font_.empty() || text_.empty() || cfg_vertical())
@@ -2153,7 +2797,8 @@ public:
             return;
         }
         if (cfg_vertical()) {
-            // narrow bars: render the whole (compact) text in the glyph- capable family rather than juggling segments in ellipsis code
+            // narrow bars: render the whole (compact) text in the glyph-
+            // capable family rather than juggling segments in ellipsis code
             select_glyph_font(cr);
             TextModule::draw(cr, a, t);
             select_bar_font(cr);
@@ -2193,7 +2838,10 @@ public:
         std::string pick = cfg.bluetooth_glyph, fam;
         if (!mapped(pick)) pick = "\U000F00AF";
         if (!mapped(pick)) {
-            // Rung 2: any Nerd-glyph-capable family installed on the system, used for the rune only (the omarchy module already sets the precedent of a module-local font face).
+            // Rung 2: any Nerd-glyph-capable family installed on the system,
+            // used for the rune only (the omarchy module already sets the
+            // precedent of a module-local font face). Covers "bar font is
+            // not a Nerd Font but one is installed" without new deps.
             static const char* fams[] = {
                 "JetBrainsMono Nerd Font",   // Omarchy >= 3.8 / quattro
                 "CaskaydiaMono Nerd Font",   // Omarchy 3.1-era package
@@ -2241,7 +2889,8 @@ public:
                                CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, cfg.font_size);
     }
-    // widths of the glyph segment (its own family) and the remainder (bar font); leaves cr on the bar font.
+    // widths of the glyph segment (its own family) and the remainder (bar
+    // font); leaves cr on the bar font.
     void seg_widths(cairo_t* cr, double* gw, double* rw) {
         std::string g = glyph(), rest = text_;
         if (text_.rfind(g, 0) == 0) rest = text_.substr(g.size());
@@ -2258,8 +2907,12 @@ public:
                 cycle_device();
                 return true;
             }
-            spawn_detached(cfg.bluetooth_click);
-            return false;
+            if (auto* sh = mattbar_shell()) {
+                sh->toggle("omarchy.bluetooth", "");
+                return true;
+            }
+            spawn_detached(live_panel_click(cfg.bluetooth_click, "omarchy.bluetooth"));
+            return true;
         }
         if (button == BTN_RIGHT && bus_ && !adapters_.empty()) {
             const auto& [path, powered] = *adapters_.begin();
@@ -2303,7 +2956,8 @@ private:
         sd_bus_match_signal(bus_, nullptr, "org.bluez", "/",
                             "org.freedesktop.DBus.ObjectManager",
                             "InterfacesRemoved", on_removed, this);
-        // Sender-scoped: the daemon forwards only BlueZ property traffic, so (as with the tray) unrelated bus chatter never wak...
+        // Sender-scoped: the daemon forwards only BlueZ property traffic, so
+        // (as with the tray) unrelated bus chatter never wakes this process.
         sd_bus_match_signal(bus_, nullptr, "org.bluez", nullptr,
                             "org.freedesktop.DBus.Properties",
                             "PropertiesChanged", on_props, this);
@@ -2323,7 +2977,8 @@ private:
         return true;
     }
 
-    // ---- message walking -------------------------------------------------- a{sv} at the current position, applied to `pa...
+    // ---- message walking --------------------------------------------------
+    // a{sv} at the current position, applied to `path` for `iface`.
     void read_props(sd_bus_message* m, const std::string& path,
                     const std::string& iface) {
         if (sd_bus_message_enter_container(m, 'a', "{sv}") < 0) return;
@@ -2396,7 +3051,8 @@ private:
                                 who + (d.connected ? " connected"
                                                    : " disconnected"), 0);
                 }
-                // transport watcher: a connect opens the grace window, a disconnect re-evaluates immediately (clears the wedge)
+                // transport watcher: a connect opens the grace window, a
+                // disconnect re-evaluates immediately (clears the wedge)
                 if (d.connected) arm_grace();
                 else check_transport();
             }
@@ -2528,7 +3184,8 @@ private:
             DBG("bluetooth: '%s'", glyph().c_str());
             return;
         }
-        // Glyph always leads (module identity next to the network SSID); everything after it is settings-controlled.
+        // Glyph always leads (module identity next to the network SSID);
+        // everything after it is settings-controlled.
         std::string t = glyph();
         if (cfg.bluetooth_show_name) {
             size_t cap = (size_t)cfg.bluetooth_name_len;
@@ -2552,7 +3209,16 @@ private:
         DBG("bluetooth: '%s'%s", t.c_str(), wedged_ ? " (wedged)" : "");
     }
 
-    // ---- transport watcher ------------------------------------------------ The wedge the MattBook taught us: Device1.Connected=true while PipeWire has no bluez sink — every layer reports healthy and there is no audio.
+    // ---- transport watcher ------------------------------------------------
+    // The wedge the MattBook taught us: Device1.Connected=true while
+    // PipeWire has no bluez sink — every layer reports healthy and there is
+    // no audio. BlueZ state is already in this module; the sink side comes
+    // from the shared pactl event stream plus one async query. Zero cost
+    // while no audio-class device is connected: nothing is armed, nothing
+    // spawns. Recovery = a clean outbound disconnect/connect cycle, which
+    // the btmon capture proved never collides (experiment A, productized:
+    // click the flagged icon, or bt_auto_heal=true to fire it once
+    // automatically per episode).
     bool audio_connected(std::string* path_out = nullptr) const {
         for (auto& [p, d] : devs_)
             if (d.connected && d.audio) {
@@ -2628,7 +3294,8 @@ private:
         pump_.process();
     }
     static int on_cycle_disc(sd_bus_message*, void* ud, sd_bus_error*) {
-        // Disconnect settled (either way): reconnect after the same 2s the manual procedure uses, so the device finishes its ow...
+        // Disconnect settled (either way): reconnect after the same 2s the
+        // manual procedure uses, so the device finishes its own teardown.
         auto* self = static_cast<BluetoothModule*>(ud);
         if (!self->cycling_) return 0;
         itimerspec ts{};
@@ -2673,11 +3340,25 @@ private:
 };
 } // namespace
 Module* make_bluetooth() { return new BluetoothModule; }
+AgentsModule* AgentsModule::g = nullptr;
 Module* make_agents() { return new AgentsModule; }
+void agents_hotkey() {
+    if (AgentsModule::g) AgentsModule::g->on_click(0, BTN_LEFT);
+}
 Module* make_microphone() { return new MicrophoneModule; }
 Module* make_screenrecord() { return new ScreenRecordModule; }
 
-// --------------------------------------------------------------------------- Screen brightness: /sys/class/backlight for state (updated by kernel uevents, zero polling), systemd-logind Session.SetBrightness for writes (unprivileged for the active session, no helper tools; falls back to a direct sysfs write, then to brightnessctl).
+// ---------------------------------------------------------------------------
+// Screen brightness: /sys/class/backlight for state (updated by kernel
+// uevents, zero polling), systemd-logind Session.SetBrightness for writes
+// (unprivileged for the active session, no helper tools; falls back to a
+// direct sysfs write, then to brightnessctl). Left-click opens a slider
+// popup on an overlay layer surface; scroll adjusts directly.
+// ---------------------------------------------------------------------------
+// A sun no font can turn into a cog: solid disc, then eight thin
+// round-capped rays with a clear GAP between disc and rays. Gears have
+// teeth fused to the rim and a hole in the middle — the gap and the
+// filled centre are exactly what make this read as a sun at 13 px.
 void draw_sun_icon(cairo_t* cr, double cx, double cy, double size,
                    const Color& c) {
     const double disc = size * 0.30;        // filled centre
@@ -2699,7 +3380,10 @@ void draw_sun_icon(cairo_t* cr, double cx, double cy, double size,
     cairo_restore(cr);
 }
 
-// "auto" (the new default) draws the vector sun.
+// "auto" (the new default) draws the vector sun. The OLD default \uf185 is
+// treated the same, so every existing conf that merely saved the default
+// gets the fix without editing anything; only a deliberately chosen glyph
+// keeps font rendering.
 bool brightness_vector_icon() {
     return cfg.brightness_glyph == "auto" ||
            cfg.brightness_glyph == "\uf185";
@@ -2760,7 +3444,10 @@ public:
                     "mattbar: brightness: no backlight device in %s; module "
                     "hidden (external monitors use DDC, which the kernel "
                     "does not expose here)\n", dir_.c_str());
-        // The uevent watch is bound even when no device exists yet, so a backlight driver that loads after the bar (or comes and goes) shows/hides the module live instead of requiring a restart.
+        // The uevent watch is bound even when no device exists yet, so a
+        // backlight driver that loads after the bar (or comes and goes)
+        // shows/hides the module live instead of requiring a restart.
+        // kernel uevents on brightness changes, wherever they come from
         uevent_fd_ = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
                             NETLINK_KOBJECT_UEVENT);
         if (uevent_fd_ >= 0) {
@@ -2842,6 +3529,10 @@ public:
 
     bool on_click(double, int button) override {
         if (button != BTN_LEFT || dev_.empty()) return false;
+        if (auto* sh = mattbar_shell(); sh && sh->is_open("omarchy.monitor")) {
+            sh->hide("omarchy.monitor");
+            return true;
+        }
         if (slider_.surf) {
             slider_.destroy();
             return true;
@@ -2951,8 +3642,12 @@ private:
     // ---- slider popup ----------------------------------------------------
     static constexpr int SW = 240, SH = 44;
     void open_slider() {
-        // Same placement helper as the calendar/bell/power panels: centered on the module, clamped to stay fully on screen, on ...
-        PopupPlace pl = popup_place(last_a_, SW, bar_->along_length());
+        // Same placement helper as the calendar/bell/power panels: centered
+        // on the module, clamped to stay fully on screen, on the monitor
+        // whose bar was clicked.
+        double along = bar_->slot_along(this);
+        if (along < 0) along = last_a_;
+        PopupPlace pl = popup_place(along, SW, bar_->along_length());
         uint32_t anchor = pl.anchor;
         int mt = pl.mt, mr = pl.mr, mb = pl.mb, ml = pl.ml;
         slider_.paint = [this](cairo_t* cr) {
@@ -3041,7 +3736,15 @@ private:
 } // namespace
 Module* make_brightness() { return new BrightnessModule; }
 
-// --------------------------------------------------------------------------- Media (MPRIS over the session bus), on the same event-driven SdPump: an initial ListNames sweep, then NameOwnerChanged (arg0namespace-filtered daemon-side) tracks players appearing/vanishing and PropertiesChanged on the fixed MPRIS object path tracks title/artist/status.
+// ---------------------------------------------------------------------------
+// Media (MPRIS over the session bus), on the same event-driven SdPump: an
+// initial ListNames sweep, then NameOwnerChanged (arg0namespace-filtered
+// daemon-side) tracks players appearing/vanishing and PropertiesChanged on
+// the fixed MPRIS object path tracks title/artist/status. Zero polling.
+//   left-click  -> PlayPause     right-click -> Next     scroll -> Next/Prev
+// Shows the active player: the most recently changed *playing* player, else
+// the most recently changed one. Hidden when no players exist.
+// ---------------------------------------------------------------------------
 namespace {
 static uint64_t mono_ms() {
     timespec ts;
@@ -3052,12 +3755,22 @@ static uint64_t mono_ms() {
 class MediaModule : public TextModule {
 public:
     ~MediaModule() override {
+        close_popup();
+        if (art_) cairo_surface_destroy(art_);
         if (retry_fd_ >= 0) close(retry_fd_);
+        if (close_fd_ >= 0) close(close_fd_);
     }
     bool enabled() const override { return cfg.show_media; }
 
     void init(Bar& bar) override {
         bar_              = &bar;
+        close_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        if (close_fd_ >= 0)
+            bar.add_fd(close_fd_, [this](uint32_t) {
+                uint64_t n;
+                while (read(close_fd_, &n, sizeof n) > 0) {}
+                close_popup();
+            }, "media-popup-close");
         pump_.on_teardown = [this](const char* why) {
             bus_ = nullptr;
             players_.clear();
@@ -3114,7 +3827,8 @@ public:
                              "member='NameOwnerChanged',"
                              "arg0namespace='org.mpris.MediaPlayer2'",
                              on_owner, this);
-        // One fixed object path for every MPRIS player: daemon-side filter keeps all non-media property traffic away from this ...
+        // One fixed object path for every MPRIS player: daemon-side filter
+        // keeps all non-media property traffic away from this process.
         sd_bus_add_match(bus_, nullptr,
                          "type='signal',path='/org/mpris/MediaPlayer2',"
                          "interface='org.freedesktop.DBus.Properties',"
@@ -3132,7 +3846,8 @@ public:
     void tick() override { refresh(); }
 
     double width(cairo_t* cr) override {
-        // Same run-time glyph verification as the bluetooth module: prefer the Nerd Font play/pause runes, degrade to ASCII on ...
+        // Same run-time glyph verification as the bluetooth module: prefer
+        // the Nerd Font play/pause runes, degrade to ASCII on any font.
         if (checked_font_ != cfg.font) {
             checked_font_ = cfg.font;
             auto mapped   = [&](const char* t) {
@@ -3157,15 +3872,20 @@ public:
     }
 
     bool on_click(double, int button) override {
+        if (button == BTN_MIDDLE) {
+            cycle_source();
+            return true;
+        }
+        if (button == BTN_RIGHT) {
+            toggle_popup();
+            return true;
+        }
         const Player* p = active();
         if (!p || !bus_) return false;
-        const char* method = button == BTN_LEFT    ? "PlayPause"
-                             : button == BTN_RIGHT ? "Next"
-                                                   : nullptr;
-        if (!method) return false;
+        if (button != BTN_LEFT) return false;
         sd_bus_call_method_async(bus_, nullptr, p->name.c_str(),
                                  "/org/mpris/MediaPlayer2",
-                                 "org.mpris.MediaPlayer2.Player", method,
+                                 "org.mpris.MediaPlayer2.Player", "PlayPause",
                                  nullptr, nullptr, nullptr);
         pump_.process();
         return true;
@@ -3183,15 +3903,25 @@ public:
         return true;
     }
 
+    static void switch_source() {
+        if (g_media) g_media->cycle_source();
+    }
+
 private:
     struct Player {
         std::string name;   // well-known org.mpris.MediaPlayer2.*
         std::string status; // Playing / Paused / Stopped
-        std::string title, artist;
+        std::string title, artist, album, art_url;
         uint64_t    seq = 0; // recency of last change
     };
 
     const Player* active() const {
+        if (!prefer_.empty()) {
+            for (auto& [u, p] : players_)
+                if (p.name == prefer_ &&
+                    (p.status == "Playing" || p.status == "Paused"))
+                    return &p;
+        }
         const Player* best = nullptr;
         for (auto& [u, p] : players_) { // playing beats paused, recent beats old
             if (!best || (p.status == "Playing") > (best->status == "Playing") ||
@@ -3200,6 +3930,19 @@ private:
                 best = &p;
         }
         return best;
+    }
+    void cycle_source() {
+        std::vector<std::string> names;
+        for (auto& [u, p] : players_)
+            if (p.status == "Playing" || p.status == "Paused")
+                names.push_back(p.name);
+        if (names.empty()) return;
+        std::sort(names.begin(), names.end());
+        auto it = std::find(names.begin(), names.end(), prefer_);
+        if (it == names.end()) prefer_ = names[0];
+        else
+            prefer_ = names[(it - names.begin() + 1) % names.size()];
+        refresh();
     }
 
     // a{sv} at current position: PlaybackStatus / Metadata for `unique`.
@@ -3262,6 +4005,22 @@ private:
                     }
                     sd_bus_message_exit_container(m);
                     used = true;
+                }
+            } else if (k == "xesam:album") {
+                const char* v = nullptr;
+                if (sd_bus_message_enter_container(m, 'v', "s") >= 0) {
+                    sd_bus_message_read(m, "s", &v);
+                    sd_bus_message_exit_container(m);
+                    p.album = v ? v : "";
+                    used    = true;
+                }
+            } else if (k == "mpris:artUrl") {
+                const char* v = nullptr;
+                if (sd_bus_message_enter_container(m, 'v', "s") >= 0) {
+                    sd_bus_message_read(m, "s", &v);
+                    sd_bus_message_exit_container(m);
+                    p.art_url = v ? v : "";
+                    used      = true;
                 }
             }
             if (!used) sd_bus_message_skip(m, "v");
@@ -3337,7 +4096,9 @@ private:
         if (sd_bus_message_read(m, "s", &iface) < 0 || !sender) return 0;
         if (!iface || strcmp(iface, "org.mpris.MediaPlayer2.Player")) return 0;
         if (!self->players_.count(sender)) {
-            // A live MPRIS player we never discovered: NameOwnerChanged can be missed (startup races; broker match quirks on driver signals).
+            // A live MPRIS player we never discovered: NameOwnerChanged can
+            // be missed (startup races; broker match quirks on driver
+            // signals). The event itself is proof a player exists - resweep.
             uint64_t now = mono_ms();
             if (!self->sweep_pending_ &&
                 now - self->last_sweep_ms_ > 1500) {
@@ -3366,10 +4127,312 @@ private:
         return n.empty() ? std::string("media") : n;
     }
 
+    static std::string percent_decode(const std::string& s) {
+        std::string o;
+        o.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '%' && i + 2 < s.size()) {
+                char hex[3] = {s[i + 1], s[i + 2], 0};
+                o += (char)strtol(hex, nullptr, 16);
+                i += 2;
+            } else
+                o += s[i];
+        }
+        return o;
+    }
+
+    static std::string file_from_url(const std::string& url) {
+        std::string u = url;
+        if (u.rfind("file://", 0) == 0) {
+            u = u.substr(7);
+            if (u.rfind("localhost", 0) == 0) u = u.substr(9);
+        }
+        return percent_decode(u);
+    }
+
+    static std::string shell_quote(const std::string& s) {
+        std::string o = "'";
+        for (char c : s) {
+            if (c == '\'') o += "'\\''";
+            else o += c;
+        }
+        o += "'";
+        return o;
+    }
+
+    std::string art_cache_path() const {
+        const char* r = getenv("XDG_RUNTIME_DIR");
+        if (r && *r) return std::string(r) + "/mattbar-art";
+        return "/tmp/mattbar-art";
+    }
+
+    void load_art(const Player* p) {
+        std::string url = p ? p->art_url : "";
+        if (url == art_url_) return;
+        art_url_ = url;
+        if (art_) {
+            cairo_surface_destroy(art_);
+            art_ = nullptr;
+        }
+        if (url.empty()) return;
+        if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+            if (!bar_) return;
+            std::string cache = art_cache_path();
+            art_fetch_.run(
+                *bar_,
+                "curl -fsL --max-time 4 -o " + shell_quote(cache) + " " +
+                    shell_quote(url),
+                [this, url, cache](const std::string&, int st) {
+                    if (st != 0 || art_url_ != url) return;
+                    if (art_) cairo_surface_destroy(art_);
+                    art_ = image_load_file(cache);
+                    if (popup_.surf) popup_.draw();
+                },
+                5000);
+            return;
+        }
+        art_ = image_load_file(file_from_url(url));
+    }
+
+    void hold_popup(bool on) {
+        if (!bar_ || on == popup_hold_) return;
+        popup_hold_ = on;
+        bar_->hold_open(on);
+    }
+
+    void arm_popup_close(int ms = 1400) {
+        if (close_fd_ < 0) return;
+        itimerspec ts{};
+        ts.it_value.tv_sec  = ms / 1000;
+        ts.it_value.tv_nsec = (ms % 1000) * 1000000L;
+        timerfd_settime(close_fd_, 0, &ts, nullptr);
+    }
+    void disarm_popup_close() {
+        if (close_fd_ < 0) return;
+        itimerspec off{};
+        timerfd_settime(close_fd_, 0, &off, nullptr);
+    }
+
+    void close_popup() {
+        disarm_popup_close();
+        hold_popup(false);
+        popup_.destroy();
+        popup_hits_.clear();
+    }
+
+    int popup_w() const { return 320; }
+    int popup_h() const {
+        int n = 0;
+        for (auto& [u, p] : players_)
+            if (p.status == "Playing" || p.status == "Paused") ++n;
+        int h = 12 + 64 + 12 + 36 + 12;
+        if (n > 1) h += 10 + n * 34;
+        return h;
+    }
+
+    void rrect(cairo_t* cr, double x, double y, double w, double h, double r) {
+        cairo_new_sub_path(cr);
+        cairo_arc(cr, x + w - r, y + r, r, -M_PI_2, 0);
+        cairo_arc(cr, x + w - r, y + h - r, r, 0, M_PI_2);
+        cairo_arc(cr, x + r, y + h - r, r, M_PI_2, M_PI);
+        cairo_arc(cr, x + r, y + r, r, M_PI, 1.5 * M_PI);
+        cairo_close_path(cr);
+    }
+
+    void paint_popup(cairo_t* cr) {
+        const int W = popup_w(), H = popup_h();
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(cr, 0, 0, 0, 0);
+        cairo_paint(cr);
+        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+        cairo_set_source_rgba(cr, cfg.c_bg.r, cfg.c_bg.g, cfg.c_bg.b,
+                              std::max(cfg.c_bg.a, 0.96));
+        rrect(cr, 0.5, 0.5, W - 1, H - 1, 10);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgba(cr, cfg.c_ws_bg.r, cfg.c_ws_bg.g, cfg.c_ws_bg.b, 1);
+        cairo_set_line_width(cr, 1);
+        cairo_stroke(cr);
+
+        cairo_select_font_face(cr, cfg.font.c_str(), CAIRO_FONT_SLANT_NORMAL,
+                               CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, cfg.font_size);
+        popup_hits_.clear();
+
+        const Player* p = active();
+        const double ax = 12, ay = 12, asz = 64;
+        cairo_save(cr);
+        rrect(cr, ax, ay, asz, asz, 8);
+        cairo_clip(cr);
+        if (art_) {
+            int sw = cairo_image_surface_get_width(art_);
+            int sh = cairo_image_surface_get_height(art_);
+            if (sw > 0 && sh > 0) {
+                double s = std::max(asz / sw, asz / sh);
+                cairo_translate(cr, ax + (asz - sw * s) / 2.0,
+                                ay + (asz - sh * s) / 2.0);
+                cairo_scale(cr, s, s);
+                cairo_set_source_surface(cr, art_, 0, 0);
+                cairo_paint(cr);
+            }
+        } else {
+            cairo_set_source_rgba(cr, cfg.c_ws_bg.r, cfg.c_ws_bg.g,
+                                  cfg.c_ws_bg.b, 1);
+            cairo_paint(cr);
+        }
+        cairo_restore(cr);
+
+        auto say = [&](double x, double y, const std::string& s, const Color& c) {
+            cairo_set_source_rgba(cr, c.r, c.g, c.b, 1);
+            cairo_font_extents_t fe;
+            cairo_font_extents(cr, &fe);
+            cairo_move_to(cr, x, y + (fe.ascent - fe.descent) / 2.0);
+            cairo_show_text(cr, s.c_str());
+        };
+        double tx = ax + asz + 12;
+        double tw = W - tx - 12;
+        auto trunc = [&](std::string s, double maxw) {
+            cairo_text_extents_t e;
+            cairo_text_extents(cr, s.c_str(), &e);
+            if (e.x_advance <= maxw) return s;
+            while (s.size() > 1) {
+                s.pop_back();
+                while (!s.empty() &&
+                       (static_cast<unsigned char>(s.back()) & 0xC0) == 0x80)
+                    s.pop_back();
+                std::string t = s + "\u2026";
+                cairo_text_extents(cr, t.c_str(), &e);
+                if (e.x_advance <= maxw) return t;
+            }
+            return s;
+        };
+        cairo_set_font_size(cr, cfg.font_size + 1);
+        say(tx, ay + 14, trunc(p && !p->title.empty() ? p->title
+                                                      : "Nothing playing",
+                               tw),
+            cfg.c_fg);
+        cairo_set_font_size(cr, std::max(10.0, cfg.font_size - 1));
+        if (p && !p->artist.empty())
+            say(tx, ay + 34, trunc(p->artist, tw), cfg.c_dim);
+        if (p && !p->album.empty())
+            say(tx, ay + 50, trunc(p->album, tw), cfg.c_dim);
+
+        // transport
+        double by = ay + asz + 14;
+        auto btn = [&](double x, const char* label, int kind) {
+            cairo_set_source_rgba(cr, cfg.c_ws_bg.r, cfg.c_ws_bg.g,
+                                  cfg.c_ws_bg.b, 1);
+            rrect(cr, x, by, 44, 28, 6);
+            cairo_fill(cr);
+            cairo_text_extents_t e;
+            cairo_set_font_size(cr, cfg.font_size);
+            cairo_text_extents(cr, label, &e);
+            say(x + (44 - e.x_advance) / 2.0, by + 14, label, cfg.c_fg);
+            popup_hits_.push_back({x, by, 44, 28, kind, -1});
+        };
+        bool playing = p && p->status == "Playing";
+        btn(W / 2.0 - 22 - 52, "\u23ee", 0); // prev
+        btn(W / 2.0 - 22, playing ? "\u23f8" : "\u25b6", 1);
+        btn(W / 2.0 + 22 + 8, "\u23ed", 2); // next
+
+        std::vector<std::string> names;
+        for (auto& [u, pl] : players_)
+            if (pl.status == "Playing" || pl.status == "Paused")
+                names.push_back(pl.name);
+        std::sort(names.begin(), names.end());
+        if (names.size() > 1) {
+            double y = by + 40;
+            cairo_set_font_size(cr, std::max(9.0, cfg.font_size - 2));
+            say(12, y, "SOURCES", cfg.c_accent);
+            y += 16;
+            cairo_set_font_size(cr, cfg.font_size);
+            for (int i = 0; i < (int)names.size(); ++i) {
+                bool sel = p && p->name == names[i];
+                if (sel) {
+                    cairo_set_source_rgba(cr, cfg.c_accent.r, cfg.c_accent.g,
+                                          cfg.c_accent.b, 0.28);
+                    rrect(cr, 10, y - 4, W - 20, 30, 6);
+                    cairo_fill(cr);
+                }
+                const Player* sp = nullptr;
+                for (auto& [u, pl] : players_)
+                    if (pl.name == names[i]) {
+                        sp = &pl;
+                        break;
+                    }
+                std::string label =
+                    sp && !sp->title.empty() ? sp->title : short_name(names[i]);
+                say(18, y + 11, trunc(label, W - 40), cfg.c_fg);
+                popup_hits_.push_back({10, y - 4, (double)W - 20, 30, 3, i});
+                y += 34;
+            }
+            source_names_ = names;
+        } else
+            source_names_.clear();
+        (void)H;
+    }
+
+    void popup_click(double x, double y, int btn) {
+        disarm_popup_close();
+        if (btn != BTN_LEFT) return;
+        const Player* p = active();
+        for (auto& h : popup_hits_) {
+            if (x < h.x || y < h.y || x >= h.x + h.w || y >= h.y + h.h)
+                continue;
+            if (h.kind == 0 || h.kind == 1 || h.kind == 2) {
+                if (!p || !bus_) return;
+                const char* method = h.kind == 0   ? "Previous"
+                                     : h.kind == 2 ? "Next"
+                                                   : "PlayPause";
+                sd_bus_call_method_async(bus_, nullptr, p->name.c_str(),
+                                         "/org/mpris/MediaPlayer2",
+                                         "org.mpris.MediaPlayer2.Player",
+                                         method, nullptr, nullptr, nullptr);
+                pump_.process();
+                return;
+            }
+            if (h.kind == 3 && h.idx >= 0 &&
+                h.idx < (int)source_names_.size()) {
+                prefer_ = source_names_[h.idx];
+                refresh();
+                return;
+            }
+        }
+    }
+
+    void toggle_popup() {
+        if (!bar_) return;
+        if (popup_.surf) {
+            close_popup();
+            return;
+        }
+        const Player* p = active();
+        load_art(p);
+        popup_.kb_mode = 2;
+        popup_.paint   = [this](cairo_t* cr) { paint_popup(cr); };
+        popup_.click   = [this](double x, double y, int b) { popup_click(x, y, b); };
+        popup_.pmotion = [this](double, double) { disarm_popup_close(); };
+        popup_.pleave  = [this] { arm_popup_close(); };
+        popup_.pkey    = [this](const Bar::KeyEvent& e) {
+            if (e.escape()) close_popup();
+        };
+        double along = bar_->slot_along(this);
+        if (along < 0) along = bar_->pointer_along();
+        pop_place_ = popup_place(along, popup_w(), bar_->along_length());
+        pop_out_   = bar_->current_output();
+        hold_popup(true);
+        popup_.ensure(*bar_, pop_place_.anchor, pop_place_.mt, pop_place_.mr,
+                      pop_place_.mb, pop_place_.ml, "mattbar-media",
+                      popup_w(), popup_h(), pop_out_);
+        popup_.draw();
+    }
+
     void refresh() {
         if (!bar_) return;
         const Player* p = active();
-        // Only genuinely transporting players count; players with sparse metadata (web radio, mpv, players mid-load) must still...
+        // Only genuinely transporting players count; players with sparse
+        // metadata (web radio, mpv, players mid-load) must still show -
+        // an empty title fell through to <hidden> before, which made the
+        // module invisible on machines whose player never sets one.
         if (!p || (p->status != "Playing" && p->status != "Paused")) {
             set_text(*bar_, "", cfg.c_dim);
             DBG("media: <hidden>");
@@ -3394,10 +4457,37 @@ private:
         std::string t = (playing ? play_ : pause_) + " " + label;
         set_text(*bar_, t, playing ? cfg.c_fg : cfg.c_dim);
         DBG("media: '%s'", t.c_str());
+        load_art(p);
+        if (popup_.surf) {
+            if (!p) {
+                close_popup();
+            } else {
+                popup_.ensure(*bar_, pop_place_.anchor, pop_place_.mt,
+                              pop_place_.mr, pop_place_.mb, pop_place_.ml,
+                              "mattbar-media", popup_w(), popup_h(),
+                              pop_out_);
+                popup_.draw();
+            }
+        }
     }
+
+    struct PopHit {
+        double x, y, w, h;
+        int    kind = 0, idx = 0;
+    };
 
     static MediaModule*                g_media; // for detached async replies
     int                                retry_fd_ = -1;
+    int                                close_fd_ = -1;
+    PopupWin                           popup_;
+    bool                               popup_hold_ = false;
+    cairo_surface_t*                   art_ = nullptr;
+    std::string                        art_url_;
+    AsyncCmd                           art_fetch_;
+    std::vector<PopHit>                popup_hits_;
+    std::vector<std::string>           source_names_;
+    PopupPlace                         pop_place_{};
+    wl_output*                         pop_out_ = nullptr;
     bool                               sweep_pending_ = false;
     bool                               need_sweep_    = false;
     uint64_t                           last_sweep_ms_ = 0;
@@ -3406,6 +4496,7 @@ private:
     SdPump                             pump_;
     sd_bus*                            bus_ = nullptr;
     std::map<std::string, Player>      players_; // unique name -> state
+    std::string                        prefer_;
     std::vector<std::string>           pending_;
     uint64_t                           seq_ = 0;
     std::string play_ = ">", pause_ = "||", checked_font_;
@@ -3416,8 +4507,75 @@ public:
 MediaModule* MediaModule::g_media = nullptr;
 } // namespace
 Module* make_media() { return new MediaModule; }
+void media_source_switch() { MediaModule::switch_source(); }
 
-// --------------------------------------------------------------------------- Stay-awake toggle: holds a zwp_idle_inhibitor_v1 on the bar's own surface while active, so the compositor suspends idle actions (lock, dpms).
+// Displays chip: same overlay as Super+Ctrl+D (omarchy.monitor).
+// ---------------------------------------------------------------------------
+namespace {
+class DisplayModule : public TextModule {
+public:
+    bool enabled() const override { return cfg.show_display; }
+    void init(Bar& bar) override {
+        bar_ = &bar;
+        set_text(*bar_, glyph_, cfg.c_fg);
+    }
+    double width(cairo_t* cr) override {
+        resolve(cr);
+        return TextModule::width(cr);
+    }
+    void draw(cairo_t* cr, double a, double t) override {
+        resolve(cr);
+        bool on = false;
+        if (auto* sh = mattbar_shell()) on = sh->is_open("omarchy.monitor");
+        set_text(*bar_, glyph_, on ? cfg.c_accent : cfg.c_fg);
+        TextModule::draw(cr, a, t);
+    }
+    bool on_click(double, int button) override {
+        if (button != BTN_LEFT) return false;
+        if (auto* sh = mattbar_shell()) {
+            sh->toggle("omarchy.monitor", "{}");
+            if (bar_) bar_->request_draw();
+            return true;
+        }
+        spawn_detached("mattbarctl shell toggle omarchy.monitor");
+        return true;
+    }
+
+private:
+    void resolve(cairo_t* cr) {
+        if (checked_ == cfg.font) return;
+        checked_ = cfg.font;
+        auto mapped = [&](const char* t) {
+            cairo_scaled_font_t* sf = cairo_get_scaled_font(cr);
+            cairo_glyph_t*       g  = nullptr;
+            int                  n  = 0;
+            bool ok = cairo_scaled_font_text_to_glyphs(
+                          sf, 0, 0, t, (int)strlen(t), &g, &n, nullptr,
+                          nullptr, nullptr) == CAIRO_STATUS_SUCCESS &&
+                      n > 0;
+            for (int i = 0; ok && i < n; ++i)
+                if (g[i].index == 0) ok = false;
+            if (g) cairo_glyph_free(g);
+            return ok;
+        };
+        const char* pick = "\uf108"; // nf-fa-desktop
+        if (!mapped(pick)) pick = "\U000F0379"; // nf-md-monitor
+        if (!mapped(pick)) pick = "DSP";
+        glyph_ = pick;
+        if (bar_) set_text(*bar_, glyph_, cfg.c_fg);
+    }
+    Bar*        bar_ = nullptr;
+    std::string glyph_ = "\uf108", checked_;
+};
+} // namespace
+Module* make_display() { return new DisplayModule; }
+
+// ---------------------------------------------------------------------------
+// Stay-awake toggle: holds a zwp_idle_inhibitor_v1 on the bar's own surface
+// while active, so the compositor suspends idle actions (lock, dpms).
+// Runtime state only — like Waybar's idle_inhibitor, it resets on restart.
+// Coffee glyph with the usual run-time font fallback.
+// ---------------------------------------------------------------------------
 namespace {
 class CaffeineModule : public TextModule {
 public:
@@ -3473,7 +4631,69 @@ private:
 } // namespace
 Module* make_caffeine() { return new CaffeineModule; }
 
-// --------------------------------------------------------------------------- Pin: click to keep the bar revealed (auto-hide paused); click again to resume.
+// ---------------------------------------------------------------------------
+// Night light: same hyprsunset temperatures Omarchy uses (4000 / 6500 K).
+// Accent when the filter is on; dim in daytime. Click toggles.
+// ---------------------------------------------------------------------------
+namespace {
+class NightlightModule : public TextModule {
+public:
+    bool enabled() const override { return cfg.show_nightlight; }
+    void init(Bar& bar) override {
+        bar_ = &bar;
+        nightlight_init(bar);
+        nightlight_refresh();
+        refresh();
+    }
+    void tick() override {
+        if (++ticks_ >= 5) {
+            ticks_ = 0;
+            nightlight_refresh();
+        }
+        refresh();
+    }
+    double width(cairo_t* cr) override {
+        if (checked_font_ != cfg.font) {
+            checked_font_ = cfg.font;
+            cairo_scaled_font_t* sf = cairo_get_scaled_font(cr);
+            cairo_glyph_t*       g  = nullptr;
+            int                  n  = 0;
+            const char*          t  = "\U000F050E"; // nf-md-weather-night
+            bool ok = cairo_scaled_font_text_to_glyphs(
+                          sf, 0, 0, t, (int)strlen(t), &g, &n, nullptr,
+                          nullptr, nullptr) == CAIRO_STATUS_SUCCESS &&
+                      n > 0 && g[0].index != 0;
+            if (g) cairo_glyph_free(g);
+            glyph_ = ok ? t : "moon";
+            refresh();
+        }
+        return TextModule::width(cr);
+    }
+    bool on_click(double, int button) override {
+        if (button != BTN_LEFT) return false;
+        nightlight_toggle();
+        refresh();
+        return true;
+    }
+
+private:
+    void refresh() {
+        if (!bar_) return;
+        set_text(*bar_, glyph_,
+                 nightlight_enabled() ? cfg.c_accent : cfg.c_dim);
+    }
+    Bar*        bar_          = nullptr;
+    int         ticks_        = 0;
+    std::string glyph_        = "moon";
+    std::string checked_font_;
+};
+} // namespace
+Module* make_nightlight() { return new NightlightModule; }
+
+// ---------------------------------------------------------------------------
+// Pin: click to keep the bar revealed (auto-hide paused); click again to
+// resume. Never touches the exclusive zone, so windows are unaffected.
+// ---------------------------------------------------------------------------
 namespace {
 class PinModule : public Module {
 public:
@@ -3514,8 +4734,309 @@ private:
 } // namespace
 Module* make_pin() { return new PinModule; }
 
+// ---------------------------------------------------------------------------
+// More: overflow group. Modules assigned to layout_more are not drawn on
+// the bar; they appear in a wrapping popup behind this ⋯ control.
+// ---------------------------------------------------------------------------
+namespace {
+class MoreModule : public Module {
+public:
+    static MoreModule* g;
+    MoreModule() { g = this; }
+    ~MoreModule() override {
+        g = nullptr;
+        close_now();
+        if (close_fd_ >= 0) close(close_fd_);
+    }
 
-// --------------------------------------------------------------------------- Custom button (Waybar "custom/*" equivalent): a glyph that runs commands on click.
+    void init(Bar& bar) override {
+        bar_ = &bar;
+        close_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        if (close_fd_ >= 0)
+            bar.add_fd(close_fd_, [this](uint32_t) {
+                uint64_t n;
+                while (read(close_fd_, &n, sizeof n) > 0) {}
+                close_now();
+            }, "more-close");
+    }
+
+    bool enabled() const override {
+        return bar_ && has_items();
+    }
+
+    double width(cairo_t*) override { return 18; }
+
+    void draw(cairo_t* cr, double a, double t) override {
+        last_a_ = a;
+        const bool on = popup_.surf != nullptr;
+        const Color& c = on ? cfg.c_accent : cfg.c_fg;
+        cairo_set_source_rgba(cr, c.r, c.g, c.b, 1.0);
+        double cx = cfg_vertical() ? t / 2.0 : a + 9;
+        double cy = cfg_vertical() ? a + 9 : t / 2.0;
+        for (int i = -1; i <= 1; ++i) {
+            cairo_arc(cr, cx + i * 5.0, cy, 1.6, 0, 2 * M_PI);
+            cairo_fill(cr);
+        }
+    }
+
+    bool on_click(double, int button) override {
+        if (button != BTN_LEFT || !bar_) return false;
+        if (popup_.surf) close_now();
+        else open();
+        return true;
+    }
+
+    void tick() override {
+        if (!has_items()) {
+            close_now();
+            return;
+        }
+        if (popup_.surf) {
+            relayout();
+            popup_.draw();
+        }
+    }
+
+    bool is_open() const { return popup_.surf != nullptr; }
+
+    void close_now() {
+        disarm_close();
+        hold(false);
+        popup_.destroy();
+        slots_.clear();
+        if (bar_) bar_->request_draw();
+    }
+
+private:
+    struct Slot {
+        Module* m = nullptr;
+        double  x = 0, y = 0, w = 0, h = 0;
+    };
+
+    bool has_items() const {
+        if (!bar_) return false;
+        for (auto* m : bar_->more) {
+            if (!m || !m->enabled()) continue;
+            if (m->primary_only() && !bar_->current_is_primary()) continue;
+            return true;
+        }
+        return false;
+    }
+
+    void hold(bool on) {
+        if (!bar_ || on == holding_) return;
+        holding_ = on;
+        bar_->hold_open(on);
+    }
+    void arm_close(int ms = 1400) {
+        if (close_fd_ < 0) return;
+        itimerspec ts{};
+        ts.it_value.tv_sec  = ms / 1000;
+        ts.it_value.tv_nsec = (ms % 1000) * 1000000L;
+        timerfd_settime(close_fd_, 0, &ts, nullptr);
+    }
+    void disarm_close() {
+        if (close_fd_ < 0) return;
+        itimerspec off{};
+        timerfd_settime(close_fd_, 0, &off, nullptr);
+    }
+
+    double max_popup_w() const {
+        double along = bar_ ? bar_->along_length() : 520;
+        return std::clamp(along - 24.0, 180.0, 520.0);
+    }
+    double row_h() const { return (double)cfg_thickness(); }
+
+    void setfont(cairo_t* cr) {
+        cairo_select_font_face(cr, cfg.font.c_str(), CAIRO_FONT_SLANT_NORMAL,
+                               CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, cfg.font_size);
+    }
+
+    void measure(cairo_t* cr) {
+        slots_.clear();
+        const double pad = 10, gap = 10;
+        const double rh  = row_h();
+        if (cfg_vertical()) {
+            double y = pad;
+            double thick = rh;
+            for (auto* m : bar_->more) {
+                if (!m || !m->enabled()) continue;
+                if (m->primary_only() && !bar_->current_is_primary()) continue;
+                setfont(cr);
+                double mw = m->width(cr);
+                if (mw <= 0.5) continue;
+                slots_.push_back({m, pad, y, thick, mw});
+                y += mw + gap;
+            }
+            pop_w_ = (int)std::lround(thick + pad * 2);
+            pop_h_ = (int)std::lround(std::max(48.0, y + pad - gap));
+        } else {
+            const double maxw = max_popup_w();
+            double x = pad, y = pad;
+            double used_w = pad;
+            for (auto* m : bar_->more) {
+                if (!m || !m->enabled()) continue;
+                if (m->primary_only() && !bar_->current_is_primary()) continue;
+                setfont(cr);
+                double mw = m->width(cr);
+                if (mw <= 0.5) continue;
+                if (x > pad && x + mw + pad > maxw) {
+                    x = pad;
+                    y += rh + gap;
+                }
+                slots_.push_back({m, x, y, mw, rh});
+                x += mw + gap;
+                used_w = std::max(used_w, x);
+            }
+            pop_w_ = (int)std::lround(std::max(120.0, used_w + pad - gap));
+            pop_h_ = (int)std::lround(y + rh + pad);
+        }
+        if (slots_.empty()) {
+            pop_w_ = 220;
+            pop_h_ = 48;
+        }
+    }
+
+    void relayout() {
+        if (!bar_ || !popup_.surf) return;
+        cairo_surface_t* dummy =
+            cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 8, 8);
+        cairo_t* cr = cairo_create(dummy);
+        measure(cr);
+        cairo_destroy(cr);
+        cairo_surface_destroy(dummy);
+        popup_.ensure(*bar_, place_.anchor, place_.mt, place_.mr, place_.mb,
+                      place_.ml, "mattbar-more", pop_w_, pop_h_, out_);
+    }
+
+    void paint(cairo_t* cr) {
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(cr, 0, 0, 0, 0);
+        cairo_paint(cr);
+        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+        cairo_set_source_rgba(cr, cfg.c_bg.r, cfg.c_bg.g, cfg.c_bg.b,
+                              std::max(cfg.c_bg.a, 0.96));
+        double r = 10;
+        cairo_new_sub_path(cr);
+        cairo_arc(cr, pop_w_ - r - 0.5, r + 0.5, r, -M_PI_2, 0);
+        cairo_arc(cr, pop_w_ - r - 0.5, pop_h_ - r - 0.5, r, 0, M_PI_2);
+        cairo_arc(cr, r + 0.5, pop_h_ - r - 0.5, r, M_PI_2, M_PI);
+        cairo_arc(cr, r + 0.5, r + 0.5, r, M_PI, 1.5 * M_PI);
+        cairo_close_path(cr);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgba(cr, cfg.c_ws_bg.r, cfg.c_ws_bg.g, cfg.c_ws_bg.b, 1);
+        cairo_set_line_width(cr, 1);
+        cairo_stroke(cr);
+
+        measure(cr);
+        if (slots_.empty()) {
+            setfont(cr);
+            cairo_set_source_rgba(cr, cfg.c_dim.r, cfg.c_dim.g, cfg.c_dim.b, 1);
+            cairo_font_extents_t fe;
+            cairo_font_extents(cr, &fe);
+            const char* msg = "Assign modules to More";
+            cairo_text_extents_t e;
+            cairo_text_extents(cr, msg, &e);
+            cairo_move_to(cr, (pop_w_ - e.x_advance) / 2.0,
+                          pop_h_ / 2.0 + (fe.ascent - fe.descent) / 2.0);
+            cairo_show_text(cr, msg);
+            return;
+        }
+        for (auto& s : slots_) {
+            setfont(cr);
+            // Horizontal bar: along = x, thickness = row height.
+            // Vertical bar: along = y, thickness = popup/bar width.
+            if (cfg_vertical()) s.m->draw(cr, s.y, s.w);
+            else s.m->draw(cr, s.x, s.h);
+        }
+    }
+
+    Slot* hit(double x, double y) {
+        for (auto& s : slots_)
+            if (x >= s.x && x < s.x + s.w && y >= s.y && y < s.y + s.h)
+                return &s;
+        return nullptr;
+    }
+
+    void open() {
+        if (!bar_ || !has_items()) return;
+        cairo_surface_t* dummy =
+            cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 8, 8);
+        cairo_t* cr = cairo_create(dummy);
+        measure(cr);
+        cairo_destroy(cr);
+        cairo_surface_destroy(dummy);
+
+        double along = bar_->slot_along(this);
+        if (along < 0) along = last_a_;
+        place_ = popup_place(along, pop_w_, bar_->along_length());
+        out_   = bar_->current_output();
+        popup_.kb_mode = 2;
+        popup_.paint   = [this](cairo_t* c) { paint(c); };
+        popup_.click   = [this](double x, double y, int b) {
+            disarm_close();
+            if (Slot* s = hit(x, y)) {
+                double rel = cfg_vertical() ? y - s->y : x - s->x;
+                if (s->m->on_click(rel, b)) {
+                    if (bar_) bar_->request_draw();
+                    if (popup_.surf) popup_.draw();
+                }
+            }
+        };
+        popup_.pscroll = [this](int d) {
+            disarm_close();
+            if (Slot* s = hit(popup_.mx, popup_.my)) {
+                double rel = cfg_vertical() ? popup_.my - s->y : popup_.mx - s->x;
+                if (s->m->on_scroll(rel, d)) {
+                    if (bar_) bar_->request_draw();
+                    if (popup_.surf) popup_.draw();
+                }
+            }
+        };
+        popup_.pmotion = [this](double x, double y) {
+            disarm_close();
+            if (Slot* s = hit(x, y))
+                s->m->on_hover(cfg_vertical() ? y - s->y : x - s->x);
+        };
+        popup_.pleave = [this] { arm_close(); };
+        popup_.pkey   = [this](const Bar::KeyEvent& e) {
+            if (e.escape()) close_now();
+        };
+        hold(true);
+        popup_.ensure(*bar_, place_.anchor, place_.mt, place_.mr, place_.mb,
+                      place_.ml, "mattbar-more", pop_w_, pop_h_, out_);
+        popup_.draw();
+        if (bar_) bar_->request_draw();
+    }
+
+    Bar*     bar_      = nullptr;
+    PopupWin popup_;
+    PopupPlace place_{};
+    wl_output* out_ = nullptr;
+    std::vector<Slot> slots_;
+    int close_fd_ = -1;
+    bool holding_ = false;
+    double last_a_ = 0;
+    int pop_w_ = 220, pop_h_ = 48;
+};
+MoreModule* MoreModule::g = nullptr;
+} // namespace
+Module* make_more() { return new MoreModule; }
+void more_close() {
+    if (MoreModule::g) MoreModule::g->close_now();
+}
+bool more_is_open() {
+    return MoreModule::g && MoreModule::g->is_open();
+}
+
+
+// ---------------------------------------------------------------------------
+// Custom button (Waybar "custom/*" equivalent): a glyph that runs commands on
+// click. With a check command, the glyph only shows while the command prints
+// output (re-run every interval, and on SIGRTMIN+<n> like Waybar's "signal").
+// Powers the Omarchy menu button and update indicator.
+// ---------------------------------------------------------------------------
 namespace {
 class CustomModule : public TextModule {
 public:
@@ -3566,7 +5087,13 @@ public:
                     run_check();
                 }, "update-signal");
         }
-        // Omarchy 3.x announced finished updates by signalling the bar (SIGRTMIN+7, handled above); Quattro dropped that convention and talks only to its own shell.
+        // Omarchy 3.x announced finished updates by signalling the bar
+        // (SIGRTMIN+7, handled above); Quattro dropped that convention and
+        // talks only to its own shell. Watch pacman's log instead: any
+        // transaction — bar-launched, keybind, terminal, AUR helper, either
+        // Omarchy generation — touches it, and one debounced re-check later
+        // the icon tells the truth. Directory watch, so log rotation
+        // cannot orphan it. Zero cost between transactions.
         ino_fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
         if (ino_fd_ >= 0 &&
             inotify_add_watch(ino_fd_, "/var/log",
@@ -3605,12 +5132,16 @@ public:
 
     void tick() override {
         if (check_.empty()) return;
-        // After the user launches the action (e.g.
+        // After the user launches the action (e.g. the updater), re-check
+        // every 10 s for a while so the icon clears promptly when the
+        // condition ends — Omarchy's own refresh signal targets waybar by
+        // name, so MattBar can't rely on it.
         long iv = now_s() < fast_until_ ? 10 : interval_s_;
         if (now_s() - last_check_ >= iv) run_check();
     }
 
-    // override to render with the module's own font (e.g.
+    // override to render with the module's own font (e.g. the omarchy logo
+    // font); the bar re-selects the default font before every module.
     double width(cairo_t* cr) override {
         if (!font_.empty())
             cairo_select_font_face(cr, font_.c_str(),
@@ -3629,7 +5160,7 @@ public:
     bool on_click(double, int button) override {
         if (button == BTN_LEFT) {
             if (check_.empty()) {
-                spawn(click_);
+                spawn(live_click(click_));
             } else {
                 launch_tracked(); // re-check the moment it exits
                 fast_until_ = now_s() + 1800; // plus a 30 min fast window
@@ -3642,18 +5173,44 @@ public:
 
 private:
     static long now_s() {
-        // BOOTTIME, not MONOTONIC: monotonic freezes during suspend, so on a machine that sleeps a lot "every 6 h" silently became "every 6 h of awake time" — the update icon could lag days behind Waybar's.
+        // BOOTTIME, not MONOTONIC: monotonic freezes during suspend, so on
+        // a machine that sleeps a lot "every 6 h" silently became "every
+        // 6 h of awake time" — the update icon could lag days behind
+        // Waybar's. Boottime counts sleep, so the first tick after any
+        // resume that crossed the interval fires the check. (Ticks only
+        // run while a bar is revealed — the zero-wakeup idle property is
+        // untouched; a hidden bar still schedules nothing.)
         timespec ts;
         clock_gettime(CLOCK_BOOTTIME, &ts);
         return ts.tv_sec;
     }
-    static void spawn(const std::string& c) {
-        if (!c.empty())
-            (void)!system((c + " >/dev/null 2>&1 &").c_str());
+    // The Omarchy-logo click is stock `omarchy-menu` (Quickshell). Only
+    // when the user has asked MattBar to shut Quickshell down do we open
+    // our own menu instead. Resolved at click time so a live settings
+    // toggle does not require reconstructing the module.
+    static std::string live_click(const std::string& stored) {
+        if (auto* sh = mattbar_shell(); sh && sh->is_open("omarchy.menu")) {
+            sh->hide("omarchy.menu");
+            return {};
+        }
+        if (stored == "omarchy-menu" ||
+            stored == "mattbarctl shell toggle omarchy.menu")
+            return cfg.quickshell_shutdown
+                       ? "mattbarctl shell toggle omarchy.menu"
+                       : "omarchy-menu";
+        return stored;
     }
+    static void spawn(const std::string& c) { spawn_detached(c); }
     void run_check() {
         last_check_ = now_s();
-        // Waybar custom-module semantics, which Omarchy's scripts rely on: the module is VISIBLE iff the check exits 0.
+        // Waybar custom-module semantics, which Omarchy's scripts rely on:
+        // the module is VISIBLE iff the check exits 0. Output text is
+        // informational only — omarchy-update-available prints a message in
+        // BOTH states ("update available" / "is up to date") and signals
+        // via exit code alone.
+        // Async with a 10 s budget: this used to be a synchronous popen
+        // that froze the ENTIRE BAR for up to 10 seconds whenever the
+        // check script was slow (network hiccup at exactly check time).
         check_cmd_.run(*bar_, check_ + " 2>/dev/null",
                        [this](const std::string& out, int st) {
                            bool visible = (st == 0);
@@ -3707,7 +5264,12 @@ Module* make_update_button() {
 }
 
 
-// --------------------------------------------------------------------------- Temperature: any hwmon sensor, defaulting to the CPU package sensor.
+// ---------------------------------------------------------------------------
+// Temperature: any hwmon sensor, defaulting to the CPU package sensor.
+// Click or scroll the module to cycle through discovered sensors; the pick
+// is also selectable in settings and persisted as cfg.temp_sensor.
+// Pure sysfs reads: no process spawns.
+// ---------------------------------------------------------------------------
 namespace {
 class TempModule : public TextModule {
 public:
@@ -3720,7 +5282,8 @@ public:
 
     void tick() override { refresh(); }
 
-    // The settings window can change cfg.temp_sensor between ticks; width() runs on every bar draw, so re-resolve there for...
+    // The settings window can change cfg.temp_sensor between ticks; width()
+    // runs on every bar draw, so re-resolve there for instant feedback.
     double width(cairo_t* cr) override {
         if (resolved_for_ != cfg.temp_sensor) refresh();
         return TextModule::width(cr);

@@ -2,11 +2,15 @@
 #include "popup.hpp"
 #include "bar.hpp"
 #include "config.hpp"
+#include "idle.hpp"
+#include "lock.hpp"
 #include "sdpump.hpp"
 #include "audio.hpp"
 #include "modules.hpp" // AsyncCmd
+#include "qs_plugins.hpp"
 #include "shm.hpp"
 #include "util.hpp"
+#include "wallpaper.hpp"
 
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
@@ -15,6 +19,7 @@
 #include <linux/netlink.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <csignal>
 #include <cmath>
 #include <dirent.h>
@@ -22,6 +27,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <deque>
@@ -57,10 +63,15 @@ struct Note {
     uint64_t         expires_at = 0;                          // ms mono, 0=never
     uint64_t         posted_at  = 0;                          // wall clock, s
     cairo_surface_t* icon       = nullptr;
+    std::string      glyph; // omarchy-glyph hint; used when no image
+    std::string      image_path, desktop_entry; // resolved after hints
     int              height     = 0; // computed at draw
 };
 
 // Icons draw at 32 px logical; retaining them any larger is pure waste.
+// Cap at 3x that (HiDPI headroom to scale 3): a 256x256 messenger avatar
+// drops from 256 KB to ~36 KB, and 30 of them in history from ~8 MB to
+// ~1 MB, with pixel-identical rendering at every scale in use.
 constexpr int ICON_KEEP = 96;
 cairo_surface_t* downscale_icon(cairo_surface_t* s) {
     if (!s) return nullptr;
@@ -85,6 +96,94 @@ cairo_surface_t* downscale_icon(cairo_surface_t* s) {
 void free_note_icon(Note& n) {
     if (n.icon) cairo_surface_destroy(n.icon);
     n.icon = nullptr;
+}
+
+std::string pct_decode(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            out += (char)strtol(s.substr(i + 1, 2).c_str(), nullptr, 16);
+            i += 2;
+        } else out += s[i];
+    }
+    return out;
+}
+
+std::string strip_file_uri(std::string p) {
+    if (p.rfind("file://", 0) == 0) p = p.substr(7);
+    return pct_decode(p);
+}
+
+cairo_surface_t* load_theme_icon(const std::string& name) {
+    if (name.empty() || name[0] == '/') return nullptr;
+    const char* home = getenv("HOME");
+    std::vector<std::string> roots = {"/usr/share/icons/hicolor",
+                                      "/usr/local/share/icons/hicolor"};
+    if (home)
+        roots.insert(roots.begin(),
+                     std::string(home) + "/.local/share/icons/hicolor");
+    const char* sizes[] = {"48x48", "64x64", "32x32", "128x128", "24x24"};
+    const char* ctxs[]  = {"apps", "status", "devices", "panel"};
+    for (auto& root : roots)
+        for (const char* sz : sizes)
+            for (const char* ctx : ctxs) {
+                std::string p =
+                    root + "/" + sz + "/" + ctx + "/" + name + ".png";
+                if (access(p.c_str(), R_OK) != 0) continue;
+                cairo_surface_t* s = cairo_image_surface_create_from_png(p.c_str());
+                if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS)
+                    return downscale_icon(s);
+                cairo_surface_destroy(s);
+            }
+    std::string pix = "/usr/share/pixmaps/" + name + ".png";
+    if (access(pix.c_str(), R_OK) == 0) {
+        cairo_surface_t* s = cairo_image_surface_create_from_png(pix.c_str());
+        if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS)
+            return downscale_icon(s);
+        cairo_surface_destroy(s);
+    }
+    return nullptr;
+}
+
+cairo_surface_t* load_icon_spec(const std::string& spec) {
+    if (spec.empty()) return nullptr;
+    std::string p = strip_file_uri(spec);
+    if (p[0] == '/') {
+        if (cairo_surface_t* s = image_load_file(p)) return downscale_icon(s);
+        cairo_surface_t* s = cairo_image_surface_create_from_png(p.c_str());
+        if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS)
+            return downscale_icon(s);
+        cairo_surface_destroy(s);
+        return nullptr;
+    }
+    return load_theme_icon(p);
+}
+
+cairo_surface_t* icon_from_desktop(const std::string& id) {
+    if (id.empty()) return nullptr;
+    std::string name = id;
+    if (name.size() > 8 && name.compare(name.size() - 8, 8, ".desktop") == 0)
+        name.resize(name.size() - 8);
+    const char* home = getenv("HOME");
+    std::vector<std::string> files;
+    if (home)
+        files.push_back(std::string(home) + "/.local/share/applications/" +
+                        name + ".desktop");
+    files.push_back("/usr/share/applications/" + name + ".desktop");
+    for (auto& f : files) {
+        std::string txt = slurp(f);
+        if (txt.empty()) continue;
+        auto p = txt.find("\nIcon=");
+        if (p == std::string::npos && txt.rfind("Icon=", 0) == 0) p = 0;
+        else if (p != std::string::npos) p += 1;
+        if (p == std::string::npos) continue;
+        auto s = txt.find('=', p);
+        auto e = txt.find('\n', s == std::string::npos ? p : s);
+        if (s == std::string::npos) continue;
+        std::string icon = trim(txt.substr(s + 1, e - s - 1));
+        if (cairo_surface_t* r = load_icon_spec(icon)) return r;
+    }
+    return load_theme_icon(name);
 }
 
 uint64_t now_ms() {
@@ -112,7 +211,14 @@ std::string strip_markup(const std::string& s) {
 }
 
 
-// --------------------------------------------------------------------------- Mixed bar-font / emoji-font text.
+// ---------------------------------------------------------------------------
+// Mixed bar-font / emoji-font text. The cairo toy API does no fallback, so
+// notification text is split into cluster runs: clusters the current bar
+// font maps stay in it, unmapped clusters are drawn with the emoji font
+// (cairo >= 1.17.8 renders color fonts through the toy API). No shaper is
+// involved, so ZWJ sequences degrade to their constituent emoji; ZWJ and
+// variation selectors are stripped from emoji runs to avoid tofu slivers.
+// ---------------------------------------------------------------------------
 namespace {
 struct RichRun {
     std::string text;
@@ -206,6 +312,29 @@ void draw_rich_text(cairo_t* cr, const std::string& s, double x, double y,
     }
 }
 
+void draw_note_avatar(cairo_t* cr, cairo_surface_t* icon, double x, double y,
+                      double size) {
+    if (!icon || size < 2) return;
+    double iw = cairo_image_surface_get_width(icon);
+    double ih = cairo_image_surface_get_height(icon);
+    if (iw < 1 || ih < 1) return;
+    double s = size / std::max(iw, ih);
+    double dw = iw * s, dh = ih * s;
+    double ox = x + (size - dw) / 2.0, oy = y + (size - dh) / 2.0;
+    cairo_save(cr);
+    cairo_new_path(cr);
+    cairo_arc(cr, x + size / 2.0, y + size / 2.0, size / 2.0 - 0.5, 0,
+              2 * M_PI);
+    cairo_close_path(cr);
+    cairo_clip(cr);
+    cairo_translate(cr, ox, oy);
+    cairo_scale(cr, s, s);
+    cairo_set_source_surface(cr, icon, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+    cairo_paint(cr);
+    cairo_restore(cr);
+}
+
 namespace { // reopen file-local helpers
 
 std::vector<std::string> wrap(cairo_t* cr, const std::string& text,
@@ -257,11 +386,23 @@ struct NotifyDaemon::Impl {
 
     // OSD sources
     int    audio_sub = 0; // shared AudioEvents subscription (0 = none)
-    AsyncCmd vol_cmd, mic_cmd;
+    AsyncCmd vol_cmd, mic_cmd, omarchy_off_cmd, omarchy_on_cmd,
+        omarchy_restart_cmd;
     double last_vol = -1, last_mic = -1;
     int    last_vol_mut = -1, last_mic_mut = -1;
     int   uevent_fd = -1;
     std::string backlight;
+
+    // Omarchy Quattro: default takeover asks it to disable
+    // omarchy.notifications over IPC (never SIGTERM — that is the whole
+    // desktop shell). cfg.quickshell_shutdown is the opt-in to stop the
+    // process entirely so wifi/bluetooth/volume panels cannot appear.
+    bool omarchy_disabled_by_us = false;
+    bool omarchy_restarted      = false;
+    bool omarchy_stopped_by_us  = false;
+    bool omarchy_stop_pending   = false;
+    int  omarchy_retry_fd       = -1;
+    int  omarchy_retries        = 0;
 
     // ---- D-Bus server -----------------------------------------------------
     bool ensure_bus() {
@@ -304,6 +445,7 @@ struct NotifyDaemon::Impl {
 
     void acquire() {
         if (!ensure_bus() || name_req) return;
+        omarchy_disabled_by_us = omarchy_marker_present();
         int r = sd_bus_request_name(bus, "org.freedesktop.Notifications",
                                     SD_BUS_NAME_REPLACE_EXISTING |
                                         SD_BUS_NAME_QUEUE);
@@ -311,9 +453,25 @@ struct NotifyDaemon::Impl {
         update_owner();
         DBG("notifyd: request_name -> %d, owner=%d", r, owns);
         if (!owns) takeover();
+        else if (cfg.notifications_takeover) disable_omarchy_notifications();
         pump.process();
     }
-    // We could not replace the current owner (mako requests the name with no ALLOW_REPLACEMENT).
+    // We could not replace the current owner (mako requests the name
+    // with no ALLOW_REPLACEMENT). Enabling this daemon means the user
+    // wants it in charge — but "terminate the owner" is only safe when
+    // the owner is a standalone notification daemon. On Omarchy Quattro
+    // the name is owned by the Quickshell SHELL process: SIGTERMing it
+    // kills the entire shell — panels, agent usage collectors, the lot —
+    // which then silently breaks every `omarchy-shell shell toggle ...`
+    // click on this bar. So the default kill is gated on the owner's comm
+    // being a known-converging daemon (mako exits by itself when it cannot
+    // get the name back — verified against its source; dunst behaves the
+    // same). For the Omarchy shell we use its plugin IPC instead:
+    // `setPluginEnabled omarchy.notifications false` unloads the
+    // NotificationServer, releases the name, and persists so the next
+    // login does not race us. cfg.quickshell_shutdown is the opt-in to
+    // stop the whole process after that. Anything else stays queued, we
+    // log, and the user picks one side via notifications_takeover.
     void takeover() {
         if (owns || !bus || !cfg.notifications_takeover) return;
         sd_bus_error    e   = SD_BUS_ERROR_NULL;
@@ -339,6 +497,10 @@ struct NotifyDaemon::Impl {
             kill((pid_t)pid, SIGTERM);
             return;
         }
+        if (is_omarchy_shell(pid, comm)) {
+            disable_omarchy_notifications();
+            return;
+        }
         fprintf(stderr,
                 "mattbar: notifyd: notification name is owned by '%s' "
                 "(pid %u) — NOT terminating it (it may be your shell). "
@@ -348,12 +510,292 @@ struct NotifyDaemon::Impl {
                 comm.empty() ? "?" : comm.c_str(), pid);
     }
 
+    static bool omarchy_shell_on_path() {
+        if (const char* p = getenv("OMARCHY_PATH"); p && *p) return true;
+        return access("/usr/bin/omarchy-shell", X_OK) == 0;
+    }
+    static bool is_omarchy_shell(uint32_t pid, const std::string& comm) {
+        if (comm == "quickshell" || comm == "qs") return true;
+        std::string cmd =
+            slurp("/proc/" + std::to_string(pid) + "/cmdline");
+        for (char& c : cmd)
+            if (c == '\0') c = ' ';
+        return cmd.find("/omarchy/shell") != std::string::npos;
+    }
+    static std::string omarchy_shell_config_dir() {
+        if (const char* p = getenv("OMARCHY_PATH"); p && *p)
+            return std::string(p) + "/shell";
+        return "/usr/share/omarchy/shell";
+    }
+    std::string omarchy_marker_path() const {
+        return state_dir + "/took_over_omarchy_notifications";
+    }
+    bool omarchy_marker_present() const {
+        return !state_dir.empty() &&
+               access(omarchy_marker_path().c_str(), F_OK) == 0;
+    }
+    void write_omarchy_marker() {
+        if (state_dir.empty()) return;
+        int fd = open(omarchy_marker_path().c_str(),
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd >= 0) close(fd);
+        omarchy_disabled_by_us = true;
+    }
+    void clear_omarchy_marker() {
+        if (!state_dir.empty()) unlink(omarchy_marker_path().c_str());
+        omarchy_disabled_by_us = false;
+    }
+    std::string omarchy_stop_marker_path() const {
+        return state_dir + "/shut_down_omarchy_shell";
+    }
+    bool omarchy_stop_marker_present() const {
+        return !state_dir.empty() &&
+               access(omarchy_stop_marker_path().c_str(), F_OK) == 0;
+    }
+    void write_omarchy_stop_marker() {
+        if (state_dir.empty()) return;
+        int fd = open(omarchy_stop_marker_path().c_str(),
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd >= 0) close(fd);
+        omarchy_stopped_by_us = true;
+    }
+    void clear_omarchy_stop_marker() {
+        if (!state_dir.empty()) unlink(omarchy_stop_marker_path().c_str());
+        omarchy_stopped_by_us = false;
+    }
+    void arm_omarchy_retry() {
+        if (cfg.quickshell_shutdown) {
+            // Plugin IPC cannot reach a shell we are about to stop (or
+            // already stopped). Killing the instance drops the name.
+            stop_omarchy_shell();
+            return;
+        }
+        if (!bar || omarchy_retries >= 8) {
+            if (omarchy_retries >= 8)
+                fprintf(stderr,
+                        "mattbar: notifyd: giving up asking the Omarchy "
+                        "shell to release the notification name after %d "
+                        "tries; disable omarchy.notifications in "
+                        "shell.json, or set notifications_takeover = "
+                        "false.\n",
+                        omarchy_retries);
+            return;
+        }
+        if (omarchy_retry_fd < 0) {
+            omarchy_retry_fd =
+                timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+            if (omarchy_retry_fd < 0) return;
+            bar->add_fd(
+                omarchy_retry_fd,
+                [this](uint32_t) {
+                    uint64_t x;
+                    while (read(omarchy_retry_fd, &x, sizeof x) > 0) {}
+                    if (cfg.quickshell_shutdown) {
+                        stop_omarchy_shell();
+                        return;
+                    }
+                    if (!owns && name_req && cfg.notifications_takeover)
+                        takeover();
+                    else if (owns && cfg.notifications_takeover &&
+                             !omarchy_disabled_by_us)
+                        disable_omarchy_notifications();
+                },
+                "notifyd-omarchy-retry");
+        }
+        int ms = std::min(4000, 500 * (1 << std::min(omarchy_retries, 3)));
+        omarchy_retries++;
+        itimerspec ts{};
+        ts.it_value.tv_sec  = ms / 1000;
+        ts.it_value.tv_nsec = (ms % 1000) * 1000000L;
+        timerfd_settime(omarchy_retry_fd, 0, &ts, nullptr);
+    }
+    void disable_omarchy_notifications() {
+        if (!cfg.notifications_takeover) return;
+        if (omarchy_disabled_by_us && owns) return;
+        if (!omarchy_shell_on_path()) return;
+        if (!bar || omarchy_off_cmd.running()) return;
+        fprintf(stderr,
+                "mattbar: notifyd: asking the Omarchy shell to disable "
+                "omarchy.notifications so MattBar can own the name\n");
+        omarchy_off_cmd.run(
+            *bar,
+            "omarchy-shell shell setPluginEnabled omarchy.notifications "
+            "false",
+            [this](const std::string& out, int status) {
+                std::string r = trim(out);
+                if (status == 0 && r.find("ok") != std::string::npos) {
+                    omarchy_retries = 0;
+                    write_omarchy_marker();
+                    update_owner();
+                    if (cfg.quickshell_shutdown) {
+                        stop_omarchy_shell();
+                        return;
+                    }
+                    if (owns) {
+                        fprintf(stderr,
+                                "mattbar: notifyd: Omarchy shell released "
+                                "the notification name\n");
+                        return;
+                    }
+                    // Quickshell's NotificationServer is a process-lifetime
+                    // singleton: unloading the QML plugin does not drop the
+                    // well-known name. A fresh shell (plugin already off)
+                    // never constructs it.
+                    restart_omarchy_shell();
+                    return;
+                }
+                fprintf(stderr,
+                        "mattbar: notifyd: omarchy-shell disable failed "
+                        "(status=%d, out='%s'); retrying\n",
+                        status, r.c_str());
+                if (cfg.quickshell_shutdown) {
+                    stop_omarchy_shell();
+                    return;
+                }
+                arm_omarchy_retry();
+            },
+            4000);
+    }
+    // Shared completion for stop / start / takeover-restart. AsyncCmd
+    // keeps one callback, so a toggle that coalesces kill→launch (or
+    // the reverse) must decide from the CURRENT cfg, not from which
+    // command just finished.
+    void on_omarchy_shell_cmd(const std::string& out, int status) {
+        omarchy_stop_pending = false;
+        update_owner();
+        if (cfg.quickshell_shutdown) {
+            write_omarchy_stop_marker();
+            omarchy_restarted = false;
+            fprintf(stderr,
+                    "mattbar: notifyd: Omarchy shell shut down\n");
+            return;
+        }
+        clear_omarchy_stop_marker();
+        omarchy_restarted = true;
+        if (owns) {
+            fprintf(stderr,
+                    "mattbar: notifyd: Omarchy shell is running "
+                    "(notification name acquired)\n");
+        } else {
+            fprintf(stderr,
+                    "mattbar: notifyd: Omarchy shell command finished "
+                    "(status=%d, out='%s')\n",
+                    status, trim(out).c_str());
+            if (name_req && cfg.notifications_takeover)
+                arm_omarchy_retry();
+        }
+        if (!cfg.enable_notifications)
+            restore_omarchy_notifications();
+    }
+    void restart_omarchy_shell() {
+        if (cfg.quickshell_shutdown) return;
+        if (omarchy_restarted || !bar) return;
+        omarchy_restarted = true;
+        fprintf(stderr,
+                "mattbar: notifyd: restarting the Omarchy shell so its "
+                "NotificationServer drops org.freedesktop.Notifications\n");
+        omarchy_restart_cmd.run(
+            *bar,
+            with_preserved_power_profile("omarchy-restart-shell"),
+            [this](const std::string& out, int status) {
+                on_omarchy_shell_cmd(out, status);
+            },
+            22000);
+    }
+    // Same kill loop omarchy-restart-shell uses, without the relaunch:
+    // `quickshell kill` is a clean exit, so omarchy-launch-shell treats
+    // it as a deliberate stop and does not supervise a replacement.
+    void stop_omarchy_shell() {
+        if (!bar || !omarchy_shell_on_path()) return;
+        if (omarchy_stopped_by_us && !omarchy_restart_cmd.running()) return;
+        omarchy_stop_pending = true;
+        std::string cmd = with_preserved_power_profile(
+            "while timeout 5 quickshell kill -p '" +
+            omarchy_shell_config_dir() +
+            "' --any-display >/dev/null 2>&1; do :; done");
+        fprintf(stderr,
+                "mattbar: notifyd: shutting down the Omarchy shell "
+                "(quickshell) so its panels cannot appear\n");
+        omarchy_restart_cmd.run(
+            *bar, cmd,
+            [this](const std::string& out, int status) {
+                on_omarchy_shell_cmd(out, status);
+            },
+            22000);
+    }
+    void start_omarchy_shell() {
+        if (cfg.quickshell_shutdown || !bar) return;
+        omarchy_stop_pending = false;
+        fprintf(stderr,
+                "mattbar: notifyd: starting the Omarchy shell again\n");
+        omarchy_restart_cmd.run(
+            *bar,
+            with_preserved_power_profile("omarchy-restart-shell"),
+            [this](const std::string& out, int status) {
+                on_omarchy_shell_cmd(out, status);
+            },
+            22000);
+    }
+    void apply_omarchy_shell() {
+        if (!omarchy_shell_on_path() || !bar) return;
+        if (cfg.quickshell_shutdown && qs_plugins_want_runtime()) {
+            // Sidecar owns the qs process while plugins are enabled.
+            return;
+        }
+        if (cfg.quickshell_shutdown) {
+            if (omarchy_stop_pending) return;
+            // Already down, and nothing in flight that could bring it
+            // back. Skip so other settings changes don't re-issue kill.
+            if (omarchy_stopped_by_us && !omarchy_restart_cmd.running())
+                return;
+            // Takeover may already be disabling the plugin; its
+            // callback stops the shell so we don't race IPC with kill.
+            if (omarchy_off_cmd.running()) return;
+            stop_omarchy_shell();
+        } else if (omarchy_stopped_by_us || omarchy_stop_marker_present() ||
+                   omarchy_stop_pending) {
+            start_omarchy_shell();
+        }
+    }
+    void restore_omarchy_notifications() {
+        if (!omarchy_disabled_by_us && !omarchy_marker_present()) return;
+        if (!omarchy_shell_on_path() || !bar) {
+            clear_omarchy_marker();
+            return;
+        }
+        if (omarchy_on_cmd.running()) return;
+        fprintf(stderr,
+                "mattbar: notifyd: handing the notification name back "
+                "to the Omarchy shell\n");
+        omarchy_on_cmd.run(
+            *bar,
+            "omarchy-shell shell setPluginEnabled omarchy.notifications "
+            "true",
+            [this](const std::string& out, int status) {
+                std::string r = trim(out);
+                if (status == 0 && r.find("ok") != std::string::npos) {
+                    clear_omarchy_marker();
+                    fprintf(stderr,
+                            "mattbar: notifyd: Omarchy notifications "
+                            "plugin re-enabled\n");
+                    return;
+                }
+                fprintf(stderr,
+                        "mattbar: notifyd: failed to re-enable "
+                        "omarchy.notifications (status=%d, out='%s')\n",
+                        status, r.c_str());
+            },
+            4000);
+    }
+
     void release() {
-        if (!bus || !name_req) return;
-        sd_bus_release_name(bus, "org.freedesktop.Notifications");
-        name_req = false;
-        owns     = false;
-        pump.process();
+        if (bus && name_req) {
+            sd_bus_release_name(bus, "org.freedesktop.Notifications");
+            name_req = false;
+            owns     = false;
+            pump.process();
+        }
+        restore_omarchy_notifications();
     }
     void update_owner() {
         owns = false;
@@ -392,8 +834,9 @@ struct NotifyDaemon::Impl {
                                           MATTBAR_VERSION, "1.2");
     }
     static int m_caps(sd_bus_message* c, void*, sd_bus_error*) {
-        return sd_bus_reply_method_return(c, "as", 3, "body", "actions",
-                                          "persistence");
+        return sd_bus_reply_method_return(c, "as", 5, "body", "body-markup",
+                                          "actions", "persistence",
+                                          "icon-static");
     }
     static int m_close(sd_bus_message* c, void* ud, sd_bus_error*) {
         auto*    self = static_cast<Impl*>(ud);
@@ -428,13 +871,14 @@ struct NotifyDaemon::Impl {
         int32_t expire = -1;
         self->read_hints(c, n);
         sd_bus_message_read(c, "i", &expire);
-        if (!n.icon && icon && icon[0] == '/' &&
-            strstr(icon, ".png")) { // PNG paths: cairo-native, no new deps
-            cairo_surface_t* s = cairo_image_surface_create_from_png(icon);
-            if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS)
-                n.icon = downscale_icon(s);
-            else cairo_surface_destroy(s);
-        }
+        // Spec order: image-data (already applied), image-path, app_icon,
+        // then the desktop-entry's Icon. Messengers put the contact
+        // avatar in image-data / image-path and the app mark in app_icon.
+        if (!n.icon && !n.image_path.empty())
+            n.icon = load_icon_spec(n.image_path);
+        if (!n.icon && icon && *icon) n.icon = load_icon_spec(icon);
+        if (!n.icon && !n.desktop_entry.empty())
+            n.icon = icon_from_desktop(n.desktop_entry);
         uint64_t timeout =
             expire > 0 ? (uint64_t)expire
                        : (n.urgency >= 2 || cfg.notification_timeout_s <= 0
@@ -444,9 +888,11 @@ struct NotifyDaemon::Impl {
         n.posted_at  = (uint64_t)time(nullptr);
         if (replaces) self->erase_note(replaces);
         n.id = replaces ? replaces : self->next_id++;
-        // Remember the app so settings can offer a mute toggle for it even when it isn't running.
+        // Remember the app so settings can offer a mute toggle for it even
+        // when it isn't running.
         cfg.note_app(n.app);
-        // A muted app never pops up — but it is still recorded, so muting costs you nothing: everything is in the bell's history.
+        // A muted app never pops up — but it is still recorded, so muting
+        // costs you nothing: everything is in the bell's history.
         if (cfg.app_muted(n.app)) {
             DBG("notifyd: #%u [%s] muted -> history only", n.id,
                 n.app.c_str());
@@ -488,6 +934,30 @@ struct NotifyDaemon::Impl {
                     sd_bus_message_exit_container(c);
                     used = true;
                 }
+            } else if (k == "image-path" || k == "image_path") {
+                const char* v = nullptr;
+                if (sd_bus_message_enter_container(c, 'v', "s") >= 0) {
+                    sd_bus_message_read(c, "s", &v);
+                    sd_bus_message_exit_container(c);
+                    if (v) n.image_path = v;
+                    used = true;
+                }
+            } else if (k == "desktop-entry" || k == "desktop_entry") {
+                const char* v = nullptr;
+                if (sd_bus_message_enter_container(c, 'v', "s") >= 0) {
+                    sd_bus_message_read(c, "s", &v);
+                    sd_bus_message_exit_container(c);
+                    if (v) n.desktop_entry = v;
+                    used = true;
+                }
+            } else if (k == "omarchy-glyph") {
+                const char* v = nullptr;
+                if (sd_bus_message_enter_container(c, 'v', "s") >= 0) {
+                    sd_bus_message_read(c, "s", &v);
+                    sd_bus_message_exit_container(c);
+                    if (v) n.glyph = v;
+                    used = true;
+                }
             }
             if (!used) sd_bus_message_skip(c, "v");
             sd_bus_message_exit_container(c);
@@ -504,7 +974,7 @@ struct NotifyDaemon::Impl {
         size_t      len  = 0;
         sd_bus_message_read_array(c, 'y', &data, &len);
         sd_bus_message_exit_container(c);
-        if (w <= 0 || h <= 0 || w > 512 || h > 512 || bps != 8 ||
+        if (w <= 0 || h <= 0 || w > 2048 || h > 2048 || bps != 8 ||
             (ch != 3 && ch != 4) || !data ||
             len < (size_t)stride * (h - 1) + (size_t)w * ch)
             return;
@@ -549,7 +1019,14 @@ struct NotifyDaemon::Impl {
         mark_dirty();
     }
 
-    // ---- crash-safe state ------------------------------------------------- History, DND, and the id counter survive restarts: serialized to $XDG_STATE_HOME/mattbar (tiny; icons ride along as the already-96px PNGs).
+    // ---- crash-safe state -------------------------------------------------
+    // History, DND, and the id counter survive restarts: serialized to
+    // $XDG_STATE_HOME/mattbar (tiny; icons ride along as the already-96px
+    // PNGs). Writes are debounced 500ms and atomic (tmp+rename), so a
+    // crash costs at most half a second of history — and with the
+    // Restart=on-failure unit that's the whole cost of a crash.
+    // Restored notes are history-only and action-less by design: the
+    // sender's bus connection died with the old process.
     std::string state_dir;
     int         save_fd     = -1;
     bool        state_dirty = false;
@@ -608,7 +1085,9 @@ struct NotifyDaemon::Impl {
                     n.urgency, (unsigned long long)n.posted_at,
                     icon_file.c_str(), a.c_str(), s.c_str(), b.c_str());
         };
-        // Active popups persist as history: after a restart they cannot be live again (expiry clocks and senders died with the ...
+        // Active popups persist as history: after a restart they cannot be
+        // live again (expiry clocks and senders died with the process), but
+        // they must not be *lost* — that is the entire point.
         for (auto& n : active) put(n);
         for (auto& n : history) put(n);
         fclose(f);
@@ -671,7 +1150,8 @@ struct NotifyDaemon::Impl {
     std::vector<NoteRecord> history_snapshot() const {
         std::vector<NoteRecord> out;
         uint64_t nowsec = (uint64_t)time(nullptr);
-        // Anything still on screen belongs at the top of the list too: opening the bell shouldn't hide what is currently showing.
+        // Anything still on screen belongs at the top of the list too:
+        // opening the bell shouldn't hide what is currently showing.
         auto add = [&](const Note& n, bool live) {
             NoteRecord r;
             r.id      = n.id;
@@ -683,7 +1163,9 @@ struct NotifyDaemon::Impl {
                             ? nowsec - n.posted_at
                             : 0;
             r.active  = live;
-            // Only ACTIVE notes are invokable: once a notification closed, the app was told so and stopped listening for its actions.
+            r.icon    = n.icon;
+            // Only ACTIVE notes are invokable: once a notification closed,
+            // the app was told so and stopped listening for its actions.
             if (live) {
                 if (auto* a = default_action(n)) {
                     r.has_action = true;
@@ -764,6 +1246,13 @@ struct NotifyDaemon::Impl {
 
     void redraw() {
         if (!bar || !bar->compositor()) return; // headless
+        // Mapping a layer surface while the panel is blanked or the
+        // screensaver is up is treated as activity and turns the
+        // display back on. Keep the notes queued; show them on wake.
+        if (lock_display_asleep() || idle_screensaver_up()) {
+            win.destroy();
+            return;
+        }
         auto v = shown();
         if (v.empty()) {
             win.destroy();
@@ -778,10 +1267,11 @@ struct NotifyDaemon::Impl {
         int total = 0;
         for (auto* np : v) {
             auto*  n     = const_cast<Note*>(np);
-            double textw = NOTE_W - 2 * NOTE_PAD - (n->icon ? 42 : 0);
+            bool   face  = n->icon || !n->glyph.empty();
+            double textw = NOTE_W - 2 * NOTE_PAD - (face ? 48 : 0);
             auto   lines = wrap(mc, n->body, textw, 3);
             n->height    = NOTE_PAD * 2 + 18 + (int)lines.size() * 17;
-            if (n->icon) n->height = std::max(n->height, NOTE_PAD * 2 + 34);
+            if (face) n->height = std::max(n->height, NOTE_PAD * 2 + 40);
             total += n->height + 8;
         }
         cairo_destroy(mc);
@@ -812,15 +1302,20 @@ struct NotifyDaemon::Impl {
             cairo_stroke(cr);
             double tx = NOTE_PAD;
             if (n->icon) {
-                double iw = cairo_image_surface_get_width(n->icon);
-                double ih = cairo_image_surface_get_height(n->icon);
-                cairo_save(cr);
-                cairo_translate(cr, NOTE_PAD, y + NOTE_PAD);
-                cairo_scale(cr, 32.0 / iw, 32.0 / ih);
-                cairo_set_source_surface(cr, n->icon, 0, 0);
-                cairo_paint(cr);
-                cairo_restore(cr);
-                tx += 42;
+                double ay = y + (n->height - 36) / 2.0;
+                draw_note_avatar(cr, n->icon, NOTE_PAD, ay, 36);
+                tx += 48;
+            } else if (!n->glyph.empty()) {
+                cairo_font_extents_t gfe;
+                cairo_set_font_size(cr, 22);
+                cairo_font_extents(cr, &gfe);
+                col(cr, cfg.c_fg, 1.0);
+                cairo_move_to(cr, NOTE_PAD,
+                              y + n->height / 2.0 +
+                                  (gfe.ascent - gfe.descent) / 2.0);
+                cairo_show_text(cr, n->glyph.c_str());
+                cairo_set_font_size(cr, cfg.font_size);
+                tx += 48;
             }
             cairo_font_extents_t fe;
             cairo_font_extents(cr, &fe);
@@ -848,7 +1343,9 @@ struct NotifyDaemon::Impl {
             off += n->height + 8;
         }
     }
-    // The action a bare click means: "default" when the app names one, otherwise its first action (many apps only register ...
+    // The action a bare click means: "default" when the app names one,
+    // otherwise its first action (many apps only register named actions,
+    // and "no default" shouldn't mean "click does nothing").
     static const std::pair<std::string, std::string>* default_action(
         const Note& n) {
         for (auto& a : n.actions)
@@ -891,7 +1388,10 @@ struct NotifyDaemon::Impl {
             col(cr, muted ? cfg.c_urgent : cfg.c_fg, 1.0);
             cairo_move_to(cr, 12, ty);
             cairo_show_text(cr, label.c_str());
-            // Numeric readout, right-aligned.
+            // Numeric readout, right-aligned. The bar's right edge is
+            // reserved off "100%" (or the actual string when wider, e.g.
+            // boosted volume "150%") so its length doesn't jitter as the
+            // digit count changes while a key is held.
             char pct[8];
             std::snprintf(pct, sizeof pct, "%d%%",
                           (int)std::lround(frac * 100));
@@ -910,7 +1410,8 @@ struct NotifyDaemon::Impl {
                             bw * std::clamp(frac, 0.0, 1.0), 6);
             cairo_fill(cr);
         };
-        // Notification stack and OSD are singletons too: primary monitor only, never mirrored onto every screen.
+        // Notification stack and OSD are singletons too: primary monitor
+        // only, never mirrored onto every screen.
         osd.ensure(*bar, ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM, 0, 0, 90, 0,
                    "mattbar-osd", 292, 44, bar->primary_output());
         osd.draw();
@@ -921,7 +1422,17 @@ struct NotifyDaemon::Impl {
         timerfd_settime(osd_fd, 0, &ts, nullptr);
     }
 
-    // PipeWire emits sink/source *change* events for much more than volume: streams starting, nodes suspending and waking, latency and port changes.
+    // PipeWire emits sink/source *change* events for much more than volume:
+    // streams starting, nodes suspending and waking, latency and port
+    // changes. Showing the OSD on every event makes it pop up "randomly"
+    // whenever any app touches audio. So remember the last level and mute
+    // state per kind and display only on an actual change; the first
+    // reading (at startup) just seeds the cache silently.
+    // Async: these used to be UNCAPPED blocking popen calls — the exact
+    // mechanism behind the bar freezing and the mic OSD hanging on screen
+    // for ~7 s during Bluetooth reconnect storms (wpctl stalls while
+    // pipewire is being restarted; every stall parked the entire event
+    // loop). Now the answer paints whenever it arrives, capped at 1.5 s.
     void query_volume() {
         vol_cmd.run(*bar, "wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null",
                     [this](const std::string& out, int) {
@@ -964,7 +1475,10 @@ struct NotifyDaemon::Impl {
     }
 
     void start_osd_sources() {
-        // Audio changes come from the shared AudioEvents stream (one pactl process serving both this OSD and the volume module).
+        // Audio changes come from the shared AudioEvents stream (one pactl
+        // process serving both this OSD and the volume module). It already
+        // debounces bursts and filters app-stream noise ("on sink #" only),
+        // so the callback just queries whichever side changed.
         if (audio_sub == 0)
             audio_sub = audio_events().subscribe(*bar, [this](bool sink,
                                                               bool src) {
@@ -1095,12 +1609,17 @@ void NotifyDaemon::init(Bar& bar) {
 void NotifyDaemon::apply_enabled() {
     if (cfg.enable_notifications) im_->acquire();
     else im_->release();
+    im_->apply_omarchy_shell();
     if (cfg.enable_osd && im_->bar) {
         im_->start_osd_sources();
         im_->query_volume(); // seed the change caches silently
         im_->query_mic();
     }
     else if (!cfg.enable_osd) im_->stop_osd_sources();
+}
+
+void NotifyDaemon::refresh_popups() {
+    if (im_) im_->redraw();
 }
 
 void NotifyDaemon::dismiss_last() {

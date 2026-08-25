@@ -1,5 +1,6 @@
 #include "config.hpp"
 #include "omarchy_theme.hpp"
+#include "qs_plugins.hpp"
 #include "util.hpp"
 
 #include <sys/stat.h>
@@ -44,7 +45,14 @@ std::string Config::path() {
     return base + "/mattbar/mattbar.conf";
 }
 
-// --------------------------------------------------------------------------- Quattro-aware click defaults.
+// ---------------------------------------------------------------------------
+// Quattro-aware click defaults. Omarchy 4 deleted the omarchy-launch-{wifi,
+// audio,bluetooth} wrappers (impala/wiremix/bluetui TUIs) in favour of
+// Quickshell panels toggled via `omarchy-shell shell toggle omarchy.<name>`.
+// Stock defaults resolve at load time against what is actually installed,
+// in BOTH directions (an OS rollback re-resolves back to the TUI wrapper).
+// A value the user customised is never touched.
+// ---------------------------------------------------------------------------
 static bool cmd_exists(const std::string& cmdline) {
     std::string c = cmdline.substr(0, cmdline.find(' '));
     if (c.empty()) return false;
@@ -82,9 +90,31 @@ void Config::resolve_click_defaults() {
                   "omarchy-shell shell toggle omarchy.bluetooth");
     resolve_click(mic_click, "omarchy-launch-audio",
                   "omarchy-shell shell toggle omarchy.audio");
-    // Agent-popup terminal: any RECOGNISED stock value — current or from an older MattBar that saved it to disk — is normalised to the up-to-date form for whichever terminal is installed.
+    // 1.30 briefly saved the MattBar menu command as the default; treat
+    // that as stock so a saved conf does not stick after the toggle is off.
+    if (omarchy_click == "auto" ||
+        omarchy_click == "mattbarctl shell toggle omarchy.menu")
+        omarchy_click = "omarchy-menu";
+    // Agent-popup terminal: any RECOGNISED stock value — current or from
+    // an older MattBar that saved it to disk — is normalised to the
+    // up-to-date form for whichever terminal is installed. A customised
+    // value is never touched.
+    //
+    // Two hard-won constraints live in these strings. (1) --inline:
+    // without it omarchy-agent is a launcher that execs
+    // omarchy-launch-tui and exits immediately — the popup dies ~60 ms
+    // after mapping. (2) ghostty's --class must be a dotted GTK app ID
+    // or it is silently ignored (window maps as com.mitchellh.ghostty
+    // and the bar never recognises it); the dotted class also makes
+    // ghostty run a separate instance whose PID Hyprland 0.55's
+    // exec_cmd rules can actually match. kitty and foot take the
+    // command positionally (no -e).
     struct TermForm { const char* bin; const char* cmd; const char* cls; };
-    // Window size is set with the TERMINAL'S OWN cell flags (110x30 cells ~ 920x640 px): Hyprland's Lua builds ignore size ...
+    // Window size is set with the TERMINAL'S OWN cell flags (110x30
+    // cells ~ 920x640 px): Hyprland's Lua builds ignore size in both
+    // exec_cmd rule tables and (field-verified) hl.window_rule effects,
+    // so the client sizing itself is the one mechanism that cannot be
+    // dropped.
     static const TermForm forms[] = {
         {"alacritty",
          "alacritty --class mattbar-agent -o window.dimensions.columns=110 "
@@ -116,7 +146,8 @@ void Config::resolve_click_defaults() {
     for (const auto& f : forms) term_stock |= (agents_term == f.cmd);
     for (const char* s : stock_legacy) term_stock |= (agents_term == s);
     if (term_stock) {
-        // Prefer the terminal the current value already names (if it is installed), else the first installed one in preference ...
+        // Prefer the terminal the current value already names (if it is
+        // installed), else the first installed one in preference order.
         const TermForm* pick = nullptr;
         std::string bin = agents_term.substr(0, agents_term.find(' '));
         for (const auto& f : forms)
@@ -126,7 +157,8 @@ void Config::resolve_click_defaults() {
                 if (cmd_exists(f.bin)) { pick = &f; break; }
         if (pick) {
             agents_term = pick->cmd;
-            // Keep the stock class in lockstep (only ever touches the two values we ship; anything else is the user's).
+            // Keep the stock class in lockstep (only ever touches the
+            // two values we ship; anything else is the user's).
             if (agents_term_class == "mattbar-agent" ||
                 agents_term_class == "com.mattbar.agent")
                 agents_term_class = pick->cls;
@@ -142,7 +174,8 @@ void Config::load() {
     }
     std::string line;
     while (std::getline(f, line)) {
-        // '#' starts a comment only before the '='; color VALUES also begin with '#' and must survive (e.g.
+        // '#' starts a comment only before the '='; color VALUES also begin
+        // with '#' and must survive (e.g. strip_color = #ff336680).
         auto hash = line.find('#');
         auto eq0  = line.find('=');
         if (hash != std::string::npos &&
@@ -193,7 +226,10 @@ void Config::load() {
         else if (k == "agents_click")      agents_click = v;
         else if (k == "agents_term")       agents_term = v;
         else if (k == "agents_term_class") agents_term_class = v;
-        else if (k == "agents_popup_size") agents_popup_size = v;
+        else if (k == "agents_popup_size") {
+            agents_popup_size = v;
+            set_agents_popup_pct(agents_popup_w_pct(), agents_popup_h_pct());
+        }
         else if (k == "agents_click_through")
             agents_click_through = (v == "true" || v == "1");
         else if (k == "show_microphone")   show_microphone = b();
@@ -206,13 +242,79 @@ void Config::load() {
         else if (k == "screenrecord_procs") screenrecord_procs = v;
         else if (k == "screenrecord_stop")  screenrecord_stop = v;
         else if (k == "show_brightness")   show_brightness = b();
+        else if (k == "show_display")      show_display = b();
         else if (k == "show_media")        show_media = b();
         else if (k == "show_caffeine")     show_caffeine = b();
+        else if (k == "show_nightlight")   show_nightlight = b();
+        else if (k == "nightlight_on_k")
+            nightlight_on_k = std::clamp(atoi(v.c_str()), 1000, 5999);
+        else if (k == "nightlight_off_k")
+            nightlight_off_k = std::clamp(atoi(v.c_str()), 6000, 10000);
+        else if (k == "show_weather")      show_weather = b();
+        else if (k == "show_active_window") show_active_window = b();
+        else if (k == "active_window_max")
+            active_window_max = std::clamp(atoi(v.c_str()), 8, 80);
+        else if (k == "show_kblayout")     show_kblayout = b();
+        else if (k == "show_reminder")     show_reminder = b();
+        else if (k == "show_dictation")    show_dictation = b();
+        else if (k == "power_show_pct")    power_show_pct = b();
+        else if (k == "show_tailscale")    show_tailscale = b();
+        else if (k == "show_dropbox")      show_dropbox = b();
+        else if (k == "weather_show_temp") weather_show_temp = b();
+        else if (k == "weather_unit")      weather_unit = v;
+        else if (k == "weather_refresh_min")
+            weather_refresh_min = std::clamp(atoi(v.c_str()), 1, 120);
+        else if (k == "shell_weather_font_size")
+            shell_weather_font_size = std::clamp(atof(v.c_str()), 9.0, 22.0);
+        else if (k == "shell_agents_font_size")
+            shell_agents_font_size = std::clamp(atof(v.c_str()), 9.0, 22.0);
         else if (k == "enable_notifications") enable_notifications = b();
         else if (k == "enable_osd")        enable_osd = b();
         else if (k == "notification_timeout_s")
             notification_timeout_s = std::clamp(atoi(v.c_str()), 0, 300);
         else if (k == "notifications_takeover") notifications_takeover = b();
+        else if (k == "quickshell_shutdown")    quickshell_shutdown = b();
+        else if (k == "qs_plugins")             qs_plugins = b();
+        else if (k == "show_plugins")           show_plugins = b();
+        else if (k == "qs_plugin_layout")       qs_plugin_layout = v;
+        else if (k == "qs_plugin_services")     qs_plugin_services = v;
+        else if (k == "idle_blank_s")
+            idle_blank_s = std::clamp(atoi(v.c_str()), 0, 120);
+        else if (k == "shell_font_size")
+            shell_font_size = std::clamp(atof(v.c_str()), 9.0, 28.0);
+        else if (k == "shell_audio_font_size")
+            shell_audio_font_size = std::clamp(atof(v.c_str()), 9.0, 22.0);
+        else if (k == "shell_network_font_size")
+            shell_network_font_size = std::clamp(atof(v.c_str()), 9.0, 22.0);
+        else if (k == "shell_bluetooth_font_size")
+            shell_bluetooth_font_size = std::clamp(atof(v.c_str()), 9.0, 22.0);
+        else if (k == "shell_display_font_size")
+            shell_display_font_size = std::clamp(atof(v.c_str()), 9.0, 22.0);
+        else if (k == "shell_clipboard_font_size")
+            shell_clipboard_font_size = std::clamp(atof(v.c_str()), 9.0, 22.0);
+        else if (k == "shell_emoji_font_size")
+            shell_emoji_font_size = std::clamp(atof(v.c_str()), 9.0, 22.0);
+        else if (k == "shell_image_font_size")
+            shell_image_font_size = std::clamp(atof(v.c_str()), 9.0, 22.0);
+        else if (k == "shell_panel_width")
+            shell_panel_width = std::clamp(atoi(v.c_str()), 280, 720);
+        else if (k == "shell_panel_height")
+            shell_panel_height = std::clamp(atoi(v.c_str()), 300, 900);
+        else if (k == "shell_overlay_width")
+            shell_overlay_width = std::clamp(atoi(v.c_str()), 360, 960);
+        else if (k == "shell_overlay_height")
+            shell_overlay_height = std::clamp(atoi(v.c_str()), 300, 900);
+        else if (k == "shell_audio_step")
+            shell_audio_step = std::clamp(atoi(v.c_str()), 1, 20);
+        else if (k == "shell_audio_show_apps") shell_audio_show_apps = b();
+        else if (k == "shell_audio_show_pct")  shell_audio_show_pct = b();
+        else if (k == "shell_wifi_scan_on_open") shell_wifi_scan_on_open = b();
+        else if (k == "shell_bt_scan_on_open")   shell_bt_scan_on_open = b();
+        else if (k == "shell_clipboard_limit")
+            shell_clipboard_limit = std::clamp(atoi(v.c_str()), 20, 1000);
+        else if (k == "shell_clipboard_paste") shell_clipboard_paste = b();
+        else if (k == "shell_emoji_insert")    shell_emoji_insert = b();
+        else if (k == "shell_image_show_labels") shell_image_show_labels = b();
         else if (k == "osd_volume")        osd_volume = b();
         else if (k == "osd_mic")           osd_mic = b();
         else if (k == "osd_brightness")    osd_brightness = b();
@@ -287,12 +389,15 @@ void Config::load() {
         else if (k == "layout_left")       layout_left = v;
         else if (k == "layout_center")     layout_center = v;
         else if (k == "layout_right")      layout_right = v;
+        else if (k == "layout_more")       layout_more = v;
     }
     if (position != "top" && position != "bottom" && position != "left" &&
         position != "right")
         position = "top";
     layout_normalize();
-    // The conf file always holds the USER's palette.
+    // The conf file always holds the USER's palette. Snapshot it, then, if
+    // theme-following is on, overlay the active Omarchy theme onto the
+    // effective colors (c_*) only.
     colors_snapshot();
     if (follow_omarchy_theme) omarchy_theme_apply(*this);
     resolve_click_defaults();
@@ -344,7 +449,9 @@ void Config::save() const {
       << "\n"
       << "font = " << font << "\n"
       << "font_size = " << font_size << "\n"
-      // colors: always the user's own palette — when Omarchy theme following is active, c_* hold the theme overlay and u_* th...
+      // colors: always the user's own palette — when Omarchy theme
+      // following is active, c_* hold the theme overlay and u_* the user's
+      // colors (kept fresh: following can only turn on via a snapshot).
       << "bg_color = " << fmt_color(follow_omarchy_theme ? u_bg : c_bg) << "\n"
       << "strip_color = " << fmt_color(follow_omarchy_theme ? u_strip : c_strip) << "\n"
       << "fg_color = " << fmt_color(follow_omarchy_theme ? u_fg : c_fg) << "\n"
@@ -368,6 +475,7 @@ void Config::save() const {
       << "agents_click = " << agents_click << "\n"
       << "agents_term = " << agents_term << "\n"
       << "agents_term_class = " << agents_term_class << "\n"
+      << "# agents_popup_size: W% H% of the monitor (Settings: Agents)\n"
       << "agents_popup_size = " << agents_popup_size << "\n"
       << "agents_click_through = "
       << (agents_click_through ? "true" : "false") << "\n"
@@ -381,12 +489,63 @@ void Config::save() const {
       << "screenrecord_procs = " << screenrecord_procs << "\n"
       << "screenrecord_stop = " << screenrecord_stop << "\n"
       << "show_brightness = " << (show_brightness ? "true" : "false") << "\n"
+      << "show_display = " << (show_display ? "true" : "false") << "\n"
       << "show_media = " << (show_media ? "true" : "false") << "\n"
       << "show_caffeine = " << (show_caffeine ? "true" : "false") << "\n"
+      << "show_nightlight = " << (show_nightlight ? "true" : "false") << "\n"
+      << "nightlight_on_k = " << nightlight_on_k << "\n"
+      << "nightlight_off_k = " << nightlight_off_k << "\n"
+      << "show_weather = " << (show_weather ? "true" : "false") << "\n"
+      << "show_active_window = " << (show_active_window ? "true" : "false")
+      << "\n"
+      << "active_window_max = " << active_window_max << "\n"
+      << "show_kblayout = " << (show_kblayout ? "true" : "false") << "\n"
+      << "show_reminder = " << (show_reminder ? "true" : "false") << "\n"
+      << "show_dictation = " << (show_dictation ? "true" : "false") << "\n"
+      << "power_show_pct = " << (power_show_pct ? "true" : "false") << "\n"
+      << "show_tailscale = " << (show_tailscale ? "true" : "false") << "\n"
+      << "show_dropbox = " << (show_dropbox ? "true" : "false") << "\n"
+      << "weather_show_temp = " << (weather_show_temp ? "true" : "false") << "\n"
+      << "weather_unit = " << weather_unit << "\n"
+      << "weather_refresh_min = " << weather_refresh_min << "\n"
+      << "shell_weather_font_size = "
+      << static_cast<int>(shell_weather_font_size) << "\n"
+      << "shell_agents_font_size = "
+      << static_cast<int>(shell_agents_font_size) << "\n"
       << "enable_notifications = " << (enable_notifications ? "true" : "false") << "\n"
       << "enable_osd = " << (enable_osd ? "true" : "false") << "\n"
       << "notification_timeout_s = " << notification_timeout_s << "\n"
       << "notifications_takeover = " << (notifications_takeover ? "true" : "false") << "\n"
+      << "quickshell_shutdown = " << (quickshell_shutdown ? "true" : "false") << "\n"
+      << "# qs_plugins: optional Quickshell sidecar for user plugins while\n"
+      << "# takeover is on. Off keeps qs dead. Sidecar starts only with at\n"
+      << "# least one plugin on the bar or in qs_plugin_services.\n"
+      << "qs_plugins = " << (qs_plugins ? "true" : "false") << "\n"
+      << "show_plugins = " << (show_plugins ? "true" : "false") << "\n"
+      << "qs_plugin_layout = " << qs_plugin_layout << "\n"
+      << "qs_plugin_services = " << qs_plugin_services << "\n"
+      << "idle_blank_s = " << idle_blank_s << "\n"
+      << "shell_font_size = " << static_cast<int>(shell_font_size) << "\n"
+      << "shell_audio_font_size = " << static_cast<int>(shell_audio_font_size) << "\n"
+      << "shell_network_font_size = " << static_cast<int>(shell_network_font_size) << "\n"
+      << "shell_bluetooth_font_size = " << static_cast<int>(shell_bluetooth_font_size) << "\n"
+      << "shell_display_font_size = " << static_cast<int>(shell_display_font_size) << "\n"
+      << "shell_clipboard_font_size = " << static_cast<int>(shell_clipboard_font_size) << "\n"
+      << "shell_emoji_font_size = " << static_cast<int>(shell_emoji_font_size) << "\n"
+      << "shell_image_font_size = " << static_cast<int>(shell_image_font_size) << "\n"
+      << "shell_panel_width = " << shell_panel_width << "\n"
+      << "shell_panel_height = " << shell_panel_height << "\n"
+      << "shell_overlay_width = " << shell_overlay_width << "\n"
+      << "shell_overlay_height = " << shell_overlay_height << "\n"
+      << "shell_audio_step = " << shell_audio_step << "\n"
+      << "shell_audio_show_apps = " << (shell_audio_show_apps ? "true" : "false") << "\n"
+      << "shell_audio_show_pct = " << (shell_audio_show_pct ? "true" : "false") << "\n"
+      << "shell_wifi_scan_on_open = " << (shell_wifi_scan_on_open ? "true" : "false") << "\n"
+      << "shell_bt_scan_on_open = " << (shell_bt_scan_on_open ? "true" : "false") << "\n"
+      << "shell_clipboard_limit = " << shell_clipboard_limit << "\n"
+      << "shell_clipboard_paste = " << (shell_clipboard_paste ? "true" : "false") << "\n"
+      << "shell_emoji_insert = " << (shell_emoji_insert ? "true" : "false") << "\n"
+      << "shell_image_show_labels = " << (shell_image_show_labels ? "true" : "false") << "\n"
       << "osd_volume = " << (osd_volume ? "true" : "false") << "\n"
       << "osd_mic = " << (osd_mic ? "true" : "false") << "\n"
       << "osd_brightness = " << (osd_brightness ? "true" : "false") << "\n"
@@ -442,6 +601,7 @@ void Config::save() const {
       << "layout_left = " << layout_left << "\n"
       << "layout_center = " << layout_center << "\n"
       << "layout_right = " << layout_right << "\n"
+      << "layout_more = " << layout_more << "\n"
       << "network_click = " << network_click << "\n"
       << "volume_click = " << volume_click << "\n"
       << "bluetooth_click = " << bluetooth_click << "\n"
@@ -466,17 +626,24 @@ void Config::save() const {
 }
 
 
-// --------------------------------------------------------------------------- Module layout operations ----------------...
+// ---------------------------------------------------------------------------
+// Module layout operations
+// ---------------------------------------------------------------------------
 static const char* KNOWN_MODULES[] = {"omarchy",   "workspaces", "clock",
-                                      "pin",       "tray",       "update",
+                                      "pin",       "tray",       "more",
+                                      "update",
                                       "temp",      "media",      "network",    "bluetooth",
-                                      "brightness",
-                                      "caffeine",
+                                      "display", "brightness",
+                                      "caffeine",  "nightlight", "weather",
                                       "notifications",
                                       "power",
                                       "volume",    "battery",
                                       "agents",    "microphone",
-                                      "screenrecord"};
+                                      "screenrecord",
+                                      "kblayout", "activewindow",
+                                      "reminder", "dictation",
+                                      "tailscale", "dropbox",
+                                      "plugins"};
 
 static std::vector<std::string> split_list(const std::string& s) {
     std::vector<std::string> out;
@@ -506,7 +673,8 @@ std::string Config::csv_join(const std::vector<std::string>& v) {
     return join_list(v);
 }
 
-// Should this output carry a bar?
+// Should this output carry a bar? Single-monitor mode keeps the old rule
+// (cfg.output, or "wherever the compositor puts it" when empty).
 bool Config::wants_monitor(const std::string& name) const {
     if (!multi_monitor) return output.empty() || name == output;
     if (monitors.empty()) return true; // every connected output
@@ -533,7 +701,8 @@ void Config::set_app_muted(const std::string& app, bool muted) {
     save();
 }
 
-// Remember every app that has ever notified us, so the settings window can offer a mute checkbox for it even when it is...
+// Remember every app that has ever notified us, so the settings window can
+// offer a mute checkbox for it even when it isn't currently running.
 void Config::note_app(const std::string& app) {
     if (app.empty() || app.find(',') != std::string::npos) return;
     auto v = csv_split(known_apps);
@@ -546,18 +715,22 @@ void Config::note_app(const std::string& app) {
 }
 
 std::vector<std::string> Config::layout_get(int zone) const {
-    return split_list(zone == 0   ? layout_left
-                      : zone == 1 ? layout_center
-                                  : layout_right);
+    if (zone == 0) return split_list(layout_left);
+    if (zone == 1) return split_list(layout_center);
+    if (zone == 2) return split_list(layout_right);
+    return split_list(layout_more);
 }
 
 void Config::layout_set(int zone, const std::vector<std::string>& v) {
-    (zone == 0 ? layout_left : zone == 1 ? layout_center : layout_right) =
-        join_list(v);
+    std::string joined = join_list(v);
+    if (zone == 0) layout_left = joined;
+    else if (zone == 1) layout_center = joined;
+    else if (zone == 2) layout_right = joined;
+    else layout_more = joined;
 }
 
 int Config::layout_zone_of(const std::string& id, int* idx) const {
-    for (int z = 0; z < 3; ++z) {
+    for (int z = 0; z < 4; ++z) {
         auto v = layout_get(z);
         for (size_t i = 0; i < v.size(); ++i)
             if (v[i] == id) {
@@ -581,7 +754,10 @@ void Config::layout_move(const std::string& id, int delta) {
 
 void Config::layout_set_zone(const std::string& id, int zone) {
     int cur = layout_zone_of(id);
-    if (cur == zone || zone < 0 || zone > 2) return;
+    if (cur == zone || zone < 0 || zone > 3) return;
+    // More cannot nest in itself. Plugins is a different accordion and
+    // is allowed in More, same as volume/clock/etc.
+    if (id == "more" && zone == 3) return;
     if (cur >= 0) {
         auto v = layout_get(cur);
         v.erase(std::remove(v.begin(), v.end(), id), v.end());
@@ -593,16 +769,33 @@ void Config::layout_set_zone(const std::string& id, int zone) {
 }
 
 void Config::layout_normalize() {
+    // Older builds placed each qs:<id> on the bar. Fold those into the
+    // Plugins accordion list so the bar only hosts one Plugins chip.
+    for (int z = 0; z < 4; ++z) {
+        auto v = layout_get(z);
+        std::vector<std::string> keep;
+        bool ch = false;
+        for (auto& id : v) {
+            if (qs_is_module_id(id)) {
+                qs_plugin_set_shown(qs_plugin_id_of(id), true);
+                ch = true;
+                continue;
+            }
+            keep.push_back(id);
+        }
+        if (ch) layout_set(z, keep);
+    }
     auto known = [](const std::string& id) {
         for (auto* k : KNOWN_MODULES)
             if (id == k) return true;
         return false;
     };
     std::vector<std::string> seen;
-    for (int z = 0; z < 3; ++z) {
+    for (int z = 0; z < 4; ++z) {
         std::vector<std::string> clean;
         for (auto& id : layout_get(z)) {
             if (!known(id)) continue; // typo or removed module
+            if (id == "more" && z == 3) continue; // host cannot nest
             if (std::find(seen.begin(), seen.end(), id) != seen.end())
                 continue; // duplicate
             seen.push_back(id);
@@ -616,4 +809,32 @@ void Config::layout_normalize() {
         if (std::find(seen.begin(), seen.end(), k) == seen.end())
             right.push_back(k);
     layout_set(2, right);
+}
+
+static void parse_agents_popup_pct(const std::string& s, int& w, int& h) {
+    w = 36;
+    h = 44;
+    int a = 0, b = 0;
+    if (sscanf(s.c_str(), "%d%% %d%%", &a, &b) == 2) {
+        w = a;
+        h = b;
+    }
+}
+
+int Config::agents_popup_w_pct() const {
+    int w, h;
+    parse_agents_popup_pct(agents_popup_size, w, h);
+    return w;
+}
+
+int Config::agents_popup_h_pct() const {
+    int w, h;
+    parse_agents_popup_pct(agents_popup_size, w, h);
+    return h;
+}
+
+void Config::set_agents_popup_pct(int w, int h) {
+    w = std::clamp(w, 20, 80);
+    h = std::clamp(h, 20, 90);
+    agents_popup_size = std::to_string(w) + "% " + std::to_string(h) + "%";
 }

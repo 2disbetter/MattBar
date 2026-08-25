@@ -1,5 +1,19 @@
 #pragma once
-// Fractional scaling (wp-fractional-scale-v1 + wp_viewporter).
+// ---------------------------------------------------------------------------
+// Fractional scaling (wp-fractional-scale-v1 + wp_viewporter), one helper
+// shared by every render site (bar surfaces, popups, settings, tray menus).
+//
+// The contract mirrors the integer-scale design: ALL layout, hit rects, and
+// pointer math stay in logical pixels; only the buffer knows the scale. At
+// 1.5x a 30-logical-px bar renders into a 45px buffer and the viewport
+// declares "this covers 30 logical px" — the compositor composites 1:1
+// instead of downsampling a 2x buffer, which is exactly the crispness
+// difference on a bar full of 11px glyphs.
+//
+// Absent protocol (older compositors) => active() is false everywhere and
+// every site falls back to the existing integer set_buffer_scale path,
+// pixel-identical to v1.23.
+// ---------------------------------------------------------------------------
 #include <cstdint>
 #include <functional>
 
@@ -35,13 +49,15 @@ struct FracSurface {
         scale120 = 0;
     }
 
-    // Use only when genuinely fractional (not whole multiple of 120).
+    // A preferred scale that is a whole multiple of 120 gains nothing over
+    // the integer path — use it only when genuinely fractional.
     bool active() const { return vp && scale120 > 0 && scale120 % 120 != 0; }
 
     // Buffer pixels for a logical size (spec rounding: round half up).
     int px(int logical) const { return (int)((logical * scale120 + 60) / 120); }
 
-    // Attach-side surface state. Integer: set_buffer_scale. Fractional: buffer scale 1 + viewport destination in logical px.
+    // Attach-side surface state. Integer path: classic set_buffer_scale.
+    // Fractional: buffer scale 1 + viewport destination in logical px.
     void apply(wl_surface* s, int logical_w, int logical_h,
                int int_scale) const {
         if (active()) {

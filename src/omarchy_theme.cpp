@@ -24,7 +24,8 @@ bool is_dir(const std::string& p) {
     return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-// ".../omarchy/current" for installed Omarchy gen (4.x state / 3.x config).
+// ".../omarchy/current" of whichever Omarchy generation is installed.
+// Quattro keeps state under ~/.local/state; 3.x under $XDG_CONFIG_HOME.
 std::string current_dir() {
     std::string cands[2];
     cands[0] = home() + "/.local/state/omarchy/current";
@@ -75,7 +76,8 @@ bool read_colors_toml(const std::string& path,
     return !out.empty();
 }
 
-// waybar.css: `@define-color <name> <#hex>;` (early-3.x or generated).
+// waybar.css: `@define-color <name> <#hex>;` lines (early-3.x themes ship
+// this directly; late 3.x generates it from colors.toml — same file).
 bool read_waybar_css(const std::string& path,
                      std::map<std::string, Color>& out) {
     std::ifstream f(path);
@@ -103,7 +105,8 @@ Color mix(const Color& a, const Color& b, double t) {
 }
 
 std::string theme_name(const std::string& cur) {
-    // Recent gens write current/theme.name; early 3.x used symlink basename.
+    // All recent generations write current/theme.name; the earliest 3.x
+    // versions used a symlink, whose target's basename is the name.
     std::ifstream f(cur + "/theme.name");
     std::string n;
     if (f && std::getline(f, n) && !trim(n).empty()) return trim(n);
@@ -144,7 +147,9 @@ bool omarchy_theme_apply(Config& c) {
     }
     const Color bg = pal["background"], fg = pal["foreground"];
 
-    // Theme goes to effective colors (c_*); user palette (u_*) untouched.
+    // Effective colors get the theme; the user's palette (u_*) stays put.
+    // Alpha of the user's background/strip is preserved so translucency
+    // preferences survive (Omarchy palettes are opaque).
     c.c_bg = bg;
     c.c_bg.a = c.u_bg.a;
     c.c_fg = fg;

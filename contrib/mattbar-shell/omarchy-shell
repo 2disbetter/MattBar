@@ -1,0 +1,43 @@
+#!/bin/bash
+# Drop-in for /usr/bin/omarchy-shell once MattBar Shell is handling
+# overlays. Translates `omarchy-shell <target> <method> [args]` into
+# `mattbarctl`. Does not start Quickshell. See SHELL.md.
+#
+# Install on PATH ahead of /usr/bin (e.g. ~/.local/bin) after MattBar
+# 1.30+, or invoke explicitly while testing:
+#   PATH="$HOME/mattbar/contrib/mattbar-shell:$PATH"
+
+QUIET=0
+if [[ ${1:-} == "-q" ]]; then
+  QUIET=1
+  shift
+fi
+
+if (( $# == 0 )) || [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  echo "Usage: omarchy-shell [-q] <target> <method> [args...]"
+  echo "(MattBar Shell shim — see SHELL.md)"
+  exit 0
+fi
+
+target=$1
+method=$2
+shift 2 || true
+
+if [[ $target == "shell" && ( $method == "summon" || $method == "toggle" ) ]] && (( $# == 1 )); then
+  set -- "$1" "{}"
+fi
+
+if ! command -v mattbarctl >/dev/null 2>&1; then
+  (( QUIET )) && exit 0
+  echo "omarchy-shell: mattbarctl not found (is mattbar installed?)" >&2
+  exit 1
+fi
+
+out=$(mattbarctl "$target" "$method" "$@" 2>/dev/null)
+status=$?
+
+if (( !QUIET )) && [[ -n $out ]]; then
+  echo "$out"
+fi
+(( QUIET )) && exit 0
+exit $status

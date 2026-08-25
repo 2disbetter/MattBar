@@ -3,11 +3,14 @@
 #include "config.hpp"
 #include "modules.hpp"
 #include "notify.hpp"
+#include "qs_plugins.hpp"
+#include "shell.hpp"
 
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -20,7 +23,9 @@ std::string ctl_socket_path() {
     return std::string(rt && *rt ? rt : "/tmp") + "/mattbar.sock";
 }
 
+// ---------------------------------------------------------------------------
 // Server
+// ---------------------------------------------------------------------------
 void CtlServer::init(Bar& bar) {
     bar_  = &bar;
     path_ = ctl_socket_path();
@@ -30,7 +35,11 @@ void CtlServer::init(Bar& bar) {
     sockaddr_un a{};
     a.sun_family = AF_UNIX;
     strncpy(a.sun_path, path_.c_str(), sizeof(a.sun_path) - 1);
-    // Only reclaim path if stale.
+    // Only reclaim the socket path if it is STALE. Unconditionally
+    // unlinking stole the path from a LIVE instance — the exact
+    // situation of a manual debug run (./mattbar) alongside the enabled
+    // systemd unit — leaving the service copy silently uncontactable.
+    // A live owner answers a connect; a stale path refuses it.
     int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (probe >= 0) {
         if (connect(probe, (sockaddr*)&a, sizeof a) == 0) {
@@ -49,10 +58,11 @@ void CtlServer::init(Bar& bar) {
         }
         close(probe);
     }
-    unlink(path_.c_str()); // stale socket from previous run
+    unlink(path_.c_str()); // stale socket from a previous run
     if (bind(listen_fd_, (sockaddr*)&a, sizeof a) < 0 ||
         listen(listen_fd_, 4) < 0) {
-        // Unwritable runtime dir: bar works without socket.
+        // An unwritable runtime dir: the bar works fine without the
+        // socket, so just say so once and move on.
         fprintf(stderr, "mattbar: ctl socket unavailable at %s\n",
                 path_.c_str());
         close(listen_fd_);
@@ -60,20 +70,29 @@ void CtlServer::init(Bar& bar) {
         return;
     }
     bar.add_fd(listen_fd_, [this](uint32_t) {
-        // Requests are tiny/local; one read/write per connection.
+        // Requests are tiny and local; one read/one write per connection
+        // keeps this a leaf in the event loop, never a stall.
         int c = accept4(listen_fd_, nullptr, nullptr,
                         SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (c < 0) return;
-        char    buf[512];
-        ssize_t n = -1;
-        for (int spin = 0; spin < 200; ++spin) { // ~20ms budget
-            n = read(c, buf, sizeof buf - 1);
-            if (n >= 0 || errno != EAGAIN) break;
+        // Image-selector rows travel as base64 on this socket; 4k was
+        // not enough for a theme's wallpaper set.
+        char        buf[8192];
+        std::string req;
+        for (int spin = 0; spin < 400; ++spin) { // ~40ms budget
+            ssize_t n = read(c, buf, sizeof buf);
+            if (n > 0) {
+                req.append(buf, n);
+                if (req.find('\n') != std::string::npos ||
+                    req.size() > 1024 * 1024)
+                    break;
+                continue;
+            }
+            if (n == 0 || (n < 0 && errno != EAGAIN)) break;
             usleep(100);
         }
-        if (n > 0) {
-            buf[n] = 0;
-            std::string reply = handle(trimline(buf));
+        if (!req.empty()) {
+            std::string reply = handle(trimline(req.c_str()));
             reply += "\n";
             (void)!write(c, reply.c_str(), reply.size());
         }
@@ -97,8 +116,24 @@ static std::string trimline(const char* s) {
 std::string CtlServer::handle(const std::string& line) {
     std::istringstream ss(line);
     std::string        cmd, arg;
-    ss >> cmd >> arg;
+    ss >> cmd;
+    std::string rest;
+    std::getline(ss, rest);
+    // trim leading space on rest; arg is the first token of rest for
+    // the original one-argument commands.
+    while (!rest.empty() && rest[0] == ' ') rest.erase(rest.begin());
+    {
+        std::istringstream a(rest);
+        a >> arg;
+    }
     auto* nd = notify_daemon();
+    if (auto* sh = mattbar_shell()) {
+        if (cmd == "shell" || cmd == "lock" || cmd == "osd" || cmd == "media" ||
+            cmd == "idle" || cmd == "nightlight" || cmd == "background" ||
+            cmd == "notifications" || cmd == "image-selector" ||
+            cmd.rfind("omarchy.", 0) == 0)
+            return sh->handle(cmd, rest);
+    }
 
     if (cmd == "dnd") {
         if (!nd) return "error: no notification daemon";
@@ -107,7 +142,7 @@ std::string CtlServer::handle(const std::string& line) {
         else if (arg == "off" && cur) nd->toggle_dnd();
         else if (arg == "toggle" || arg.empty()) nd->toggle_dnd();
         else if (arg != "status") return "usage: dnd [on|off|toggle|status]";
-        bar_->request_draw(); // bell slash tracks this immediately
+        bar_->request_draw(); // the bell's slash tracks this immediately
         return nd->dnd() ? "dnd on" : "dnd off";
     }
     if (cmd == "dismiss") { if (nd) nd->dismiss_last(); return "ok"; }
@@ -142,7 +177,8 @@ std::string CtlServer::handle(const std::string& line) {
         return bar_->pinned() ? "pinned" : "unpinned";
     }
     if (cmd == "reveal") {
-        // Show every bar; collapse after normal hide delay if no pointer.
+        // Show every bar; without a pointer inside they collapse again
+        // after the normal hide delay, exactly like a hover would.
         bar_->ctl_reveal();
         return "revealed";
     }
@@ -159,16 +195,45 @@ std::string CtlServer::handle(const std::string& line) {
         }
         std::string act = power_ctl_active();
         if (!act.empty()) out += " profile=" + act;
+        out += qs_plugins_running() ? " sidecar=up" : " sidecar=down";
         return out;
+    }
+    if (cmd == "plugins") {
+        if (arg == "stop" || arg == "off" || arg == "kill") {
+            qs_plugins_shutdown();
+            return "plugins stopped";
+        }
+        if (arg == "status" || arg.empty())
+            return qs_plugins_running() ? "sidecar up" : "sidecar down";
+        return "usage: plugins [status|stop]";
+    }
+    if (cmd == "agents") {
+        if (arg == "pick") {
+            spawn_detached("omarchy-agent --pick");
+            return "ok";
+        }
+        if (arg == "toggle" || arg == "click" || arg.empty()) {
+            agents_hotkey();
+            if (bar_) bar_->request_draw();
+            return "ok";
+        }
+        return "usage: agents [toggle|pick]";
     }
     if (cmd == "help" || cmd.empty())
         return "commands: dnd [on|off|toggle|status], dismiss, dismiss-all,\n"
                "invoke, restore, profile [name], pin [on|off|toggle|status],\n"
-               "reveal, hide, status";
+               "reveal, hide, status, plugins [status|stop],\n"
+               "agents [toggle|pick],\n"
+               "shell ping|toggle|summon|hide <id> [payload],\n"
+               "notifications dismissOne|dismissAll|invokeLast|toggleDnd,\n"
+               "osd show <json>, media playPause|next|previous,\n"
+               "nightlight toggle|enable|disable|status|refresh";
     return "error: unknown command '" + cmd + "' (try help)";
 }
 
+// ---------------------------------------------------------------------------
 // Client
+// ---------------------------------------------------------------------------
 int ctl_client(int argc, char** argv) {
     std::string line;
     for (int i = 0; i < argc; ++i) {
@@ -197,4 +262,42 @@ int ctl_client(int argc, char** argv) {
     close(fd);
     fputs(reply.c_str(), stdout);
     return reply.rfind("error", 0) == 0 ? 1 : 0;
+}
+
+int omarchy_shell_client(int argc, char** argv) {
+    int i = 0;
+    if (i < argc && argv[i] && std::string(argv[i]) == "-q") ++i;
+    if (i >= argc) return ctl_client(0, nullptr);
+    std::vector<char*> toks;
+    for (; i < argc; ++i) toks.push_back(argv[i]);
+    // `omarchy-shell shell toggle omarchy.menu` with no payload: add {}
+    if (toks.size() == 3 && std::string(toks[0]) == "shell" &&
+        (std::string(toks[1]) == "toggle" || std::string(toks[1]) == "summon")) {
+        static char empty[] = "{}";
+        toks.push_back(empty);
+    }
+    return ctl_client((int)toks.size(), toks.data());
+}
+
+int omarchy_menu_client(int argc, char** argv) {
+    std::string verb = "toggle";
+    std::string route = "root";
+    if (argc >= 1 && argv[0] && *argv[0]) verb = argv[0];
+    if (argc >= 2 && argv[1] && *argv[1]) route = argv[1];
+    if (verb == "close" || verb == "hide") {
+        char t[] = "shell", m[] = "hide", id[] = "omarchy.menu";
+        char* a[] = {t, m, id};
+        return ctl_client(3, a);
+    }
+    std::string payload = std::string("{\"menu\":\"") + route + "\"}";
+    char t[] = "shell", m[] = "toggle", id[] = "omarchy.menu";
+    std::vector<char> p(payload.begin(), payload.end());
+    p.push_back(0);
+    if (verb == "summon") {
+        char sm[] = "summon";
+        char* a[] = {t, sm, id, p.data()};
+        return ctl_client(4, a);
+    }
+    char* a[] = {t, m, id, p.data()};
+    return ctl_client(4, a);
 }

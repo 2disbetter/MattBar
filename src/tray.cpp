@@ -1,4 +1,19 @@
 // Expandable system tray (StatusNotifierItem / KDE spec) via sd-bus.
+//
+// MattBar tries to own org.kde.StatusNotifierWatcher itself; if another
+// watcher already runs (e.g. a second bar), it registers as a host with it
+// instead. Icons come from IconName (theme PNG lookup, including the
+// item's IconThemePath for apps like Dropbox/Spotify/Steam that ship
+// icons outside /usr/share/icons) or IconPixmap (ARGB32 network byte
+// order -> premultiplied cairo).
+//
+// Right-click renders the item's com.canonical.dbusmenu menu in an
+// xdg_popup parented to the bar's layer surface. Submenus navigate in
+// place with a "< Back" row. Falls back to the SNI ContextMenu method for
+// items that expose no menu. Left-click on ItemIsMenu / Dropbox-style
+// appindicators opens that same menu (Activate is a no-op on Wayland).
+//
+// Omarchy-style behavior: collapsed by default, a chevron toggles the icons.
 
 #include "modules.hpp"
 #include "bar.hpp"
@@ -15,6 +30,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +56,11 @@ struct TrayItem {
     std::string path;     // object path
     std::string iface;    // whichever SNI interface answered
     std::string menu;     // dbusmenu object path ("" if none)
+    std::string id;       // StatusNotifierItem.Id
+    std::string title;    // StatusNotifierItem.Title
+    std::string icon_name;
+    std::string theme_path; // StatusNotifierItem.IconThemePath
+    bool only_menu = false; // ItemIsMenu, or appindicator with no Activate UI
     cairo_surface_t* icon = nullptr;
     long icon_ms = 0;     // last icon load (throttles NewIcon storms)
     // Bus-side filtered subscriptions, scoped to THIS item's name only.
@@ -53,14 +74,17 @@ static long now_ms() {
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-// --------------------------------------------------------------------------- dbusmenu layout parsing -----------------...
+// ---------------------------------------------------------------------------
+// dbusmenu layout parsing
+// ---------------------------------------------------------------------------
 struct MenuNode {
     int32_t id = 0;
     std::string label;
     bool separator = false;
     bool enabled   = true;
     bool visible   = true;
-    // dbusmenu toggle rendering: 0 none, 1 checkmark, 2 radio; state -1 unknown/indeterminate, 0 off, 1 on
+    // dbusmenu toggle rendering: 0 none, 1 checkmark, 2 radio;
+    // state -1 unknown/indeterminate, 0 off, 1 on
     int  toggle_type  = 0;
     int  toggle_state = -1;
     // per-item icon: theme name and/or raw PNG bytes ("icon-data")
@@ -167,7 +191,9 @@ int parse_menu_node(sd_bus_message* m, MenuNode& out) {
     return 1;
 }
 
-// --------------------------------------------------------------------------- Tray module -----------------------------...
+// ---------------------------------------------------------------------------
+// Tray module
+// ---------------------------------------------------------------------------
 class TrayModule : public Module {
 public:
     ~TrayModule() override {
@@ -208,7 +234,9 @@ public:
 
     bool setup_bus() {
         if (sd_bus_open_user(&bus_) < 0) { bus_ = nullptr; return false; }
-        // Cap EVERY synchronous call (icon/menu property gets, GetLayout, host registration) at 500 ms.
+        // Cap EVERY synchronous call (icon/menu property gets, GetLayout,
+        // host registration) at 500 ms. The sd-bus default is 25 s, which
+        // let one hung or mutually-waiting peer freeze the entire bar.
         sd_bus_set_method_call_timeout(bus_, 500 * 1000ULL);
 
         // Try to be THE watcher.
@@ -228,7 +256,8 @@ public:
             sd_bus_emit_signal(bus_, WATCHER_PATH, WATCHER_IFACE,
                                "StatusNotifierHostRegistered", "");
         } else {
-            // External watcher: announce ourselves, pull existing items, and follow its (un)register signals.
+            // External watcher: announce ourselves, pull existing items,
+            // and follow its (un)register signals.
             sd_bus_call_method(bus_, WATCHER_NAME, WATCHER_PATH, WATCHER_IFACE,
                                "RegisterStatusNotifierHost", nullptr, nullptr,
                                "s", host_name_.c_str());
@@ -251,7 +280,13 @@ public:
                                 on_ext_unregistered, this);
         }
 
-        // NOTE: deliberately NO broad matches here.
+        // NOTE: deliberately NO broad matches here. A global
+        // NameOwnerChanged subscription receives a broadcast for EVERY
+        // connection appearing or vanishing on the bus — one chatty or
+        // reconnect-looping client elsewhere in the session translated to
+        // thousands of wakeups/second in this process. Item-scoped matches
+        // are installed per tracked item instead (see watch_item), so the
+        // bus daemon filters everything else before it reaches us.
 
         bus_fd_ = sd_bus_get_fd(bus_);
         bus_epoll_events_ = EPOLLIN;
@@ -274,11 +309,28 @@ public:
             uint64_t n;
             while (read(collapse_fd_, &n, sizeof n) > 0) {}
             if (expanded_) {
+                // on_hover re-arms on pointer *motion*, but a pointer
+                // parked motionless over the icons generates no events —
+                // don't collapse under it, check again in one period.
+                if (pointer_on_tray()) { arm_collapse(true); return; }
                 expanded_ = false;
+                armed_ms_ = -1;
                 bar_->request_draw();
             }
         }, "tray-collapse");
         if (expanded_) arm_collapse(true);
+    }
+
+    // Is the pointer currently resting anywhere on this module's slot?
+    // (Used by the collapse timer; hovers only fire on motion.)
+    bool pointer_on_tray() const {
+        BarSurface* bs = bar_->current();
+        if (!bs || !bs->ptr_inside) return false;
+        double x = bs->slot_along(const_cast<TrayModule*>(this));
+        if (x < 0) return false;  // pointer is on a bar without the tray
+        double along = bar_->pointer_along();
+        return along >= x && along < x + const_cast<TrayModule*>(this)
+                                            ->width(nullptr);
     }
 
     // (Re)start or cancel the auto-collapse countdown.
@@ -288,20 +340,55 @@ public:
         if (arm && cfg.tray_collapse_ms > 0) {
             ts.it_value.tv_sec  = cfg.tray_collapse_ms / 1000;
             ts.it_value.tv_nsec = (cfg.tray_collapse_ms % 1000) * 1000000L;
+            armed_ms_ = cfg.tray_collapse_ms;
+        } else {
+            armed_ms_ = arm ? 0 : -1;  // 0: expanded with "off"; -1: idle
         }
         timerfd_settime(collapse_fd_, 0, &ts, nullptr);
+    }
+
+    // Live re-arm: if the user changes the timeout in settings (or the
+    // conf file) while the tray is open, restart the countdown with the
+    // new duration instead of letting the old deadline fire — otherwise
+    // the stepper appears to do nothing until the next expand.
+    void tick() override {
+        if (expanded_ && armed_ms_ >= 0 &&
+            armed_ms_ != cfg.tray_collapse_ms)
+            arm_collapse(true);
     }
 
     // ---- rendering -------------------------------------------------------
     double width(cairo_t*) override {
         double w = GEAR_W + CHEV_W;
-        if (expanded_ && !items_.empty())
-            w += items_.size() * (TRAY_ICON_SIZE + TRAY_ICON_GAP);
+        if (expanded_) {
+            int n = 0;
+            for (auto& it : items_)
+                if (!item_hidden(it)) ++n;
+            if (n) w += n * (TRAY_ICON_SIZE + TRAY_ICON_GAP);
+        }
         return w;
     }
 
     void draw(cairo_t* cr, double a, double t) override {
         const bool vert = cfg_vertical();
+        if (expanded_) {
+            // On a crowded bar the grown right group can overrun the
+            // center modules, and modules composite OVER whatever was
+            // drawn before them — buried text would bleed through around
+            // the icons. Replace (not composite: OPERATOR_SOURCE) the
+            // pixels under the tray's whole extent with the bar
+            // background, so the text is erased rather than dimmed and a
+            // translucent bar keeps exactly its configured translucency.
+            cairo_save(cr);
+            cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+            cairo_set_source_rgba(cr, cfg.c_bg.r, cfg.c_bg.g, cfg.c_bg.b,
+                                  cfg.c_bg.a);
+            double w = width(cr);
+            if (vert) cairo_rectangle(cr, 0, a, t, w);
+            else      cairo_rectangle(cr, a, 0, w, t);
+            cairo_fill(cr);
+            cairo_restore(cr);
+        }
         // center of the gear along/across
         double gx = vert ? t / 2.0 : a + GEAR_W / 2.0 - 1;
         double gy = vert ? a + GEAR_W / 2.0 - 1 : t / 2.0;
@@ -350,6 +437,7 @@ public:
         if (!expanded_) return;
         double along = a + GEAR_W + CHEV_W + TRAY_ICON_GAP;
         for (auto& it : items_) {
+            if (item_hidden(it)) continue;
             double ix = vert ? (t - TRAY_ICON_SIZE) / 2.0 : along;
             double iy = vert ? along : (t - TRAY_ICON_SIZE) / 2.0;
             if (it.icon) {
@@ -390,7 +478,8 @@ public:
         if (idx < 0) return false;
         auto& it = items_[idx];
 
-        if (button == BTN_RIGHT) {
+        if (button == BTN_RIGHT ||
+            (button == BTN_LEFT && it.only_menu && !it.menu.empty())) {
             if (!it.menu.empty() && bar_->wm_base()) {
                 open_menu(it);
                 return false;
@@ -417,7 +506,8 @@ public:
     }
 
     bool enabled() const override { return cfg.show_tray; }
-    // One tray, on the primary bar: a second SNI host on another monitor would register for the same items and fight the fi...
+    // One tray, on the primary bar: a second SNI host on another monitor
+    // would register for the same items and fight the first.
     bool primary_only() const override { return true; }
 
     bool on_scroll(double relx, int dir) override {
@@ -437,11 +527,39 @@ private:
     static constexpr double ROW_H = 28, PAD_X = 14, MARGIN = 6;
     static constexpr double MENU_MIN_W = 140, MENU_MAX_W = 420;
 
+    static bool item_named(const TrayItem& it, const char* needle) {
+        auto has = [needle](const std::string& s) {
+            if (s.empty() || !needle || !*needle) return false;
+            std::string a = s, b = needle;
+            for (char& c : a) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            for (char& c : b) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            return a.find(b) != std::string::npos;
+        };
+        return has(it.id) || has(it.title) || has(it.icon_name);
+    }
+
+    // Omarchy hides the Dropbox SNI item when the dedicated dropbox
+    // widget is on the bar (left/center/right). Keep that: two copies
+    // of the same status, and the native icon is the worse of them.
+    // If the widget lives only in More (or is disabled), show the SNI.
+    bool item_hidden(const TrayItem& it) const {
+        if (!cfg.show_dropbox) return false;
+        int z = cfg.layout_zone_of("dropbox");
+        if (z < 0 || z > 2) return false;
+        return item_named(it, "dropbox");
+    }
+
     int item_at(double relx) const {
         double off = relx - GEAR_W - CHEV_W - TRAY_ICON_GAP;
         if (off < 0) return -1;
         int idx = static_cast<int>(off / (TRAY_ICON_SIZE + TRAY_ICON_GAP));
-        return idx < static_cast<int>(items_.size()) ? idx : -1;
+        int vis = 0;
+        for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
+            if (item_hidden(items_[i])) continue;
+            if (vis == idx) return i;
+            ++vis;
+        }
+        return -1;
     }
 
     void process() {
@@ -471,7 +589,10 @@ private:
         msgs_count_ += msgs;
         if (tally) dump_health();
 
-        // Watchdog: wakeups that consume nothing mean our poll interest is wrong for sd-bus's current state, or the connection is sick.
+        // Watchdog: wakeups that consume nothing mean our poll interest is
+        // wrong for sd-bus's current state, or the connection is sick.
+        // Either way, spinning forever is never acceptable: log the raw fd
+        // state and reset the connection.
         if (progress == 0 && msgs == 0) {
             if (++barren_wakes_ > 2000) {
                 char c;
@@ -491,7 +612,10 @@ private:
             barren_wakes_ = 0;
         }
 
-        // sd-bus contract: poll with exactly the events IT wants right now (POLLIN and/or POLLOUT), and drive it again at its timeout.
+        // sd-bus contract: poll with exactly the events IT wants right now
+        // (POLLIN and/or POLLOUT), and drive it again at its timeout. A
+        // hardcoded EPOLLIN violates this and can spin when sd-bus's state
+        // machine doesn't currently want to read.
         int ev = sd_bus_get_events(bus_);
         uint32_t e = 0;
         if (ev > 0) {
@@ -544,7 +668,9 @@ private:
             fprintf(stderr, "mattbar: dbus messages over %.1fs:%s\n", secs,
                     line.c_str());
         }
-        // Storm with (almost) no real messages: capture the raw bytes stuck on the socket — the D-Bus wire header identifies th...
+        // Storm with (almost) no real messages: capture the raw bytes stuck
+        // on the socket — the D-Bus wire header identifies the message —
+        // then reset the connection rather than keep spinning.
         if (cb_count_ > 5000 && msgs_count_ < 10) {
             uint8_t raw[64];
             ssize_t rn = recv(bus_fd_, raw, sizeof raw,
@@ -583,7 +709,9 @@ private:
         timerfd_settime(reconnect_fd_, 0, &ts, nullptr);
     }
 
-    // The bus died. A closed fd is PERMANENTLY readable: if it stays in epoll the main loop spins on it at thousands of wak...
+    // The bus died. A closed fd is PERMANENTLY readable: if it stays in
+    // epoll the main loop spins on it at thousands of wakeups per second
+    // (observed as constant ~2% CPU). Tear everything down instead.
     void bus_fail(const char* why) {
         fprintf(stderr,
                 "mattbar: D-Bus connection lost (%s); tray disabled, "
@@ -608,7 +736,9 @@ private:
         schedule_reconnect();
     }
 
-    // ---- item bookkeeping ------------------------------------------------ spec is either "/obj/path" (service = sender),...
+    // ---- item bookkeeping ------------------------------------------------
+    // spec is either "/obj/path" (service = sender), ":1.42/obj/path",
+    // "busname" (path defaults to /StatusNotifierItem)
     bool add_item_from_spec(const std::string& spec, const std::string& sender) {
         std::string svc, path;
         if (!spec.empty() && spec[0] == '/') {
@@ -625,9 +755,15 @@ private:
         for (auto& it : items_)
             if (it.service == svc && it.path == path)
                 return false; // already known: NOT a new registration
-        TrayItem item{svc, path, ITEM_IFACES[0], "", nullptr};
-        load_icon(item);
+        TrayItem item;
+        item.service = svc;
+        item.path    = path;
+        item.iface   = ITEM_IFACES[0];
         fetch_menu_path(item);
+        load_icon(item);
+        if (item.menu.empty()) fetch_menu_path(item);
+        if (!item.only_menu && !item.menu.empty() && item_named(item, "dropbox"))
+            item.only_menu = true;
         watch_item(item);
         items_.push_back(item);
         bar_->request_draw();
@@ -690,6 +826,13 @@ private:
         }
     }
 
+    static void take_string(char* s, std::string& out) {
+        if (s) {
+            out = s;
+            free(s);
+        }
+    }
+
     // ---- icons -----------------------------------------------------------
     void load_icon(TrayItem& item) {
         if (item.icon) { cairo_surface_destroy(item.icon); item.icon = nullptr; }
@@ -699,7 +842,33 @@ private:
                                            item.path.c_str(), iface,
                                            "IconName", nullptr, &name) >= 0) {
                 item.iface = iface;
-                if (name && *name) item.icon = icon_from_theme(name);
+                if (name && *name) item.icon_name = name;
+                char* tp = nullptr;
+                if (sd_bus_get_property_string(bus_, item.service.c_str(),
+                                               item.path.c_str(), iface,
+                                               "IconThemePath", nullptr,
+                                               &tp) >= 0)
+                    take_string(tp, item.theme_path);
+                char* id = nullptr;
+                if (sd_bus_get_property_string(bus_, item.service.c_str(),
+                                               item.path.c_str(), iface, "Id",
+                                               nullptr, &id) >= 0)
+                    take_string(id, item.id);
+                char* title = nullptr;
+                if (sd_bus_get_property_string(bus_, item.service.c_str(),
+                                               item.path.c_str(), iface,
+                                               "Title", nullptr, &title) >= 0)
+                    take_string(title, item.title);
+                int is_menu = 0;
+                if (sd_bus_get_property_trivial(
+                        bus_, item.service.c_str(), item.path.c_str(), iface,
+                        "ItemIsMenu", nullptr, 'b', &is_menu) >= 0)
+                    item.only_menu = is_menu != 0;
+                else if (!item.menu.empty() && item_named(item, "dropbox"))
+                    item.only_menu = true;
+                if (name && *name)
+                    item.icon =
+                        icon_from_theme(item.icon_name, item.theme_path);
                 free(name);
                 if (item.icon) return;
                 if (load_pixmap(item, iface)) return;
@@ -760,6 +929,11 @@ private:
     }
 
     // SVG rendering via librsvg, loaded with dlopen ON FIRST SVG ONLY.
+    // Linking librsvg costs 1-3 MB of resident glib/gobject setup at every
+    // startup whether or not an SVG ever appears; dlopen defers that to
+    // the moment an SVG icon is actually encountered, and a system without
+    // librsvg behaves exactly as a build without it used to (PNG lookup +
+    // placeholder). No build-time dependency remains at all.
     struct Rsvg {
         // minimal local declarations: the three symbols we call
         struct Rect { double x, y, width, height; };
@@ -769,7 +943,8 @@ private:
         bool ok = false;
         Rsvg() {
             void* h = dlopen("librsvg-2.so.2", RTLD_NOW | RTLD_LOCAL);
-            // g_object_unref lives in gobject, a hard dependency of librsvg, so it is guaranteed present when librsvg is.
+            // g_object_unref lives in gobject, a hard dependency of
+            // librsvg, so it is guaranteed present when librsvg is.
             void* g = dlopen("libgobject-2.0.so.0", RTLD_NOW | RTLD_LOCAL);
             if (!h || !g) {
                 fprintf(stderr,
@@ -807,67 +982,87 @@ private:
         return nullptr;
     }
 
-    static cairo_surface_t* icon_from_theme(const std::string& name) {
-        if (!name.empty() && name[0] == '/') { // absolute path
-            if (name.size() > 4 &&
-                name.compare(name.size() - 4, 4, ".svg") == 0)
-                if (cairo_surface_t* s = icon_from_svg(name)) return s;
-            cairo_surface_t* s = cairo_image_surface_create_from_png(
-                name.c_str());
-            if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS) return s;
-            cairo_surface_destroy(s);
+    static cairo_surface_t* icon_from_file(const std::string& path) {
+        if (path.empty() || access(path.c_str(), R_OK) != 0) return nullptr;
+        auto ends = [&](const char* ext) {
+            size_t n = strlen(ext);
+            return path.size() >= n &&
+                   path.compare(path.size() - n, n, ext) == 0;
+        };
+        if (ends(".svg") || ends(".SVG")) return icon_from_svg(path);
+        cairo_surface_t* s = cairo_image_surface_create_from_png(path.c_str());
+        if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS) return s;
+        cairo_surface_destroy(s);
+        if (!ends(".png") && !ends(".PNG"))
+            if (cairo_surface_t* svg = icon_from_svg(path)) return svg;
+        return nullptr;
+    }
+
+    static cairo_surface_t* icon_from_theme(const std::string& name,
+                                            const std::string& extra_path = {}) {
+        if (name.empty()) return nullptr;
+        if (name[0] == '/') { // absolute path
+            if (cairo_surface_t* s = icon_from_file(name)) return s;
             return nullptr;
         }
+        // IconThemePath: apps (Dropbox, Spotify, Steam) ship a private
+        // icon dir. It may be a freedesktop theme tree (hicolor/16x16/…)
+        // or a flat folder of name.png files.
+        if (!extra_path.empty()) {
+            if (cairo_surface_t* s =
+                    icon_from_file(extra_path + "/" + name + ".png"))
+                return s;
+            if (cairo_surface_t* s =
+                    icon_from_file(extra_path + "/" + name + ".svg"))
+                return s;
+            if (cairo_surface_t* s = icon_from_file(extra_path + "/" + name))
+                return s;
+        }
         const char* home = getenv("HOME");
-        std::vector<std::string> roots = {"/usr/share/icons/hicolor",
-                                          "/usr/local/share/icons/hicolor"};
+        std::vector<std::string> roots;
+        if (!extra_path.empty()) {
+            roots.push_back(extra_path + "/hicolor");
+            roots.push_back(extra_path);
+        }
         if (home)
-            roots.insert(roots.begin(),
-                         std::string(home) + "/.local/share/icons/hicolor");
-        const char* sizes[] = {"22x22", "24x24", "32x32", "48x48", "64x64",
-                               "128x128"};
+            roots.push_back(std::string(home) + "/.local/share/icons/hicolor");
+        roots.push_back("/usr/share/icons/hicolor");
+        roots.push_back("/usr/local/share/icons/hicolor");
+        const char* sizes[] = {"16x16", "22x22", "24x24", "32x32", "48x48",
+                               "64x64", "128x128"};
         const char* ctxs[]  = {"apps", "status", "devices", "panel"};
         for (auto& root : roots)
             for (const char* sz : sizes)
                 for (const char* ctx : ctxs) {
                     std::string p =
                         root + "/" + sz + "/" + ctx + "/" + name + ".png";
-                    if (access(p.c_str(), R_OK) != 0) continue;
-                    cairo_surface_t* s =
-                        cairo_image_surface_create_from_png(p.c_str());
-                    if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS)
-                        return s;
-                    cairo_surface_destroy(s);
+                    if (cairo_surface_t* s = icon_from_file(p)) return s;
                 }
-        // No PNG anywhere: SVG-only themes/apps (scalable dir, then the same size dirs, where some themes ship .svg despite the...
+        // No PNG anywhere: SVG-only themes/apps (scalable dir, then the
+        // same size dirs, where some themes ship .svg despite the name)
         for (auto& root : roots)
             for (const char* ctx : ctxs) {
                 std::string p =
                     root + "/scalable/" + ctx + "/" + name + ".svg";
-                if (access(p.c_str(), R_OK) == 0)
-                    if (cairo_surface_t* s = icon_from_svg(p)) return s;
+                if (cairo_surface_t* s = icon_from_file(p)) return s;
             }
         for (auto& root : roots)
             for (const char* sz : sizes)
                 for (const char* ctx : ctxs) {
                     std::string p = root + "/" + std::string(sz) + "/" + ctx +
                                     "/" + name + ".svg";
-                    if (access(p.c_str(), R_OK) == 0)
-                        if (cairo_surface_t* s = icon_from_svg(p)) return s;
+                    if (cairo_surface_t* s = icon_from_file(p)) return s;
                 }
         std::string p = "/usr/share/pixmaps/" + name + ".png";
-        if (access(p.c_str(), R_OK) == 0) {
-            cairo_surface_t* s = cairo_image_surface_create_from_png(p.c_str());
-            if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS) return s;
-            cairo_surface_destroy(s);
-        }
+        if (cairo_surface_t* s = icon_from_file(p)) return s;
         p = "/usr/share/pixmaps/" + name + ".svg";
-        if (access(p.c_str(), R_OK) == 0)
-            if (cairo_surface_t* s = icon_from_svg(p)) return s;
+        if (cairo_surface_t* s = icon_from_file(p)) return s;
         return nullptr;
     }
 
-    // ======================================================================= dbusmenu popup ==============================...
+    // =======================================================================
+    // dbusmenu popup
+    // =======================================================================
     struct Row {
         const MenuNode* node = nullptr; // null => "back" row
         bool separator = false;
@@ -962,7 +1157,9 @@ private:
         m.h = static_cast<int>(m.rows.size() * ROW_H + 2 * MARGIN);
     }
 
-    // Decode a menu item's icon once and cache it on the node (icon-data PNG bytes first, then a theme lookup by name, reusing the tray's own theme walker).
+    // Decode a menu item's icon once and cache it on the node (icon-data
+    // PNG bytes first, then a theme lookup by name, reusing the tray's own
+    // theme walker). shared_ptr so submenu navigation copies are free.
     cairo_surface_t* menu_icon(MenuNode& n) {
         if (n.icon) return n.icon.get();
         if (n.icon_name.empty() && n.icon_png.empty()) return nullptr;
@@ -1130,7 +1327,8 @@ private:
         if (!menu_ || !menu_->mapped) return;
         Menu& m = *menu_;
         void* data = nullptr;
-        // HiDPI: the tray lives on the primary bar, so its menu renders at the primary output's scale.
+        // HiDPI: the tray lives on the primary bar, so its menu renders at
+        // the primary output's scale. Layout/hit math stays logical.
         const int sc = wl_surface_get_version(m.surf) >= 3
                            ? bar_->scale_of(bar_->primary_output())
                            : 1;
@@ -1257,7 +1455,10 @@ private:
         const char* spec = nullptr;
         sd_bus_message_read(m, "s", &spec);
         const char* sender = sd_bus_message_get_sender(m);
-        // Reply FIRST: the registering app blocks on this reply, and add_item_from_spec makes synchronous property calls back to that same app.
+        // Reply FIRST: the registering app blocks on this reply, and
+        // add_item_from_spec makes synchronous property calls back to that
+        // same app. Replying afterwards deadlocked both sides until the
+        // 25 s timeout.
         int r = sd_bus_reply_method_return(m, "");
         bool added =
             self->add_item_from_spec(spec ? spec : "", sender ? sender : "");
@@ -1349,7 +1550,9 @@ private:
         if (!sender) return 0;
         for (auto& it : self->items_)
             if (it.service == sender) {
-                // Some apps emit NewIcon in bursts or animate their icon; a full reload (D-Bus + theme search) once per second is plent...
+                // Some apps emit NewIcon in bursts or animate their icon;
+                // a full reload (D-Bus + theme search) once per second is
+                // plenty for a 20 px tray icon.
                 long now = now_ms();
                 if (now - it.icon_ms < 1000) continue;
                 it.icon_ms = now;
@@ -1369,6 +1572,7 @@ private:
     std::string host_name_;
     std::vector<TrayItem> items_;
     int collapse_fd_ = -1;
+    int armed_ms_    = -1;  // duration of the running countdown; -1 = none
     int bus_fd_ = -1;
     int bus_timer_fd_ = -1;
     int reconnect_fd_ = -1;

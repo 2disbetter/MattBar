@@ -14,7 +14,8 @@ inline std::string slurp(const std::string& path) {
     return ss.str();
 }
 
-// Capture stdout of a shell command; optionally its exit status (-1 if it did not terminate normally).
+// Capture stdout of a shell command; optionally its exit status
+// (-1 if it did not terminate normally). Empty string on failure.
 inline std::string cmd_output(const std::string& cmd, int* status = nullptr) {
     if (status) *status = -1;
     FILE* p = popen(cmd.c_str(), "r");

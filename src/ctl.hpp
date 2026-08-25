@@ -1,5 +1,23 @@
 #pragma once
-// mattbarctl: line-based control socket at $XDG_RUNTIME_DIR/mattbar.sock.
+// ---------------------------------------------------------------------------
+// mattbarctl: a line-based control socket at $XDG_RUNTIME_DIR/mattbar.sock.
+// The RTMIN+N signal surface is nearly full and signals can't carry
+// arguments or answer questions; the socket can do both:
+//
+//   mattbarctl dnd on|off|toggle|status
+//   mattbarctl dismiss | dismiss-all | invoke | restore
+//   mattbarctl profile [name]        (no name: prints active + available)
+//   mattbarctl pin on|off|toggle|status
+//   mattbarctl reveal | hide
+//   mattbarctl status                (one-line summary)
+//   mattbarctl shell ping|toggle|summon|hide <id> [payload]
+//   mattbarctl notifications dismissOne|dismissAll|invokeLast|toggleDnd
+//   mattbarctl osd show <json>
+//   mattbarctl media playPause|next|previous
+//   (omarchy-shell shim in contrib/mattbar-shell/)
+//
+// `mattbarctl` is the same binary (argv[0] symlink or `mattbar ctl ...`).
+// ---------------------------------------------------------------------------
 #include <string>
 
 class Bar;
@@ -16,7 +34,12 @@ private:
     std::string path_;
 };
 
-// Client side (main.cpp): send one command line, print reply. Returns exit code.
+// Client side (used by main.cpp): send one command line, print the reply.
+// Returns the process exit code.
 int ctl_client(int argc, char** argv);
+// argv[0] dispatch when this binary is invoked as omarchy-shell / omarchy-menu
+// (the PATH shim used only while quickshell_shutdown is on).
+int omarchy_shell_client(int argc, char** argv);
+int omarchy_menu_client(int argc, char** argv);
 
 std::string ctl_socket_path();

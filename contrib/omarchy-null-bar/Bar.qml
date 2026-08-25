@@ -1,9 +1,17 @@
 import QtQuick
 
-// Null bar: creates no window/surfaces/timers. Selecting it unloads omarchy.bar.
-// Properties mirror the real bar surface that other components read
-// (guarded by `shell.bar && ...`): barHidden, barSize, fontFamily.
-// summon/hide/isBarWidgetOpen intentionally absent (typeof-guarded no-ops).
+// A bar that isn't there. Creates no window, no surfaces, no timers —
+// selecting this as the shell's bar option unloads omarchy.bar entirely.
+//
+// The properties below mirror the parts of the real bar's surface that
+// other shell components read (guarded by `shell.bar && ...`):
+//   - notifications: `!shell.bar.barHidden ? Math.max(0, shell.bar.barSize)
+//     : defaultBarSize` — barHidden:true routes them to their default edge
+//     margin and keeps barSize from ever being read (undefined would NaN
+//     the anchor math).
+//   - notifications also read fontFamily for popup text.
+// summonBarWidget/hideBarWidget/isBarWidgetOpen are intentionally absent;
+// their call sites are typeof-guarded and no-op cleanly.
 Item {
   // set by shell.configureBar() when present; harmless to accept
   property var shell: null

@@ -2,15 +2,28 @@
 #include "bar.hpp"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/epoll.h>
+#include <sys/prctl.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
-// One `pactl subscribe` for the process.
+// ---------------------------------------------------------------------------
+// One `pactl subscribe` for the whole process. pactl talks the PulseAudio
+// client protocol, which PipeWire's pipewire-pulse serves natively, so this
+// covers both stacks with zero new library dependencies. The process sleeps
+// in its socket between events: an idle audio stack costs zero wakeups.
+//
+// Event filtering matches the OSD's hard-won rule: only "on sink #" /
+// "on source #" lines are device state changes; sink-input/source-output
+// lines are app streams starting and stopping, and reacting to those would
+// mean a query burst every time any app opens audio.
+// ---------------------------------------------------------------------------
 
 AudioEvents& audio_events() {
     static AudioEvents a;
@@ -30,16 +43,69 @@ void AudioEvents::unsubscribe(int id) {
             subs_.erase(it);
             break;
         }
-    // Stream stays up with zero subscribers: sleeping pactl is free.
+    // The stream stays up even with zero subscribers: a sleeping pactl is
+    // free, and the OSD toggling off/on shouldn't churn processes.
+}
+
+static void reap_orphan_pactl() {
+    // KillMode=process does not signal leftover children. Older mattbar
+    // runs left `pactl subscribe` in this cgroup; they only write on
+    // audio events, so SIGPIPE never arrives and they sit forever.
+    FILE* f = fopen("/proc/self/cgroup", "r");
+    if (!f) return;
+    char line[256] = {};
+    std::string cg;
+    while (fgets(line, sizeof line, f)) {
+        char* p = strchr(line, ':');
+        if (!p) continue;
+        p = strchr(p + 1, ':');
+        if (!p) continue;
+        ++p;
+        size_t n = strlen(p);
+        while (n && (p[n - 1] == '\n' || p[n - 1] == '\r')) p[--n] = 0;
+        if (n) {
+            cg = p;
+            break;
+        }
+    }
+    fclose(f);
+    if (cg.empty()) return;
+    std::string path = "/sys/fs/cgroup" + cg + "/cgroup.procs";
+    FILE* procs = fopen(path.c_str(), "r");
+    if (!procs) return;
+    pid_t me = getpid();
+    int p = 0;
+    while (fscanf(procs, "%d", &p) == 1) {
+        if (p <= 1 || p == me) continue;
+        char cmdp[64];
+        snprintf(cmdp, sizeof cmdp, "/proc/%d/cmdline", p);
+        FILE* c = fopen(cmdp, "r");
+        if (!c) continue;
+        char buf[128] = {};
+        size_t n = fread(buf, 1, sizeof buf - 1, c);
+        fclose(c);
+        if (n < 6) continue;
+        bool pactl = strncmp(buf, "pactl", 5) == 0 && buf[5] == 0;
+        bool sub   = false;
+        for (size_t i = 0; i + 1 < n; ++i)
+            if (buf[i] == 0 && strncmp(buf + i + 1, "subscribe", 9) == 0)
+                sub = true;
+        if (pactl && sub) kill(p, SIGTERM);
+    }
+    fclose(procs);
 }
 
 void AudioEvents::start(Bar& bar) {
+    reap_orphan_pactl();
     int p[2];
     if (pipe2(p, O_CLOEXEC) != 0) return;
     pid_t pid = fork();
     if (pid == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (getppid() == 1) _exit(0);
         dup2(p[1], 1);
         close(p[0]);
+        close(p[1]);
         execlp("pactl", "pactl", "subscribe", (char*)nullptr);
         _exit(127);
     }
@@ -74,14 +140,15 @@ void AudioEvents::start(Bar& bar) {
             if (strstr(buf, "on source #")) q_source_ = hit = true;
         }
         if (ev & (EPOLLHUP | EPOLLERR)) {
-            // pactl died (audio restart or missing).
+            // pactl died (audio daemon restart, or it was never there).
             stop();
             schedule_restart();
             return;
         }
         if (hit) {
-            attempts_ = 0; // working stream clears failure budget
-            // Debounce: one callback per burst (volume-key repeat / slider).
+            attempts_ = 0; // a working stream clears the failure budget
+            // Debounce: one callback per burst — a volume-key repeat or a
+            // slider drag is dozens of events and must be one query.
             itimerspec ts{};
             ts.it_value.tv_nsec = 60 * 1000000L;
             timerfd_settime(query_fd_, 0, &ts, nullptr);
@@ -95,7 +162,7 @@ void AudioEvents::stop() {
     fd_ = -1;
     if (pid_ > 0) {
         kill(pid_, SIGTERM);
-        waitpid(pid_, nullptr, WNOHANG); // reap; ECHILD fine if early
+        waitpid(pid_, nullptr, WNOHANG); // reap; ECHILD is fine if too early
         pid_ = -1;
     }
 }

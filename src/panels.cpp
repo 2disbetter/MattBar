@@ -1,4 +1,12 @@
-// --------------------------------------------------------------------------- Pop-up panels: the clock's calendar, the notification centre behind the bell, and the power-profile selector.
+// ---------------------------------------------------------------------------
+// Pop-up panels: the clock's calendar, the notification centre behind the
+// bell, and the power-profile selector.
+//
+// All three follow the same rules as the brightness slider: an overlay layer
+// surface built from PopupWin, opened on the monitor whose bar was clicked,
+// holding the bar open while it is up, and closing itself a moment after the
+// pointer leaves (or on a second click of its module).
+// ---------------------------------------------------------------------------
 #include "modules.hpp"
 #include "bar.hpp"
 #include "config.hpp"
@@ -60,7 +68,8 @@ void rrect(cairo_t* cr, double x, double y, double w, double h, double r) {
     cairo_close_path(cr);
 }
 
-// Panel background: the bar's own background, opaque enough to read text on top of whatever window it covers, with a su...
+// Panel background: the bar's own background, opaque enough to read text on
+// top of whatever window it covers, with a subtle border.
 void panel_bg(cairo_t* cr, int w, int h) {
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
@@ -74,7 +83,8 @@ void panel_bg(cairo_t* cr, int w, int h) {
     cairo_stroke(cr);
 }
 
-// Does the bar font actually map this glyph?
+// Does the bar font actually map this glyph? Same check the bluetooth and
+// brightness modules make before falling back to text.
 bool glyph_mapped(cairo_t* cr, const std::string& t) {
     cairo_scaled_font_t* sf = cairo_get_scaled_font(cr);
     cairo_glyph_t*       g  = nullptr;
@@ -101,7 +111,8 @@ std::string utf8_trunc(const std::string& s, size_t maxchars) {
     return s.substr(0, i) + "\u2026";
 }
 
-// A popup that closes itself shortly after the pointer leaves, and holds the bar open for as long as it exists.
+// A popup that closes itself shortly after the pointer leaves, and holds the
+// bar open for as long as it exists. Shared by all three panels.
 struct AutoPanel {
     PopupWin win;
     Bar*     bar      = nullptr;
@@ -110,6 +121,10 @@ struct AutoPanel {
 
     void init(Bar& b, const char* label) {
         bar      = &b;
+        win.kb_mode = 2;
+        win.pkey    = [this](const Bar::KeyEvent& e) {
+            if (e.escape()) close_now();
+        };
         close_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
         b.add_fd(close_fd, [this](uint32_t) {
             uint64_t n;
@@ -142,7 +157,9 @@ struct AutoPanel {
     }
 };
 
-// --------------------------------------------------------------------------- Calendar (left-click the clock) ---------...
+// ---------------------------------------------------------------------------
+// Calendar (left-click the clock)
+// ---------------------------------------------------------------------------
 constexpr int CAL_CELL = 30, CAL_HDR = 34, CAL_DOW = 22, CAL_PAD = 10;
 
 struct Calendar {
@@ -154,7 +171,9 @@ struct Calendar {
         return CAL_PAD * 2 + 7 * CAL_CELL + (cfg.calendar_week_numbers ? 28 : 0);
     }
     int height() const {
-        // Computed from the month itself, not from the last paint: the surface has to be sized before anything is drawn into it...
+        // Computed from the month itself, not from the last paint: the
+        // surface has to be sized before anything is drawn into it, or a
+        // 6-week month would be clipped on the frame it first appears.
         return CAL_HDR + CAL_DOW + weeks_now() * CAL_CELL + CAL_PAD;
     }
     int weeks_now() const {
@@ -271,7 +290,8 @@ struct Calendar {
     }
 
     void resize_and_draw() {
-        // The grid can be 5 or 6 rows tall; re-request the size when it changes so the panel never clips a week.
+        // The grid can be 5 or 6 rows tall; re-request the size when it
+        // changes so the panel never clips a week.
         p.win.ensure(*p.bar, last_place.anchor, last_place.mt, last_place.mr,
                      last_place.mb, last_place.ml, "mattbar-calendar", width(),
                      height(), last_out);
@@ -319,20 +339,25 @@ Calendar& calendar() {
 
 // Called by the clock module. Second click closes, as with every panel.
 void calendar_toggle(Bar& bar, Module* owner) {
+    if (calendar_is_open()) calendar_close();
+    else calendar_open(bar, owner);
+}
+void calendar_open(Bar& bar, Module* owner) {
     Calendar& c = calendar();
     if (!c.ready) {
         c.p.init(bar, "calendar-close");
         c.ready = true;
     }
-    if (c.p.open()) {
-        c.p.close_now();
-        return;
-    }
+    if (c.p.open()) return;
     c.month_off = 0;
     c.open(bar, owner);
 }
+void calendar_close() { calendar().p.close_now(); }
+bool calendar_is_open() { return calendar().p.open(); }
 
-// --------------------------------------------------------------------------- Notification centre (the bell) ----------...
+// ---------------------------------------------------------------------------
+// Notification centre (the bell)
+// ---------------------------------------------------------------------------
 namespace {
 
 constexpr int NC_W = 380, NC_HDR = 38, NC_ROW = 52, NC_FOOT = 26,
@@ -358,7 +383,12 @@ public:
 
     void draw(cairo_t* cr, double a, double t) override {
         std::string s = label();
-        // The bell's only ambient signal is a slight dimming when there is nothing to read.
+        // The bell's only ambient signal is a slight dimming when there is
+        // nothing to read. It never grows a badge unless you turn one on,
+        // and it never pulses, flashes, or changes color to demand a look.
+        // Do-not-disturb is the exception, because it is YOUR state, not
+        // the notifications': a thin slash through the bell says "silenced"
+        // at a glance. Still static, still quiet.
         auto* d   = notify_daemon();
         bool  dnd = d && d->dnd();
         const Color c = dnd ? cfg.c_dim
@@ -482,12 +512,17 @@ private:
                 cairo_rectangle(cr, 6, y + 2, NC_W - 12, NC_ROW - 4);
                 cairo_fill(cr);
             }
+            double tx = 14;
+            if (r.icon) {
+                draw_note_avatar(cr, r.icon, 10, y + (NC_ROW - 32) / 2.0, 32);
+                tx = 48;
+            }
             // app + age on the first line, summary/body on the second
             std::string app = utf8_trunc(r.app.empty() ? "unknown" : r.app, 22);
             const Color ac  = r.urgency >= 2 ? cfg.c_urgent
                               : r.active    ? cfg.c_accent
                                             : cfg.c_dim;
-            say(cr, 14, y + 15, app, ac);
+            say(cr, tx, y + 15, app, ac);
             std::string age = ago(r.age_s);
             say(cr, NC_W - 14 - tw(cr, age), y + 15, age, cfg.c_dim);
             double tagx = NC_W - 30 - tw(cr, age);
@@ -507,7 +542,7 @@ private:
             // collapse newlines: one row is one line
             for (auto& ch : line)
                 if (ch == '\n' || ch == '\r') ch = ' ';
-            say(cr, 14, y + 35, utf8_trunc(line, 46), cfg.c_fg);
+            say(cr, tx, y + 35, utf8_trunc(line, r.icon ? 40 : 46), cfg.c_fg);
         }
 
         std::string hint = recs_.size() > (size_t)shown
@@ -542,7 +577,8 @@ private:
             panel_.disarm_close();
             if (y < NC_HDR) {
                 if (btn == BTN_LEFT && x >= clear_x_) {
-                    // Clear all: drop the history AND dismiss anything still on screen, so the bell really is empty afterwards.
+                    // Clear all: drop the history AND dismiss anything still
+                    // on screen, so the bell really is empty afterwards.
                     if (auto* d = notify_daemon()) {
                         d->dismiss_all();
                         d->clear_history();
@@ -563,7 +599,8 @@ private:
                      cfg.app_muted(app) ? "muted" : "unmuted");
                 redraw();
             } else if (btn == BTN_LEFT && recs_[i].has_action) {
-                // fire the default action ("open the mail", "join the call") straight from the history panel
+                // fire the default action ("open the mail", "join the
+                // call") straight from the history panel
                 if (auto* d = notify_daemon()) d->invoke(recs_[i].id);
                 reload();
                 redraw();
@@ -587,10 +624,13 @@ private:
 
 Module* make_notifications() { return new NotificationsModule; }
 
-// --------------------------------------------------------------------------- Power profiles (power-profiles-daemon) --...
+// ---------------------------------------------------------------------------
+// Power profiles (power-profiles-daemon)
+// ---------------------------------------------------------------------------
 namespace {
 
-// PPD moved from net.hadess to org.freedesktop.UPower in 0.20; try the current name first and fall back, so both eras w...
+// PPD moved from net.hadess to org.freedesktop.UPower in 0.20; try the
+// current name first and fall back, so both eras work unchanged.
 struct PpdEndpoint {
     const char* dest;
     const char* path;
@@ -606,7 +646,9 @@ constexpr PpdEndpoint PPD[] = {
 
 constexpr int PP_W = 210, PP_ROW = 34, PP_PAD = 8, PP_SEP = 11;
 
-// The session actions, in escalating severity.
+// The session actions, in escalating severity. Suspend and hibernate are
+// recoverable and fire on one click; restart and shutdown are not, so they
+// arm on the first click and execute on the second.
 struct PowerAction {
     const char*  label;
     const char*  glyph;    // preferred rune
@@ -630,7 +672,9 @@ public:
         if (retry_fd_ >= 0) close(retry_fd_);
     }
 
-    // Without power-profiles-daemon the module either hides (actions off: nothing to show, like the battery on a desktop) o...
+    // Without power-profiles-daemon the module either hides (actions off:
+    // nothing to show, like the battery on a desktop) or stays as a plain
+    // power button whose popup has only the session actions.
     bool enabled() const override {
         return cfg.show_power &&
                (!active_.empty() || cfg.power_show_actions);
@@ -669,7 +713,8 @@ public:
     void draw(cairo_t* cr, double a, double t) override {
         if (active_.empty() && !actions_on()) return;
         std::string s = label();
-        // Performance gets the accent so a glance tells you the machine is not in its quiet mode.
+        // Performance gets the accent so a glance tells you the machine is
+        // not in its quiet mode.
         const Color c = active_ == "performance" ? cfg.c_accent : cfg.c_fg;
         if (!cfg_vertical()) {
             say(cr, a, t / 2.0, s, c);
@@ -819,6 +864,7 @@ private:
         // Optimistic update; PropertiesChanged confirms (or corrects) it.
         if (r >= 0) {
             active_ = p;
+            persist_power_profile(p);
             bar_->request_draw();
             if (panel_.open()) redraw();
         }
@@ -993,7 +1039,8 @@ private:
                 return;
             }
             if (PACTS[a].confirm && pending_ != a) {
-                // First click arms; anything else disarms. Nobody reboots off a stray click at the bottom of a popup.
+                // First click arms; anything else disarms. Nobody reboots
+                // off a stray click at the bottom of a popup.
                 pending_ = a;
                 redraw();
                 return;

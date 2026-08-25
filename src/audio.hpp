@@ -1,5 +1,11 @@
 #pragma once
-// Shared audio-change event stream.
+// ---------------------------------------------------------------------------
+// Shared audio-change event stream. One persistent `pactl subscribe`
+// process feeds every consumer (volume module, OSD); subscribers are
+// called once per debounced burst with which side changed. This is what
+// lets the volume module stop polling: it queries the mixer only when the
+// mixer actually changed.
+// ---------------------------------------------------------------------------
 #include <sys/types.h>
 
 #include <functional>
@@ -9,14 +15,15 @@ class Bar;
 
 class AudioEvents {
 public:
-    // sink = output changed, source = input (mic) changed
+    // sink = output (speakers) changed, source = input (mic) changed
     using Callback = std::function<void(bool sink, bool source)>;
 
-    // Lazily starts the event stream on first subscriber.
+    // Lazily starts the event stream on the first subscriber.
     int  subscribe(Bar& bar, Callback cb);
     void unsubscribe(int id);
 
-    // True while event stream is healthy (else fall back to polling).
+    // True while the underlying event stream is healthy. Consumers use
+    // this to decide whether to fall back to polling.
     bool available() const { return fd_ >= 0; }
 
 private:
@@ -32,7 +39,7 @@ private:
     Bar*  bar_       = nullptr;
     int   next_id_   = 1;
     pid_t pid_       = -1;
-    int   fd_        = -1;   // pactl stdout read end
+    int   fd_        = -1;   // read end of pactl's stdout
     int   query_fd_  = -1;   // debounce timer
     int   retry_fd_  = -1;   // restart-after-death timer
     int   attempts_  = 0;

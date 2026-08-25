@@ -1,33 +1,50 @@
 # MattBar as supervised session infrastructure.
 #
-# Bar is notification daemon, tray host, and OSD. Crash/wedged loop costs
-# a sub-second flicker: sd_notify watchdog from epoll loop, Restart=always,
-# history/DND restored from $XDG_STATE_HOME/mattbar (~500ms max loss).
+# The bar is the notification daemon, tray host, and OSD — state worth
+# protecting. Under this unit a crash or a wedged event loop costs a
+# sub-second flicker: sd_notify watchdog pings come from inside the epoll
+# loop (a frozen loop stops pinging), Restart=on-failure brings the bar
+# back, and notification history / DND are restored from
+# $XDG_STATE_HOME/mattbar (at most ~500ms of history can be lost).
 #
-# Install: cp contrib/mattbar.service ~/.config/systemd/user/
-#          systemctl --user daemon-reload
-#          systemctl --user enable --now mattbar
-# Hyprland: replace `exec-once = mattbar` with
-#           `exec-once = systemctl --user start mattbar`
+# Install:   cp contrib/mattbar.service ~/.config/systemd/user/
+#            systemctl --user daemon-reload
+#            systemctl --user enable --now mattbar
+# Hyprland:  replace any `exec-once = mattbar` with
+#            `exec-once = systemctl --user start mattbar` (or rely on
+#            graphical-session.target if your session reaches it).
 
 [Unit]
 Description=MattBar status bar
 Documentation=file:///usr/local/share/doc/mattbar/README.md
 PartOf=graphical-session.target
 After=graphical-session.target
+# These belong in [Unit], not [Service] — systemd was ignoring the
+# interval and logging "Unknown key 'StartLimitIntervalSec'".
+StartLimitIntervalSec=60
+StartLimitBurst=60
 
 [Service]
 Type=notify
 NotifyAccess=main
 ExecStart=/usr/local/bin/mattbar
-# always (not on-failure): bar must return from ANY exit (resume-thaw used
-# to exit 0 and stay down). Burst window tolerates post-resume churn.
+# Only signal mattbar itself. Launched apps (menu, screensaver, terminals)
+# must not die when the bar restarts — control-group SIGTERM took down
+# Brave/Spotify/Signal and then waited 90s on jetbrainsd.
+KillMode=process
+TimeoutStopSec=8
+# always (not on-failure): a bar must come back from ANY exit — the
+# resume-thaw Wayland error path used to exit 0 and stay down. The burst
+# window tolerates post-resume churn without latching the unit failed.
 Restart=always
 RestartSec=500ms
-StartLimitIntervalSec=60
-StartLimitBurst=60
-# Watchdog: pings at WatchdogSec/3 from event loop. 30s covers suspend/
-# resume freeze (pre-suspend age + post-thaw). Silent that long => gone.
+# Watchdog: the bar pings at WatchdogSec/3 from its event loop. 30s (not
+# 10) because suspend/resume freezes the whole unit: the pre-suspend ping
+# age plus the post-resume thaw window must fit inside this budget or
+# systemd SIGABRTs the cgroup (bar + pactl child) the moment it thaws.
+# Old note:
+# deliberately far above any legitimate stall now that every subprocess
+# call is async — if the loop is silent that long, it is gone.
 WatchdogSec=30
 Slice=session.slice
 

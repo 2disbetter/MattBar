@@ -1,6 +1,8 @@
 #pragma once
 #include "frac.hpp"
-// In-bar settings window: a centered overlay layer surface with click-only widgets (steppers, checkboxes, click-to-set sliders).
+// In-bar settings window: a centered overlay layer surface with click-only
+// widgets (steppers, checkboxes, click-to-set sliders). Changes apply live;
+// "Save" persists them to ~/.config/mattbar/mattbar.conf.
 #include <wayland-client.h>
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
@@ -38,11 +40,13 @@ private:
     wl_surface* surf_ = nullptr;
     FracSurface frac_; // fractional scaling (see frac.hpp)
     zwlr_layer_surface_v1* ls_ = nullptr;
-    int  w_ = 430, h_ = 520;
+    int  w_ = 500, h_ = 520;
     bool mapped_ = false;
     double mx_ = -1, my_ = -1;
     double scroll_ = 0, scroll_max_ = 0;
     int color_sel_ = 0; // index into the Colors section's swatch table
+    int tab_ = 0;       // TabBar / Layout / Modules / Notify / Look / Shell
+    int shell_tab_ = 0; // Idle / Menu / Panels / Pickers / Desktop / Plugins
     double woff_ = 0; // content-y -> surface-y offset during widget capture
     std::vector<Widget> widgets_;
 };
