@@ -8,10 +8,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(WAYLAND REQUIRED wayland-client wayland-cursor)
-pkg_check_modules(CAIRO   REQUIRED cairo)
-pkg_check_modules(SYSTEMD REQUIRED libsystemd)
-pkg_check_modules(XKB     REQUIRED xkbcommon)
+pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET wayland-client wayland-cursor)
+pkg_check_modules(CAIRO   REQUIRED IMPORTED_TARGET cairo)
+pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
+pkg_check_modules(XKB     REQUIRED IMPORTED_TARGET xkbcommon)
 # SVG tray icons need librsvg AT RUNTIME only (dlopen on first SVG icon);
 # there is no build-time dependency and no standing RAM cost without SVGs.
 
@@ -38,9 +38,8 @@ function(wayland_protocol XML BASENAME)
     COMMAND ${WAYLAND_SCANNER} private-code ${XML}
             ${GEN}/${BASENAME}-protocol.c
     DEPENDS ${XML})
-  set(PROTO_SRC ${PROTO_SRC}
-      ${GEN}/${BASENAME}-protocol.c
-      ${GEN}/${BASENAME}-client-protocol.h PARENT_SCOPE)
+  set(_add ${GEN}/${BASENAME}-protocol.c ${GEN}/${BASENAME}-client-protocol.h)
+  set(PROTO_SRC ${PROTO_SRC} ${_add} PARENT_SCOPE)
 endfunction()
 
 wayland_protocol(${CMAKE_CURRENT_SOURCE_DIR}/protocols/wlr-layer-shell-unstable-v1.xml
@@ -63,7 +62,7 @@ wayland_protocol(${WAYLAND_PROTOCOLS_DIR}/staging/ext-idle-notify/ext-idle-notif
                  ext-idle-notify-v1)
 
 # --- executable -------------------------------------------------------------
-add_executable(mattbar
+set(MATTBAR_SRC
   src/main.cpp
   src/bar.cpp
   src/config.cpp
@@ -90,22 +89,30 @@ add_executable(mattbar
   src/shell_panels.cpp
   src/shell_network.cpp
   src/shell_overlays.cpp
-  src/qs_plugins.cpp
-  ${PROTO_SRC})
+  src/qs_plugins.cpp)
+foreach(_f IN LISTS MATTBAR_SRC)
+  if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${_f})
+    message(FATAL_ERROR
+      "Missing ${_f}. Copy the whole MattBar tree (src/, protocols/, "
+      "CMakeLists.txt). Do not reuse a build/ directory from another machine.")
+  endif()
+endforeach()
+if(NOT PROTO_SRC)
+  message(FATAL_ERROR
+    "No Wayland protocol sources. Install wayland-protocols and wayland-scanner, "
+    "then rm -rf build && cmake -B build -S .")
+endif()
 
-target_include_directories(mattbar PRIVATE
-  ${GEN}
-  ${WAYLAND_INCLUDE_DIRS}
-  ${CAIRO_INCLUDE_DIRS}
-  ${SYSTEMD_INCLUDE_DIRS}
-  ${XKB_INCLUDE_DIRS})
+add_executable(mattbar ${MATTBAR_SRC} ${PROTO_SRC})
+
+target_include_directories(mattbar PRIVATE ${GEN})
 
 find_library(PAM_LIBRARY pam REQUIRED)
 target_link_libraries(mattbar PRIVATE
-  ${WAYLAND_LIBRARIES}
-  ${CAIRO_LIBRARIES}
-  ${SYSTEMD_LIBRARIES}
-  ${XKB_LIBRARIES}
+  PkgConfig::WAYLAND
+  PkgConfig::CAIRO
+  PkgConfig::SYSTEMD
+  PkgConfig::XKB
   ${PAM_LIBRARY}
   ${CMAKE_DL_LIBS})
 
