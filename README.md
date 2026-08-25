@@ -1,5 +1,5 @@
 # MattBar
-
+<img width="1600" height="720" alt="image" src="https://github.com/user-attachments/assets/79846e09-ef13-4e43-8f5d-b0cb0bd544ea" />
 **Ultra-efficient, configurable drop-in replacement for Waybar and the Omarchy 4 / Quattro Quickshell bar.**
 
 Written in C++ against raw `wayland-client` + Cairo — no GTK, no Qt.  
