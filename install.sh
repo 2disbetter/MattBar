@@ -366,7 +366,7 @@ fi
 
 if ((need_copy)); then
   log "installing binary to $DEST_BIN"
-  if [[ -w ${PREFIX}/bin 2>/dev/null ]] || [[ $PREFIX == "$REAL_HOME"* ]]; then
+  if [[ -w ${PREFIX}/bin ]] || [[ $PREFIX == "$REAL_HOME"* ]]; then
     mkdir -p "$PREFIX/bin"
     install -m 755 "$SRC_BIN" "$DEST_BIN"
     ln -sfn mattbar "$PREFIX/bin/mattbarctl"
