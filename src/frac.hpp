@@ -64,8 +64,12 @@ struct FracSurface {
             if (wl_surface_get_version(s) >= 3)
                 wl_surface_set_buffer_scale(s, 1);
             wp_viewport_set_destination(vp, logical_w, logical_h);
-        } else if (wl_surface_get_version(s) >= 3) {
-            wl_surface_set_buffer_scale(s, int_scale);
+        } else {
+            // Unset a leftover destination so the integer path is not
+            // fighting a viewport from a previous fractional scale.
+            if (vp) wp_viewport_set_destination(vp, -1, -1);
+            if (wl_surface_get_version(s) >= 3)
+                wl_surface_set_buffer_scale(s, int_scale);
         }
     }
 };

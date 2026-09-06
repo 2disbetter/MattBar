@@ -5,7 +5,7 @@
 // ---------------------------------------------------------------------------
 #include <string>
 
-inline constexpr const char* MATTBAR_VERSION = "1.39.35";
+inline constexpr const char* MATTBAR_VERSION = "1.42.2";
 #include <vector>
 
 struct Color { double r, g, b, a; };
@@ -122,14 +122,26 @@ struct Config {
     // so those panels keep working while MattBar claims notifications.
     // Toggling it off starts the shell again.
     bool quickshell_shutdown     = false;
-    // Shell tab: run user Omarchy Quickshell plugins as a sidecar while
-    // takeover is on. Off (default) keeps qs dead. A child qs starts
-    // only when this is on AND at least one plugin is placed on the bar
-    // or listed in qs_plugin_services.
+    // Internal keep-alive for the QS sidecar. Not a Settings checkbox:
+    // Plugin row on forces this true; Stop / lazy-idle force it false.
+    // Chip-summoned overlays use a runtime lazy hold instead.
     bool        qs_plugins         = false;
     bool        show_plugins       = true; // Plugins accordion chip on the bar
+    // Optional QS-hosted plugin strip (mattbar.plugin-bar) stacked on the
+    // desktop-facing side of MattBar. Off (default). Only bar-widget
+    // kinds render there; overlay/panel/menu stay on the Plugins chip.
+    bool        qs_plugin_bar         = false;
+    int         qs_plugin_bar_height  = 28; // logical px, thin row
     // Placeable user plugins assigned to the Plugins accordion (order).
+    // Bar-widget ids in this list go on the plugin row when it is on.
     std::string qs_plugin_layout;
+    // Plugin-row zones, same idea as layout_left/center/right/more.
+    // Only kind:bar-widget ids belong here. Overlay/panel/menu stay on
+    // the chip. An existing qs_plugin_layout migrates into left.
+    std::string qs_plugin_bar_left;
+    std::string qs_plugin_bar_center;
+    std::string qs_plugin_bar_right;
+    std::string qs_plugin_bar_more;
     std::string qs_plugin_services; // CSV of service-only plugin ids
     // Seconds after lock before backlight off. Omarchy's lock plugin
     // hardcodes 5; 0 keeps the panel lit. Screensaver and lock delays

@@ -634,7 +634,8 @@ void BarSurface::create(Bar& b, wl_output* o, const std::string& n) {
         bool inside = cfg.multi_monitor && cfg.reveal_all_monitors
                           ? owner->any_pointer_inside()
                           : ptr_inside;
-        if (!inside && expanded && !owner->pinned() && owner->hold_ == 0)
+        if (!inside && expanded && !owner->pinned() && owner->hold_ == 0 &&
+            !owner->plugin_row_hover_)
             set_expanded(false);
     }, "hide-timer");
 
@@ -687,6 +688,7 @@ void BarSurface::set_expanded(bool on) {
     expanded = on;
     if (on) owner->tick_modules(); // wake with fresh clock/battery/etc.
     owner->update_tick();          // tick runs while ANY bar is revealed
+    qs_plugin_bar_publish(*owner);
     const uint32_t req =
         on ? static_cast<uint32_t>(cfg_thickness()) : hidden_thickness();
     if (req != (cfg_vertical() ? w : h)) awaiting_configure = true;
@@ -925,7 +927,8 @@ void Bar::ctl_reveal() {
 
 void Bar::ctl_hide() {
     for (auto* bs : surfaces_)
-        if (bs->expanded && !pinned_ && hold_ == 0) bs->set_expanded(false);
+        if (bs->expanded && !pinned_ && hold_ == 0 && !plugin_row_hover_)
+            bs->set_expanded(false);
 }
 
 bool Bar::any_expanded() const {
@@ -979,20 +982,13 @@ wl_output* Bar::output_named(const std::string& name) const {
     return nullptr;
 }
 
+void Bar::note_focused_output(const std::string& name) {
+    if (!name.empty()) focused_mon_ = name;
+}
+
 wl_output* Bar::focused_output() const {
-    // hyprctl -j activeworkspace is a small JSON blob with "monitor":"DP-1".
-    std::string j = cmd_output("hyprctl -j activeworkspace 2>/dev/null");
-    auto k = j.find("\"monitor\"");
-    if (k != std::string::npos) {
-        auto q = j.find('"', j.find(':', k));
-        if (q != std::string::npos) {
-            auto e = j.find('"', q + 1);
-            if (e != std::string::npos)
-                if (wl_output* o = output_named(j.substr(q + 1, e - q - 1)))
-                    return o;
-        }
-    }
-    return nullptr;
+    if (focused_mon_.empty()) return nullptr;
+    return output_named(focused_mon_);
 }
 
 wl_output* Bar::primary_output() const {
@@ -1169,7 +1165,9 @@ void Bar::sync_surfaces() {
 
 // The tick timer runs while ANY bar is revealed, and is fully disarmed once
 // every bar is hidden — the zero-wakeup idle property survives multi-monitor.
-void Bar::update_tick() { arm_tick(any_expanded()); }
+void Bar::update_tick() {
+    arm_tick(any_expanded() || qs_plugins_lazy_hold());
+}
 
 void Bar::tick_modules() {
     qs_plugins_reap();
@@ -1189,10 +1187,11 @@ void Bar::toggle_pinned() {
         if (pinned_) {
             bs->arm_hide(false);
             if (!bs->expanded) bs->set_expanded(true);
-        } else if (!bs->ptr_inside && hold_ == 0) {
+        } else if (!bs->ptr_inside && hold_ == 0 && !plugin_row_hover_) {
             bs->arm_hide(true);
         }
     }
+    qs_plugin_bar_publish(*this);
     request_draw();
 }
 
@@ -1202,6 +1201,19 @@ void Bar::toggle_settings() {
     } else {
         settings_ = new SettingsWindow(*this);
     }
+}
+
+void Bar::open_settings() {
+    if (settings_) {
+        settings_close_pending_ = false;
+        settings_->refresh();
+        return;
+    }
+    settings_ = new SettingsWindow(*this);
+}
+
+bool Bar::settings_open() const {
+    return settings_ != nullptr && !settings_close_pending_;
 }
 
 void Bar::close_settings_later() { settings_close_pending_ = true; }
@@ -1214,6 +1226,8 @@ void Bar::apply_config() {
     // Sidecar first: restore user shell.json before notifyd relaunches
     // a full Omarchy shell, and skip notifyd's kill while plugins run.
     qs_plugins_apply(*this);
+    qs_plugin_bar_watch(*this);
+    qs_plugin_bar_publish(*this);
     if (notify_daemon()) notify_daemon()->apply_enabled();
     if (mattbar_shell()) mattbar_shell()->apply_takeover();
     more_close();
@@ -1275,9 +1289,24 @@ void Bar::on_omarchy_theme_event() {
 void Bar::hold_open(bool acquire) {
     hold_ += acquire ? 1 : -1;
     if (hold_ < 0) hold_ = 0;
-    if (hold_ == 0 && !pinned_)
+    if (hold_ == 0 && !pinned_ && !plugin_row_hover_)
         for (auto* bs : surfaces_)
             if (!bs->ptr_inside) bs->arm_hide(true);
+}
+
+void Bar::set_plugin_row_hover(bool on) {
+    if (plugin_row_hover_ == on) return;
+    plugin_row_hover_ = on;
+    if (on) {
+        for (auto* bs : surfaces_) {
+            bs->arm_hide(false);
+            if (!bs->expanded) bs->set_expanded(true);
+        }
+        if (cfg.multi_monitor && cfg.reveal_all_monitors) reveal_all();
+    } else if (!pinned_ && hold_ == 0) {
+        for (auto* bs : surfaces_)
+            if (!bs->ptr_inside) bs->arm_hide(true);
+    }
 }
 
 void Bar::arm_tick(bool arm) {

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "mattbar.plugin-bar",
+  "name": "MattBar plugin row",
+  "version": "1.0.0",
+  "author": "MattBar",
+  "description": "Thin Quickshell strip that hosts user bar-widget plugins next to MattBar. Overlay, panel, and menu plugins stay on MattBar's Plugins chip.",
+  "kinds": ["bar"],
+  "entryPoints": { "bar": "Bar.qml" }
+}

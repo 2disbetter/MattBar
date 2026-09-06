@@ -276,7 +276,14 @@ void Config::load() {
         else if (k == "quickshell_shutdown")    quickshell_shutdown = b();
         else if (k == "qs_plugins")             qs_plugins = b();
         else if (k == "show_plugins")           show_plugins = b();
+        else if (k == "qs_plugin_bar")          qs_plugin_bar = b();
+        else if (k == "qs_plugin_bar_height")
+            qs_plugin_bar_height = std::clamp(atoi(v.c_str()), 16, 64);
         else if (k == "qs_plugin_layout")       qs_plugin_layout = v;
+        else if (k == "qs_plugin_bar_left")     qs_plugin_bar_left = v;
+        else if (k == "qs_plugin_bar_center")   qs_plugin_bar_center = v;
+        else if (k == "qs_plugin_bar_right")    qs_plugin_bar_right = v;
+        else if (k == "qs_plugin_bar_more")     qs_plugin_bar_more = v;
         else if (k == "qs_plugin_services")     qs_plugin_services = v;
         else if (k == "idle_blank_s")
             idle_blank_s = std::clamp(atoi(v.c_str()), 0, 120);
@@ -517,12 +524,21 @@ void Config::save() const {
       << "notification_timeout_s = " << notification_timeout_s << "\n"
       << "notifications_takeover = " << (notifications_takeover ? "true" : "false") << "\n"
       << "quickshell_shutdown = " << (quickshell_shutdown ? "true" : "false") << "\n"
-      << "# qs_plugins: optional Quickshell sidecar for user plugins while\n"
-      << "# takeover is on. Off keeps qs dead. Sidecar starts only with at\n"
-      << "# least one plugin on the bar or in qs_plugin_services.\n"
+      << "# qs_plugins: internal keep-alive. Plugin row on writes true;\n"
+      << "# Stop / lazy chip sessions write false. Not a Settings checkbox.\n"
       << "qs_plugins = " << (qs_plugins ? "true" : "false") << "\n"
       << "show_plugins = " << (show_plugins ? "true" : "false") << "\n"
+      << "# qs_plugin_bar: thin QS strip (mattbar.plugin-bar) on the desktop\n"
+      << "# side of MattBar. Only bar-widget plugins render there.\n"
+      << "qs_plugin_bar = " << (qs_plugin_bar ? "true" : "false") << "\n"
+      << "qs_plugin_bar_height = " << qs_plugin_bar_height << "\n"
       << "qs_plugin_layout = " << qs_plugin_layout << "\n"
+      << "# Plugin-row zones (bar-widget plugins only). Same L/C/R/M idea\n"
+      << "# as layout_*. More is a ⋯ overflow on the plugin row.\n"
+      << "qs_plugin_bar_left = " << qs_plugin_bar_left << "\n"
+      << "qs_plugin_bar_center = " << qs_plugin_bar_center << "\n"
+      << "qs_plugin_bar_right = " << qs_plugin_bar_right << "\n"
+      << "qs_plugin_bar_more = " << qs_plugin_bar_more << "\n"
       << "qs_plugin_services = " << qs_plugin_services << "\n"
       << "idle_blank_s = " << idle_blank_s << "\n"
       << "shell_font_size = " << static_cast<int>(shell_font_size) << "\n"

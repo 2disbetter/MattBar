@@ -44,11 +44,18 @@ MattBar’s menu, and a runtime PATH shim (`$XDG_RUNTIME_DIR/mattbar/bin`)
 is prepended so `omarchy-shell` / `omarchy-menu` / `omarchy-system-lock`
 hit MattBar instead of the dead Quickshell.
 
-**No plugin host.** Quickshell’s QML `PluginRegistry` / third-party
-`~/.config/omarchy/plugins` / `{type:"qml"}` bar modules are a
-platform, not a feature. MattBar Shell is a closed set of C++
-modules. Custom bar slots can stay as `type: command` (exec a script)
-if we ever want them.
+**C++ first-party modules; opt-in Quickshell sidecar for user plugins.**
+MattBar does not reimplement Quickshell’s QML `PluginRegistry` or speak
+the QML plugin ABI. First-party panels stay a closed set of C++
+modules. Third-party Omarchy plugins (`~/.config/omarchy/plugins`,
+`{type:"qml"}` bar modules) still run: turn on **Settings → Shell →
+Quickshell plugins** (`qs_plugins`) while takeover is on, place the
+plugin on the bar or list it in `qs_plugin_services`, and MattBar
+starts a stripped Quickshell sidecar that loads *your* plugins only
+(first-party QS bar/panels stay disabled via the null-bar +
+`shell.json` rewrite). That sidecar is the user’s choice — install a
+plugin, use it, then turn the toggle off and the Qt process goes
+away. See `qs_plugins.cpp` and INSTALL.md §8.
 
 **Match the Quickshell TUIs.** The replacement is not a “good enough”
 subset. If Omarchy’s panel shows a control, a row, or a reading, MattBar
@@ -140,7 +147,7 @@ UI exists. **new** = not started.
 | Wallpaper | done | Fullscreen layer per output; 420ms slanted wipe on `set` / `transition` / `refresh`; `setInstant` snaps |
 | Idle | done | Screensaver after N s, lock after M s (`idle.lock` / `idle.screensaver` in shell.json); enable/disable/toggle (Stay Awake); caffeine inhibitor respected |
 | Night light | done | Own hyprsunset temperature (4000 / 6500 K); enable/disable/toggle/status/refresh; bar moon indicator |
-| Notifications | have | Daemon, popups, DND, history. Still need IPC aliases (`dismissOne`, `dismissAll`, `invokeLast`, `showHistory`, `toggleDnd`) |
+| Notifications | done | Daemon, popups, DND, history, IPC aliases (`dismissOne`, `dismissAll`, `invokeLast`, `showHistory`, `toggleDnd`) |
 | OSD | partial | Volume/mic/brightness exist. Missing generic `omarchy-osd` payload (icon/message/progress/duration), app-launch feedback, media toasts |
 | Media transport | partial | Bar MPRIS exists. Hardware keys call `media playPause/next/previous/sourceSwitch` even while locked |
 
@@ -152,13 +159,13 @@ UI exists. **new** = not started.
 | Clock + calendar | done | Calendar; right-click cycles format; middle-click timezone picker |
 | Pin / auto-hide | have | Keep; Omarchy’s bar does not auto-hide |
 | Tray | have | |
-| Menu button | partial | Must open *our* menu, not `omarchy-menu` → Quickshell |
+| Menu button | done | Takeover: opens MattBar menu. Off: `omarchy-menu` → Quickshell |
 | Update | have | |
 | Agents indicator | done | Status + usage panel (`omarchy.agents`) |
 | Screen recording | have | |
-| Network status | partial | SSID yes; panel is new |
-| Bluetooth status | partial | Status yes; device list is new |
-| Volume / mic | partial | Readout yes; mixer panel is new |
+| Network status | done | SSID + network panel |
+| Bluetooth status | done | Status + device list panel |
+| Volume / mic | done | Readout + audio mixer panel |
 | Brightness | done | Slider, scale, monitors; laptop lid/mirror when eDP+external exist |
 | Media | done | Play/pause, scroll skip; right-click cover-art popup; middle-click / `media sourceSwitch` cycles player |
 | Notifications bell | have | |
@@ -187,16 +194,16 @@ UI exists. **new** = not started.
 | Weather | done | Open-Meteo (coords) + wttr.in (IP auto); hero + 3-day; location search |
 | Tailscale | done | On/off, self IP, machines (click copies IP), EXIT NODES, Mullvad region picker |
 | Dropbox | done | Status, storage meter, pause/resume, login, recent files |
-| Wi-Fi QR | new | Encode current SSID/PSK (in-tree encoder) |
-| Speed test | new | Download/upload dials |
+| Wi-Fi QR | done | Encode current SSID/PSK; opened from the network panel |
+| Speed test | done | Download/upload dials; opened from the network panel |
 | Disk speed test | done | Live READ/WRITE MB/s dials via `omarchy-disk-speedtest` |
 
 ### Overlays
 
 | Overlay | Status | Notes |
 |---|---|---|
-| Omarchy menu | new | Parse `omarchy-menu.jsonc` + `~/.config/omarchy/extensions/omarchy-menu.jsonc`; `when:` / `checked:`; run `action:`; routes (`apps`, `system`, `capture`, …). This is Super+Space |
-| App library | new | `.desktop` scan, hidden-entry filter, icons, launch OSD. Menu’s Apps page |
+| Omarchy menu | done | Parse stock + `~/.config/omarchy/extensions/omarchy-menu.jsonc`; run `action:`; routes (`apps`, `system`, `capture`, …). Super+Space while takeover is on. `when:` / `checked:` / `aliases` are parsed but not yet applied, so gated items always show |
+| App library | done | `.desktop` scan (system + `~/.local/share/applications`), hidden-entry filter, PNG icons. Extra `XDG_DATA_DIRS` / Flatpak export dirs not walked yet |
 | Clipboard history | done | Reads Omarchy's history JSON; search, paste, confirm-clear |
 | Emoji picker | done | Search Omarchy's emoji list; insert or copy |
 | Image picker | done | Directory grid; `selectionFile` / `doneFile` round-trip used by wallpaper and theme tools |
@@ -209,6 +216,7 @@ Callers keep using `omarchy-shell`. The shim turns that into
 `mattbarctl`. Native form:
 
 ```
+mattbarctl settings
 mattbarctl shell ping
 mattbarctl shell toggle omarchy.audio
 mattbarctl shell summon omarchy.menu '{"menu":"root"}'
@@ -235,6 +243,7 @@ Targets that must eventually answer (Omarchy binds and scripts):
 | `nightlight` toggle / status | Super+Ctrl+N |
 | `background` refresh / set / transition / themeTransition | wallpaper + theme tools |
 | `image-selector` open / cancel | `omarchy-menu-images` |
+| `omarchy.system-update` refresh / clear | `omarchy-update-status` at the end of `omarchy update` |
 | `omarchy.{audio,bluetooth,network,monitor,power,clock,agents,…}` toggle | Super+Ctrl+A/B/W/… and bar module clicks |
 
 `setPluginEnabled` for `omarchy.notifications` is already handled by
@@ -243,7 +252,8 @@ shell, that call becomes a no-op or a local flag.
 
 ## What we will not recreate
 
-- Qt / QML / Quickshell plugin ABI
+- A first-party QML plugin ABI inside MattBar (user QML plugins run in
+  the opt-in Quickshell sidecar instead — see Decisions)
 - Omarchy’s built-in bar as a second bar
 - Dev gallery
 - PipeWire, NetworkManager, bluetoothd, polkitd, logind, PAM, Hyprland
@@ -278,7 +288,7 @@ Updated as work lands.
 | Calendar IPC (`omarchy.clock`) | done |
 | Notifications / OSD / media IPC aliases | done |
 | Wallpaper (JPEG/PNG, shutdown only) | done |
-| Session lock (ext-session-lock-v1 + PAM) | done (password; no fingerprint yet) |
+| Session lock (ext-session-lock-v1 + PAM) | done (password + fingerprint when `omarchy-lock-fingerprint` exists and fprintd reports an enrolled finger) |
 | Polkit agent | done (password dialog; only while takeover is on) |
 | Idle auto-lock / screensaver | done (`ext-idle-notify-v1`; only while takeover is on) |
 | Panels (audio, network, bluetooth, display) | done (1.31.1) — layout matches the Quickshell TUIs (hero, sections, stats, band/DNS, text size). QR + speed-test overlays included. Laptop clamshell/mirror still later |
@@ -289,6 +299,8 @@ Updated as work lands.
 | Disk speed test | done (1.35.0) — live READ/WRITE MB/s dials (`omarchy-disk-speedtest`) |
 | Clock timezone, laptop lid/mirror, power panel, active window, keyboard layout, reminders, dictation | done (1.36.0) |
 | Tailscale / Dropbox | done (1.36.0) — last on the list, pills hide if the CLI is missing |
+| User Omarchy plugins (QS sidecar) | done — lazy from the Plugins chip. QS starts on first summon and stops on dismiss/Stop. Plugin row is the keep-alive switch. |
+| Plugin row (`mattbar.plugin-bar`) | done (1.42.0) — keep-alive QS host. Strip always mounts when the setting is on, even with zero plugins. L/C/R/M zones. Overlay/panel/menu stay on the chip. Same auto-hide family, zero exclusive zone. |
 
 ## Related
 

@@ -6,7 +6,10 @@
 #include "qs_plugins.hpp"
 #include "shell.hpp"
 
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -20,7 +23,22 @@ static std::string trimline(const char* s);
 
 std::string ctl_socket_path() {
     const char* rt = getenv("XDG_RUNTIME_DIR");
-    return std::string(rt && *rt ? rt : "/tmp") + "/mattbar.sock";
+    if (!rt || !*rt || rt[0] != '/') return {};
+    std::string p = std::string(rt) + "/mattbar.sock";
+    if (p.size() >= sizeof(sockaddr_un::sun_path)) return {};
+    return p;
+}
+
+static bool peer_is_same_uid(int fd) {
+    struct {
+        pid_t pid;
+        uid_t uid;
+        gid_t gid;
+    } cred{};
+    socklen_t len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0)
+        return false;
+    return cred.uid == geteuid();
 }
 
 // ---------------------------------------------------------------------------
@@ -29,6 +47,12 @@ std::string ctl_socket_path() {
 void CtlServer::init(Bar& bar) {
     bar_  = &bar;
     path_ = ctl_socket_path();
+    if (path_.empty()) {
+        fprintf(stderr,
+                "mattbar: ctl socket disabled (XDG_RUNTIME_DIR unset). "
+                "mattbarctl will not work until the session exports it.\n");
+        return;
+    }
     listen_fd_ =
         socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (listen_fd_ < 0) return;
@@ -59,8 +83,10 @@ void CtlServer::init(Bar& bar) {
         close(probe);
     }
     unlink(path_.c_str()); // stale socket from a previous run
-    if (bind(listen_fd_, (sockaddr*)&a, sizeof a) < 0 ||
-        listen(listen_fd_, 4) < 0) {
+    mode_t old_umask = umask(0077);
+    int bound = bind(listen_fd_, (sockaddr*)&a, sizeof a);
+    umask(old_umask);
+    if (bound < 0 || listen(listen_fd_, 16) < 0) {
         // An unwritable runtime dir: the bar works fine without the
         // socket, so just say so once and move on.
         fprintf(stderr, "mattbar: ctl socket unavailable at %s\n",
@@ -69,27 +95,35 @@ void CtlServer::init(Bar& bar) {
         listen_fd_ = -1;
         return;
     }
+    chmod(path_.c_str(), S_IRUSR | S_IWUSR); // 0600 even if umask was looser
     bar.add_fd(listen_fd_, [this](uint32_t) {
-        // Requests are tiny and local; one read/one write per connection
-        // keeps this a leaf in the event loop, never a stall.
+        // One connection per accept. poll() waits at most 50ms for the
+        // line — mattbarctl writes immediately after connect, so this
+        // almost never sleeps. The old 400× usleep(100) stalled the
+        // whole event loop (pointer, lock, watchdog) on every ctl call.
         int c = accept4(listen_fd_, nullptr, nullptr,
                         SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (c < 0) return;
-        // Image-selector rows travel as base64 on this socket; 4k was
-        // not enough for a theme's wallpaper set.
+        if (!peer_is_same_uid(c)) {
+            close(c);
+            return;
+        }
         char        buf[8192];
         std::string req;
-        for (int spin = 0; spin < 400; ++spin) { // ~40ms budget
+        int         left = 50;
+        while (left > 0 && req.size() <= 1024 * 1024 &&
+               req.find('\n') == std::string::npos) {
             ssize_t n = read(c, buf, sizeof buf);
             if (n > 0) {
-                req.append(buf, n);
-                if (req.find('\n') != std::string::npos ||
-                    req.size() > 1024 * 1024)
-                    break;
+                req.append(buf, (size_t)n);
                 continue;
             }
-            if (n == 0 || (n < 0 && errno != EAGAIN)) break;
-            usleep(100);
+            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+                break;
+            pollfd pfd{c, POLLIN, 0};
+            int pr = poll(&pfd, 1, left);
+            if (pr <= 0) break;
+            left -= 5; // bounded even if the clock does not move
         }
         if (!req.empty()) {
             std::string reply = handle(trimline(req.c_str()));
@@ -176,6 +210,19 @@ std::string CtlServer::handle(const std::string& line) {
         else if (arg != "status") return "usage: pin [on|off|toggle|status]";
         return bar_->pinned() ? "pinned" : "unpinned";
     }
+    if (cmd == "hold") {
+        if (arg == "on" || arg == "1") {
+            bar_->set_plugin_row_hover(true);
+            return "hold on";
+        }
+        if (arg == "off" || arg == "0") {
+            bar_->set_plugin_row_hover(false);
+            return "hold off";
+        }
+        if (arg == "status" || arg.empty())
+            return bar_->plugin_row_hover() ? "hold on" : "hold off";
+        return "usage: hold [on|off|status]";
+    }
     if (cmd == "reveal") {
         // Show every bar; without a pointer inside they collapse again
         // after the normal hide delay, exactly like a hover would.
@@ -185,6 +232,24 @@ std::string CtlServer::handle(const std::string& line) {
     if (cmd == "hide") {
         bar_->ctl_hide();
         return "hidden";
+    }
+    if (cmd == "settings") {
+        // Same window as the tray gear. Default is open (menu items spawn
+        // it); toggle matches a gear click; close/status for scripts.
+        if (arg == "close" || arg == "off" || arg == "hide") {
+            bar_->close_settings_later();
+            return "closed";
+        }
+        if (arg == "toggle") {
+            bar_->toggle_settings();
+            return bar_->settings_open() ? "open" : "closed";
+        }
+        if (arg == "status")
+            return bar_->settings_open() ? "open" : "closed";
+        if (!arg.empty() && arg != "open" && arg != "show" && arg != "on")
+            return "usage: settings [open|toggle|close|status]";
+        bar_->open_settings();
+        return "open";
     }
     if (cmd == "status") {
         std::string out = "mattbar " + std::string(MATTBAR_VERSION);
@@ -196,6 +261,8 @@ std::string CtlServer::handle(const std::string& line) {
         std::string act = power_ctl_active();
         if (!act.empty()) out += " profile=" + act;
         out += qs_plugins_running() ? " sidecar=up" : " sidecar=down";
+        if (cfg.qs_plugin_bar) out += " plugin-bar";
+        if (bar_->plugin_row_hover()) out += " row-hover";
         return out;
     }
     if (cmd == "plugins") {
@@ -222,7 +289,8 @@ std::string CtlServer::handle(const std::string& line) {
     if (cmd == "help" || cmd.empty())
         return "commands: dnd [on|off|toggle|status], dismiss, dismiss-all,\n"
                "invoke, restore, profile [name], pin [on|off|toggle|status],\n"
-               "reveal, hide, status, plugins [status|stop],\n"
+               "reveal, hide, hold [on|off|status], settings [open|toggle|close|status], status,\n"
+               "plugins [status|stop],\n"
                "agents [toggle|pick],\n"
                "shell ping|toggle|summon|hide <id> [payload],\n"
                "notifications dismissOne|dismissAll|invokeLast|toggleDnd,\n"
@@ -234,7 +302,7 @@ std::string CtlServer::handle(const std::string& line) {
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
-int ctl_client(int argc, char** argv) {
+int ctl_client(int argc, char** argv, bool quiet) {
     std::string line;
     for (int i = 0; i < argc; ++i) {
         if (i) line += " ";
@@ -242,16 +310,28 @@ int ctl_client(int argc, char** argv) {
     }
     if (line.empty()) line = "help";
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) { perror("mattbarctl: socket"); return 1; }
+    if (fd < 0) {
+        if (!quiet) perror("mattbarctl: socket");
+        return quiet ? 0 : 1;
+    }
     sockaddr_un a{};
     a.sun_family = AF_UNIX;
     std::string p = ctl_socket_path();
+    if (p.empty()) {
+        if (!quiet)
+            fprintf(stderr,
+                    "mattbarctl: XDG_RUNTIME_DIR is unset; no control socket\n");
+        close(fd);
+        return quiet ? 0 : 1;
+    }
     strncpy(a.sun_path, p.c_str(), sizeof(a.sun_path) - 1);
     if (connect(fd, (sockaddr*)&a, sizeof a) < 0) {
-        fprintf(stderr, "mattbarctl: cannot reach %s (is mattbar running?)\n",
-                p.c_str());
+        if (!quiet)
+            fprintf(stderr,
+                    "mattbarctl: cannot reach %s (is mattbar running?)\n",
+                    p.c_str());
         close(fd);
-        return 1;
+        return quiet ? 0 : 1;
     }
     line += "\n";
     (void)!write(fd, line.c_str(), line.size());
@@ -260,14 +340,19 @@ int ctl_client(int argc, char** argv) {
     std::string reply;
     while ((n = read(fd, buf, sizeof buf)) > 0) reply.append(buf, n);
     close(fd);
-    fputs(reply.c_str(), stdout);
+    if (!quiet) fputs(reply.c_str(), stdout);
+    if (quiet) return 0;
     return reply.rfind("error", 0) == 0 ? 1 : 0;
 }
 
 int omarchy_shell_client(int argc, char** argv) {
     int i = 0;
-    if (i < argc && argv[i] && std::string(argv[i]) == "-q") ++i;
-    if (i >= argc) return ctl_client(0, nullptr);
+    bool quiet = false;
+    if (i < argc && argv[i] && std::string(argv[i]) == "-q") {
+        quiet = true;
+        ++i;
+    }
+    if (i >= argc) return quiet ? 0 : ctl_client(0, nullptr);
     std::vector<char*> toks;
     for (; i < argc; ++i) toks.push_back(argv[i]);
     // `omarchy-shell shell toggle omarchy.menu` with no payload: add {}
@@ -276,7 +361,11 @@ int omarchy_shell_client(int argc, char** argv) {
         static char empty[] = "{}";
         toks.push_back(empty);
     }
-    return ctl_client((int)toks.size(), toks.data());
+    // Omarchy's omarchy-shell -q is best-effort: suppress output and
+    // return success even when the target, method, or socket is gone.
+    // `omarchy-update` uses `set -e` and calls us with -q; exiting 1
+    // aborted the updater after packages were already installed.
+    return ctl_client((int)toks.size(), toks.data(), quiet);
 }
 
 int omarchy_menu_client(int argc, char** argv) {

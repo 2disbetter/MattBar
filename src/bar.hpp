@@ -135,7 +135,9 @@ public:
     wl_output*  input_output() const;
     wl_output*  output_named(const std::string& name) const;
     // Hyprland's focused monitor, matched to a known wl_output.
+    // Fed by socket2 `focusedmon` / j/activeworkspace — never forks hyprctl.
     wl_output*  focused_output() const;
+    void        note_focused_output(const std::string& name);
     wl_output*  primary_output() const;
     // Name of the bar actually elected primary right now (the settings
     // window displays this rather than re-deriving the election rule).
@@ -170,13 +172,20 @@ public:
     // Hold: modules (e.g. an open tray menu) can temporarily prevent
     // auto-hiding without pinning. Balanced acquire/release.
     void hold_open(bool acquire);
+    // Plugin-row hover family: the QS strip sits inward of this bar.
+    // Hovering it must reveal/keep MattBar the same way ptr_inside does.
+    void set_plugin_row_hover(bool on);
+    bool plugin_row_hover() const { return plugin_row_hover_; }
 
     // Settings window lifecycle (gear icon in the tray)
     void toggle_settings();
+    void open_settings();        // spawn if closed; same window as the gear
+    bool settings_open() const;
     void close_settings_later(); // safe to call from settings' own callbacks
     void refresh_settings();     // redraw if the window is open
     // Re-apply cfg-derived surface geometry after a settings change.
     void apply_config();
+    void update_tick();   // arm module tick while revealed or lazy plugin session
 
     // One key event, already translated through xkbcommon. keysym is an
     // XKB_KEY_* value (Escape = 0xff1b) so popups need not include
@@ -291,6 +300,7 @@ private:
     // them all, and an open menu holds every bar open)
     bool pinned_     = false;
     int  hold_       = 0;             // >0: don't auto-hide (menus etc.)
+    bool plugin_row_hover_ = false;   // QS plugin-bar pointer is inside
     volatile sig_atomic_t running_ = 1;
     wl_surface* ptr_surface_ = nullptr; // which of our surfaces has pointer
     wl_surface* kb_surface_  = nullptr; // which of our surfaces has keyboard
@@ -345,7 +355,6 @@ private:
 
     // internals
     void arm_tick(bool arm);
-    void update_tick();   // tick runs while ANY bar is revealed
     void tick_modules();
     void set_cursor(wl_pointer*, uint32_t serial);
     void route_click(int button);
@@ -363,6 +372,8 @@ public:
     void ctl_reveal();
     void ctl_hide();
 private:
+
+    std::string focused_mon_;
 
     friend struct BarSurface;
 

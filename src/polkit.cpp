@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -44,6 +45,7 @@ int   helper_in  = -1;
 int   wait_fd    = -1;
 bool  busy       = false;
 bool  fp_ok      = false;
+bool  helper_killed = false;
 
 bool fingerprint_polkit() {
     auto has = [](const char* p) {
@@ -196,7 +198,8 @@ void start_helper(const std::string& pw) {
     } else {
         helper_in = p[1];
     }
-    helper_pid = pid;
+    helper_killed = false;
+    helper_pid    = pid;
     if (wait_fd < 0 && g_bar) {
         wait_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
         if (wait_fd >= 0)
@@ -209,12 +212,15 @@ void start_helper(const std::string& pw) {
                     int st = 0;
                     pid_t r = waitpid(helper_pid, &st, WNOHANG);
                     if (r != helper_pid) return;
-                    helper_pid = -1;
-                    busy       = false;
+                    bool killed = helper_killed;
+                    helper_pid    = -1;
+                    helper_killed = false;
+                    busy          = false;
                     if (helper_in >= 0) {
                         close(helper_in);
                         helper_in = -1;
                     }
+                    if (killed) return;
                     bool ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
                     if (ok) {
                         reply_ok();
@@ -297,9 +303,20 @@ void show_dialog() {
 
 void close_dialog() {
     if (helper_pid > 0) {
+        helper_killed = true;
         kill(helper_pid, SIGTERM);
-        waitpid(helper_pid, nullptr, 0);
-        helper_pid = -1;
+        int   st = 0;
+        pid_t w  = waitpid(helper_pid, &st, WNOHANG);
+        if (w != helper_pid && !(w < 0 && errno == ECHILD)) {
+            kill(helper_pid, SIGKILL);
+            w = waitpid(helper_pid, &st, WNOHANG);
+        }
+        if (w == helper_pid || (w < 0 && errno == ECHILD)) {
+            helper_pid    = -1;
+            helper_killed = false;
+        }
+        // else leave helper_pid for the waiter; helper_killed
+        // drops a late exit-0 so cancel cannot become allow.
     }
     if (helper_in >= 0) {
         close(helper_in);

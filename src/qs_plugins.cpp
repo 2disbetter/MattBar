@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>
+#include <sys/inotify.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
@@ -46,8 +47,14 @@ Bar*                  g_bar       = nullptr;
 bool                  g_json_ours = false;
 uint64_t              g_restart_ms = 0;
 int                   g_fail_streak = 0;
+// Lazy chip session: sidecar is up because the user summoned a plugin
+// while the plugin row is off. Cleared on Stop or when the overlay goes
+// idle. Plugin row on is keep-alive and does not use this flag.
+bool                  g_lazy_hold = false;
+uint64_t              g_lazy_at_ms = 0;
+bool                  g_lazy_saw_layer = false;
 
-const char* kSkipIds[] = {"mattbar.null-bar", nullptr};
+const char* kSkipIds[] = {"mattbar.null-bar", "mattbar.plugin-bar", nullptr};
 const char* kDisableFirstParty[] = {
     "omarchy.notifications", "omarchy.lock",     "omarchy.polkit",
     "omarchy.idle",          "omarchy.battery",  "omarchy.osd",
@@ -139,8 +146,18 @@ bool mkdir_parents(const std::string& file) {
     auto slash = file.rfind('/');
     if (slash == std::string::npos) return true;
     std::string dir = file.substr(0, slash);
-    std::string cmd = "mkdir -p '" + dir + "'";
-    return system(cmd.c_str()) == 0;
+    std::string cur;
+    bool ok = true;
+    for (size_t i = 0; i <= dir.size(); ++i) {
+        if (i == dir.size() || dir[i] == '/') {
+            if (!cur.empty() && cur != "/") {
+                if (mkdir(cur.c_str(), 0700) != 0 && errno != EEXIST)
+                    ok = false;
+            }
+        }
+        if (i < dir.size()) cur += dir[i];
+    }
+    return ok;
 }
 
 uint64_t now_ms() {
@@ -190,6 +207,7 @@ void qs_plugins_scan() {
     closedir(d);
     std::sort(g_catalog.begin(), g_catalog.end(),
               [](const QsPlugin& a, const QsPlugin& b) { return a.id < b.id; });
+    qs_plugin_bar_migrate();
 }
 
 const std::vector<QsPlugin>& qs_plugins_catalog() {
@@ -227,6 +245,169 @@ std::vector<std::string> qs_plugin_layout_ids() {
     return out;
 }
 
+bool qs_plugin_has_kind(const QsPlugin& p, const char* kind) {
+    return has_kind(p.kinds, kind);
+}
+bool qs_plugin_is_bar_widget(const QsPlugin& p) {
+    return has_kind(p.kinds, "bar-widget");
+}
+bool qs_plugin_is_summonable(const QsPlugin& p) {
+    return has_kind(p.kinds, "overlay") || has_kind(p.kinds, "panel") ||
+           has_kind(p.kinds, "menu");
+}
+
+std::vector<std::string> qs_plugin_chip_ids() {
+    std::vector<std::string> out;
+    for (auto& id : qs_plugin_layout_ids()) {
+        const QsPlugin* p = qs_plugin_find(id);
+        if (!p) continue;
+        if (cfg.qs_plugin_bar && qs_plugin_is_bar_widget(*p))
+            continue; // row host owns the widget face
+        if (qs_plugin_is_summonable(*p)) {
+            out.push_back(id);
+            continue;
+        }
+        // bar-widget-only: stay on the chip only while the row is off,
+        // so enabling one is never a silent no-op.
+        if (!cfg.qs_plugin_bar)
+            out.push_back(id);
+    }
+    return out;
+}
+
+static std::string& plugin_bar_zone_str(int zone) {
+    if (zone == 1) return cfg.qs_plugin_bar_center;
+    if (zone == 2) return cfg.qs_plugin_bar_right;
+    if (zone == 3) return cfg.qs_plugin_bar_more;
+    return cfg.qs_plugin_bar_left;
+}
+
+static std::vector<std::string> plugin_bar_zone_list(int zone) {
+    auto v = cfg.csv_split(plugin_bar_zone_str(zone));
+    std::vector<std::string> out;
+    for (auto& id : v) {
+        const QsPlugin* p = qs_plugin_find(id);
+        if (p && p->placeable && qs_plugin_is_bar_widget(*p) &&
+            qs_plugin_shown(id))
+            out.push_back(id);
+    }
+    return out;
+}
+
+std::vector<std::string> qs_plugin_row_ids(int zone) {
+    if (!cfg.qs_plugin_bar) return {};
+    if (zone >= 0 && zone <= 3) return plugin_bar_zone_list(zone);
+    std::vector<std::string> out;
+    for (int z = 0; z < 4; ++z) {
+        auto part = plugin_bar_zone_list(z);
+        out.insert(out.end(), part.begin(), part.end());
+    }
+    // Shown bar-widgets that never got a zone still count (and will
+    // migrate to left on the next qs_plugin_bar_migrate()).
+    if (out.empty()) {
+        for (auto& id : qs_plugin_layout_ids()) {
+            const QsPlugin* p = qs_plugin_find(id);
+            if (p && qs_plugin_is_bar_widget(*p)) out.push_back(id);
+        }
+    }
+    return out;
+}
+
+int qs_plugin_row_zone_of(const std::string& plugin_id, int* idx) {
+    for (int z = 0; z < 4; ++z) {
+        auto v = plugin_bar_zone_list(z);
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i] == plugin_id) {
+                if (idx) *idx = (int)i;
+                return z;
+            }
+    }
+    return -1;
+}
+
+void qs_plugin_row_set_zone(const std::string& plugin_id, int zone) {
+    if (zone < 0 || zone > 3) return;
+    const QsPlugin* p = qs_plugin_find(plugin_id);
+    if (!p || !qs_plugin_is_bar_widget(*p)) return;
+    if (!qs_plugin_shown(plugin_id)) qs_plugin_set_shown(plugin_id, true);
+    for (int z = 0; z < 4; ++z) {
+        auto v = cfg.csv_split(plugin_bar_zone_str(z));
+        auto it = std::find(v.begin(), v.end(), plugin_id);
+        if (it == v.end()) continue;
+        if (z == zone) return;
+        v.erase(it);
+        plugin_bar_zone_str(z) = cfg.csv_join(v);
+    }
+    auto v = cfg.csv_split(plugin_bar_zone_str(zone));
+    if (std::find(v.begin(), v.end(), plugin_id) == v.end())
+        v.push_back(plugin_id);
+    plugin_bar_zone_str(zone) = cfg.csv_join(v);
+}
+
+void qs_plugin_row_move(const std::string& plugin_id, int delta) {
+    int idx = -1;
+    int z   = qs_plugin_row_zone_of(plugin_id, &idx);
+    if (z < 0) return;
+    auto v = cfg.csv_split(plugin_bar_zone_str(z));
+    // Recompute idx against the raw list (may include stale ids).
+    auto it = std::find(v.begin(), v.end(), plugin_id);
+    if (it == v.end()) return;
+    int i  = (int)(it - v.begin());
+    int to = i + delta;
+    if (to < 0 || to >= (int)v.size()) return;
+    std::swap(v[i], v[to]);
+    plugin_bar_zone_str(z) = cfg.csv_join(v);
+}
+
+void qs_plugin_bar_migrate() {
+    bool any_zone = !cfg.qs_plugin_bar_left.empty() ||
+                    !cfg.qs_plugin_bar_center.empty() ||
+                    !cfg.qs_plugin_bar_right.empty() ||
+                    !cfg.qs_plugin_bar_more.empty();
+    if (!any_zone) {
+        // First run of 1.41: the old single CSV becomes left.
+        std::vector<std::string> left;
+        for (auto& id : qs_plugin_layout_ids()) {
+            const QsPlugin* p = qs_plugin_find(id);
+            if (p && qs_plugin_is_bar_widget(*p)) left.push_back(id);
+        }
+        cfg.qs_plugin_bar_left = cfg.csv_join(left);
+        return;
+    }
+    // Drop junk / duplicates / non-widgets; place shown widgets that
+    // have no zone onto left so a check is never a silent no-op.
+    std::vector<std::string> seen;
+    for (int z = 0; z < 4; ++z) {
+        auto raw = cfg.csv_split(plugin_bar_zone_str(z));
+        std::vector<std::string> clean;
+        for (auto& id : raw) {
+            const QsPlugin* p = qs_plugin_find(id);
+            if (!p || !qs_plugin_is_bar_widget(*p)) continue;
+            if (std::find(seen.begin(), seen.end(), id) != seen.end())
+                continue;
+            seen.push_back(id);
+            clean.push_back(id);
+            if (!qs_plugin_shown(id)) qs_plugin_set_shown(id, true);
+        }
+        plugin_bar_zone_str(z) = cfg.csv_join(clean);
+    }
+    auto left = cfg.csv_split(cfg.qs_plugin_bar_left);
+    for (auto& id : qs_plugin_layout_ids()) {
+        const QsPlugin* p = qs_plugin_find(id);
+        if (!p || !qs_plugin_is_bar_widget(*p)) continue;
+        if (std::find(seen.begin(), seen.end(), id) != seen.end()) continue;
+        left.push_back(id);
+        seen.push_back(id);
+    }
+    cfg.qs_plugin_bar_left = cfg.csv_join(left);
+}
+
+bool qs_plugin_bar_want() {
+    // Plugin row is the keep-alive host. It does not depend on the
+    // legacy qs_plugins flag (that checkbox is gone).
+    return cfg.quickshell_shutdown && cfg.qs_plugin_bar;
+}
+
 bool qs_plugin_shown(const std::string& plugin_id) {
     auto v = qs_plugin_layout_ids();
     return std::find(v.begin(), v.end(), plugin_id) != v.end();
@@ -238,6 +419,20 @@ void qs_plugin_set_shown(const std::string& plugin_id, bool on) {
     if (on && it == v.end()) v.push_back(plugin_id);
     if (!on && it != v.end()) v.erase(it);
     cfg.qs_plugin_layout = cfg.csv_join(v);
+    if (!on) {
+        for (int z = 0; z < 4; ++z) {
+            auto zv = cfg.csv_split(plugin_bar_zone_str(z));
+            auto zit = std::find(zv.begin(), zv.end(), plugin_id);
+            if (zit == zv.end()) continue;
+            zv.erase(zit);
+            plugin_bar_zone_str(z) = cfg.csv_join(zv);
+        }
+        return;
+    }
+    const QsPlugin* p = qs_plugin_find(plugin_id);
+    if (p && qs_plugin_is_bar_widget(*p) &&
+        qs_plugin_row_zone_of(plugin_id) < 0)
+        qs_plugin_row_set_zone(plugin_id, 0);
 }
 
 void qs_plugin_move(const std::string& plugin_id, int delta) {
@@ -252,15 +447,15 @@ void qs_plugin_move(const std::string& plugin_id, int delta) {
 }
 
 bool qs_plugins_want_runtime() {
-    if (!cfg.quickshell_shutdown || !cfg.qs_plugins) return false;
-    qs_plugins_scan();
-    for (auto& p : g_catalog) {
-        if (p.placeable && qs_plugin_shown(p.id)) return true;
-        if (p.service_only && qs_plugin_service_on(p.id)) return true;
-    }
-    return false;
+    if (!cfg.quickshell_shutdown) return false;
+    // Plugin row is the keep-alive switch: sidecar stays up (and the
+    // strip is shown) even with zero plugins checked.
+    if (cfg.qs_plugin_bar) return true;
+    // Chip path: only while a summoned plugin session is live.
+    return g_lazy_hold;
 }
 bool qs_plugins_running() { return g_pid > 0; }
+bool qs_plugins_lazy_hold() { return g_lazy_hold && !cfg.qs_plugin_bar; }
 
 void qs_plugins_sync_modules(Bar& bar) {
     g_bar = &bar;
@@ -272,18 +467,251 @@ static bool null_bar_installed() {
                   R_OK) == 0;
 }
 
+static bool plugin_bar_installed() {
+    return access((plugins_dir() + "/mattbar.plugin-bar/manifest.json").c_str(),
+                  R_OK) == 0;
+}
+
+static std::string dirname_of(const std::string& p) {
+    auto sl = p.rfind('/');
+    return sl == std::string::npos ? std::string(".") : p.substr(0, sl);
+}
+
+static bool copy_plugin_file(const std::string& src_dir, const std::string& dst_dir,
+                             const char* name) {
+    std::string body = slurp(src_dir + "/" + name);
+    if (body.empty()) return false;
+    return write_file(dst_dir + "/" + name, body);
+}
+
+// Drop plugin-bar files into ~/.config/omarchy/plugins if the user enabled
+// the row but hasn't re-run install.sh since 1.40. Without these the
+// sidecar stays on null-bar and the strip never appears.
+static bool ensure_plugin_bar_installed() {
+    if (plugin_bar_installed()) return true;
+    std::string exe;
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n > 0) {
+        buf[n] = 0;
+        exe = buf;
+    }
+    std::string exe_dir = exe.empty() ? std::string() : dirname_of(exe);
+    std::vector<std::string> cands;
+    if (!exe_dir.empty()) {
+        cands.push_back(exe_dir + "/contrib/omarchy-plugin-bar");
+        cands.push_back(dirname_of(exe_dir) + "/contrib/omarchy-plugin-bar");
+        cands.push_back(exe_dir + "/../contrib/omarchy-plugin-bar");
+        cands.push_back(dirname_of(dirname_of(exe_dir)) +
+                        "/contrib/omarchy-plugin-bar");
+    }
+    cands.push_back("/usr/local/share/mattbar/omarchy-plugin-bar");
+    cands.push_back("/usr/share/mattbar/omarchy-plugin-bar");
+    cands.push_back(home_dir() + "/.local/share/mattbar/omarchy-plugin-bar");
+    std::string src;
+    for (auto& c : cands) {
+        if (access((c + "/manifest.json").c_str(), R_OK) == 0 &&
+            access((c + "/Bar.qml").c_str(), R_OK) == 0) {
+            src = c;
+            break;
+        }
+    }
+    if (src.empty()) return false;
+    std::string dst = plugins_dir() + "/mattbar.plugin-bar";
+    mkdir_parents(dst + "/manifest.json");
+    if (!copy_plugin_file(src, dst, "manifest.json") ||
+        !copy_plugin_file(src, dst, "Bar.qml"))
+        return false;
+    copy_plugin_file(src, dst, "README.md");
+    fprintf(stderr,
+            "mattbar: qs-plugins: installed mattbar.plugin-bar from %s\n",
+            src.c_str());
+    return plugin_bar_installed();
+}
+
+static std::string json_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (char c : s) {
+        if (c == '"' || c == '\\') o += '\\';
+        if (c == '\n' || c == '\r') continue;
+        o += c;
+    }
+    return o;
+}
+
+static std::string plugin_bar_state_path() {
+    const char* rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt || !*rt || rt[0] != '/') return {};
+    return std::string(rt) + "/mattbar.plugin-bar";
+}
+static std::string plugin_bar_hover_path() {
+    const char* rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt || !*rt || rt[0] != '/') return {};
+    return std::string(rt) + "/mattbar.plugin-bar-hover";
+}
+
+static bool write_atomic(const std::string& path, const std::string& body) {
+    if (path.empty()) return false;
+    std::string tmp = path + ".tmp";
+    if (!write_file(tmp, body)) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    chmod(path.c_str(), S_IRUSR | S_IWUSR);
+    return true;
+}
+
+static int  g_hover_ifd = -1;
+static int  g_hover_wd  = -1;
+static bool g_hover_on  = false;
+
+static void read_hover_and_apply() {
+    if (!g_bar) return;
+    std::string t = trim(slurp(plugin_bar_hover_path()));
+    bool on = t == "1" || t == "on" || t == "true";
+    if (on == g_hover_on) return;
+    g_hover_on = on;
+    g_bar->set_plugin_row_hover(on);
+}
+
+void qs_plugin_bar_publish(Bar& bar) {
+    g_bar = &bar;
+    std::string path = plugin_bar_state_path();
+    if (path.empty()) return;
+    if (!qs_plugin_bar_want()) {
+        unlink(path.c_str());
+        unlink(plugin_bar_hover_path().c_str());
+        if (g_hover_on) {
+            g_hover_on = false;
+            bar.set_plugin_row_hover(false);
+        }
+        return;
+    }
+    char buf[512];
+    snprintf(buf, sizeof buf,
+             "on=1\nexpanded=%d\npinned=%d\nposition=%s\noffset=%d\n"
+             "height=%d\nfont=%s\nfg=%.3f,%.3f,%.3f,%.3f\n"
+             "bg=%.3f,%.3f,%.3f,%.3f\nurgent=%.3f,%.3f,%.3f,%.3f\n",
+             bar.expanded() ? 1 : 0, bar.pinned() ? 1 : 0,
+             cfg.position.c_str(), cfg_thickness(),
+             cfg.qs_plugin_bar_height, cfg.font.c_str(),
+             cfg.c_fg.r, cfg.c_fg.g, cfg.c_fg.b, cfg.c_fg.a,
+             cfg.c_bg.r, cfg.c_bg.g, cfg.c_bg.b, cfg.c_bg.a,
+             cfg.c_urgent.r, cfg.c_urgent.g, cfg.c_urgent.b, cfg.c_urgent.a);
+    write_atomic(path, buf);
+}
+
+void qs_plugin_bar_watch(Bar& bar) {
+    g_bar = &bar;
+    std::string hover = plugin_bar_hover_path();
+    if (hover.empty()) return;
+    // Seed the file so we can watch its inode instead of the whole
+    // runtime dir (Wayland/pipewire traffic would otherwise wake us).
+    if (access(hover.c_str(), F_OK) != 0) write_atomic(hover, "0\n");
+    if (g_hover_ifd < 0) {
+        g_hover_ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (g_hover_ifd < 0) return;
+        bar.add_fd(g_hover_ifd, [](uint32_t) {
+            char buf[4096];
+            ssize_t n;
+            bool gone = false;
+            while ((n = read(g_hover_ifd, buf, sizeof buf)) > 0) {
+                for (ssize_t off = 0; off < n;) {
+                    auto* ev = reinterpret_cast<inotify_event*>(buf + off);
+                    if (ev->mask & (IN_DELETE_SELF | IN_MOVE_SELF))
+                        gone = true;
+                    off += sizeof(inotify_event) + ev->len;
+                }
+            }
+            if (gone) {
+                // Atomic rewrite (tmp + rename) replaces the inode.
+                // Do not clobber the new contents or drop the hover
+                // hold — the replacement is often a "1" from QML.
+                g_hover_wd = -1;
+                std::string p = plugin_bar_hover_path();
+                if (!p.empty() && g_hover_ifd >= 0) {
+                    if (access(p.c_str(), F_OK) != 0)
+                        write_atomic(p, "0\n");
+                    g_hover_wd = inotify_add_watch(
+                        g_hover_ifd, p.c_str(),
+                        IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE_SELF |
+                            IN_MOVE_SELF);
+                }
+                read_hover_and_apply();
+                return;
+            }
+            read_hover_and_apply();
+        }, "plugin-bar-hover");
+    }
+    if (g_hover_wd < 0 && g_hover_ifd >= 0)
+        g_hover_wd = inotify_add_watch(g_hover_ifd, hover.c_str(),
+                                       IN_MODIFY | IN_CLOSE_WRITE |
+                                           IN_DELETE_SELF | IN_MOVE_SELF);
+}
+
+void qs_plugin_bar_clear() {
+    if (g_hover_on && g_bar) g_bar->set_plugin_row_hover(false);
+    g_hover_on = false;
+    g_hover_wd = -1;
+    unlink(plugin_bar_state_path().c_str());
+    unlink(plugin_bar_hover_path().c_str());
+}
+
 static std::string sidecar_json() {
+    const bool row = qs_plugin_bar_want() && plugin_bar_installed();
+    const char* bar_id = row ? "mattbar.plugin-bar" : "mattbar.null-bar";
+    std::string pos = cfg.position;
+    if (pos != "top" && pos != "bottom" && pos != "left" && pos != "right")
+        pos = "top";
     std::string o = "{\n  \"version\": 1,\n  \"bar\": {\n"
-                    "    \"id\": \"mattbar.null-bar\",\n"
-                    "    \"position\": \"top\",\n"
-                    "    \"transparent\": true,\n"
-                    "    \"layout\": { \"left\": [], \"center\": [], "
-                    "\"right\": [] }\n  },\n  \"plugins\": [";
+                    "    \"id\": \"";
+    o += bar_id;
+    o += "\",\n    \"position\": \"";
+    o += pos;
+    o += "\",\n    \"transparent\": true,\n"
+         "    \"overlay\": true,\n"
+         "    \"layout\": {";
+    auto emit_ids = [&](const char* key, const std::vector<std::string>& ids) {
+        o += " \"";
+        o += key;
+        o += "\": [";
+        bool first_w = true;
+        if (row) {
+            for (auto& id : ids) {
+                if (!first_w) o += ", ";
+                first_w = false;
+                o += "{ \"id\": \"" + json_escape(id) + "\" }";
+            }
+        }
+        o += "]";
+    };
+    emit_ids("left", qs_plugin_row_ids(0));
+    o += ",";
+    emit_ids("center", qs_plugin_row_ids(1));
+    o += ",";
+    emit_ids("right", qs_plugin_row_ids(2));
+    o += " },\n    \"more\": [";
+    {
+        bool first_w = true;
+        if (row) {
+            for (auto& id : qs_plugin_row_ids(3)) {
+                if (!first_w) o += ", ";
+                first_w = false;
+                o += "{ \"id\": \"" + json_escape(id) + "\" }";
+            }
+        }
+    }
+    o += "]\n  },\n  \"plugins\": [";
     bool first = true;
     auto add   = [&](const std::string& id) {
         if (!first) o += ",";
         first = false;
-        o += "\n    { \"id\": \"" + id + "\" }";
+        o += "\n    { \"id\": \"" + json_escape(id) + "\" }";
     };
     for (auto& p : g_catalog) {
         if (p.placeable && qs_plugin_shown(p.id)) add(p.id);
@@ -311,7 +739,15 @@ static void restore_user_json() {
 }
 
 static bool install_sidecar_json() {
-    if (!null_bar_installed()) {
+    const bool row = qs_plugin_bar_want();
+    if (row && !plugin_bar_installed() && !ensure_plugin_bar_installed()) {
+        fprintf(stderr,
+                "mattbar: qs-plugins: mattbar.plugin-bar is not installed "
+                "under ~/.config/omarchy/plugins; plugin row disabled this "
+                "run (sidecar will use null-bar). Re-run install.sh or copy "
+                "contrib/omarchy-plugin-bar there.\n");
+    }
+    if (!(row && plugin_bar_installed()) && !null_bar_installed()) {
         fprintf(stderr,
                 "mattbar: qs-plugins: mattbar.null-bar is not installed "
                 "under ~/.config/omarchy/plugins; cannot start sidecar\n");
@@ -338,21 +774,28 @@ static bool install_sidecar_json() {
     return true;
 }
 
+// SIGTERM, then SIGKILL if it is still a child. Never usleep/waitpid(0)
+// on the event loop — a wedged Quickshell used to freeze the bar for 1s
+// on every sidecar restart. A leftover zombie is remembered in g_old_pid
+// and reaped from qs_plugins_reap().
+static pid_t g_old_pid = -1;
+
+static bool reap_one(pid_t pid) {
+    if (pid <= 0) return true;
+    int st = 0;
+    pid_t w = waitpid(pid, &st, WNOHANG);
+    return w == pid || (w < 0 && errno == ECHILD);
+}
+
 static void kill_pid() {
     if (g_pid <= 0) return;
-    kill(g_pid, SIGTERM);
-    for (int i = 0; i < 20; ++i) {
-        int   st  = 0;
-        pid_t w = waitpid(g_pid, &st, WNOHANG);
-        if (w == g_pid || (w < 0 && errno == ECHILD)) {
-            g_pid = -1;
-            return;
-        }
-        usleep(50000);
-    }
-    kill(g_pid, SIGKILL);
-    waitpid(g_pid, nullptr, 0);
+    pid_t pid = g_pid;
     g_pid = -1;
+    kill(pid, SIGTERM);
+    if (reap_one(pid)) return;
+    kill(pid, SIGKILL);
+    if (reap_one(pid)) return;
+    g_old_pid = pid;
 }
 
 static void kill_any_qs() {
@@ -383,17 +826,77 @@ static bool spawn_sidecar() {
         _exit(127);
     }
     g_pid = pid;
-    fprintf(stderr, "mattbar: qs-plugins: sidecar started pid=%d\n", (int)pid);
+    fprintf(stderr,
+            "mattbar: qs-plugins: sidecar started pid=%d bar=%s\n",
+            (int)pid,
+            (qs_plugin_bar_want() && plugin_bar_installed())
+                ? "mattbar.plugin-bar"
+                : "mattbar.null-bar");
     return true;
 }
 
+static bool lazy_plugin_layer_up() {
+    int st = 0;
+    std::string j = cmd_output("hyprctl -j layers 2>/dev/null", &st);
+    if (st != 0 || j.empty()) return false;
+    // Any layer-shell namespace that isn't MattBar / our plugin-row /
+    // compositor chrome is treated as a live plugin overlay.
+    size_t p = 0;
+    while ((p = j.find("\"namespace\"", p)) != std::string::npos) {
+        size_t q = j.find('"', p + 11);
+        if (q == std::string::npos) break;
+        size_t r = j.find('"', q + 1);
+        if (r == std::string::npos) break;
+        std::string ns = j.substr(q + 1, r - q - 1);
+        p = r + 1;
+        if (ns.empty() || ns.rfind("mattbar", 0) == 0) continue;
+        if (ns.rfind("hypr", 0) == 0 || ns == "wallpaper" || ns == "background")
+            continue;
+        return true;
+    }
+    return false;
+}
+
+static void lazy_idle_tick() {
+    if (cfg.qs_plugin_bar || !g_lazy_hold || g_pid <= 0) return;
+    uint64_t now = now_ms();
+    if (now < g_lazy_at_ms + 1500) return; // let the overlay map
+    bool up = lazy_plugin_layer_up();
+    if (up) {
+        g_lazy_saw_layer = true;
+        return;
+    }
+    if (!g_lazy_saw_layer) {
+        // Overlay never appeared (summon failed). Give it ~8s then drop.
+        if (now > g_lazy_at_ms + 8000) {
+            fprintf(stderr, "mattbar: qs-plugins: lazy session idle (no overlay)\n");
+            g_lazy_hold = false;
+            if (g_bar) qs_plugins_apply(*g_bar);
+        }
+        return;
+    }
+    // Overlay was up and is gone — plugin no longer in use.
+    fprintf(stderr, "mattbar: qs-plugins: plugin overlay gone; stopping sidecar\n");
+    g_lazy_hold = false;
+    g_lazy_saw_layer = false;
+    if (g_bar) qs_plugins_apply(*g_bar);
+}
+
 void qs_plugins_reap() {
+    if (g_old_pid > 0 && reap_one(g_old_pid))
+        g_old_pid = -1;
+    lazy_idle_tick();
     if (g_pid <= 0) return;
     int   st = 0;
     pid_t w  = waitpid(g_pid, &st, WNOHANG);
     if (w == 0) return;
     fprintf(stderr, "mattbar: qs-plugins: sidecar pid %d exited\n", (int)g_pid);
     g_pid = -1;
+    // Sidecar death must drop the hover hold or MattBar stays pinned open.
+    if (g_hover_on && g_bar) {
+        g_hover_on = false;
+        g_bar->set_plugin_row_hover(false);
+    }
     if (!qs_plugins_want_runtime()) return;
     uint64_t now = now_ms();
     if (now < g_restart_ms) return;
@@ -410,15 +913,25 @@ void qs_plugins_reap() {
 void qs_plugins_stop() {
     kill_any_qs();
     restore_user_json();
+    qs_plugin_bar_clear();
     g_fail_streak = 0;
 }
 
 void qs_plugins_shutdown() {
     plugins_close();
+    g_lazy_hold = false;
+    g_lazy_saw_layer = false;
+    bool dirty = false;
     if (cfg.qs_plugins) {
         cfg.qs_plugins = false;
-        cfg.save();
+        dirty = true;
     }
+    // Stop means kill QS. Plugin row is what holds it up, so it goes off.
+    if (cfg.qs_plugin_bar) {
+        cfg.qs_plugin_bar = false;
+        dirty = true;
+    }
+    if (dirty) cfg.save();
     if (g_pid > 0 || g_json_ours ||
         access(marker_path().c_str(), F_OK) == 0) {
         fprintf(stderr, "mattbar: qs-plugins: user stopped sidecar\n");
@@ -432,6 +945,15 @@ void qs_plugins_shutdown() {
 
 void qs_plugins_apply(Bar& bar) {
     g_bar = &bar;
+    // Plugin row is keep-alive. Mirror that onto the hidden qs_plugins
+    // flag so older tools/docs reading the conf still make sense.
+    if (cfg.qs_plugin_bar && !cfg.qs_plugins) {
+        cfg.qs_plugins = true;
+        cfg.save();
+    } else if (!cfg.qs_plugin_bar && !g_lazy_hold && cfg.qs_plugins) {
+        cfg.qs_plugins = false;
+        cfg.save();
+    }
     qs_plugins_sync_modules(bar);
     // Crash leftover: a previous run swapped shell.json and died.
     if (access(marker_path().c_str(), F_OK) == 0 && !g_json_ours &&
@@ -442,9 +964,13 @@ void qs_plugins_apply(Bar& bar) {
             fprintf(stderr, "mattbar: qs-plugins: stopping sidecar\n");
             qs_plugins_stop();
         }
+        qs_plugin_bar_publish(bar);
         return;
     }
     if (!install_sidecar_json()) return;
+    // State file first so FileView sees it when Bar.qml loads.
+    qs_plugin_bar_watch(bar);
+    qs_plugin_bar_publish(bar);
     if (g_pid > 0) {
         // Already ours; rewrite of shell.json is picked up if qs watches
         // the file. Omarchy disables the file watcher, so restart.
@@ -499,9 +1025,12 @@ void qs_plugins_activate(const std::string& plugin_id, const std::string& method
         qs_plugin_set_shown(plugin_id, true);
         dirty = true;
     }
-    if (!cfg.qs_plugins) {
-        cfg.qs_plugins = true;
-        dirty          = true;
+    // Chip summon is a lazy session. Do not persist keep-alive
+    // (that is what Plugin row is for).
+    if (!cfg.qs_plugin_bar) {
+        g_lazy_hold  = true;
+        g_lazy_at_ms = now_ms();
+        g_lazy_saw_layer = false;
     }
     if (dirty) {
         cfg.save();
@@ -510,6 +1039,7 @@ void qs_plugins_activate(const std::string& plugin_id, const std::string& method
     // Don't restart a live sidecar just to summon — that drops in-progress
     // overlay state (Neon Cadet's current ball, etc.).
     if (g_pid <= 0 && g_bar) qs_plugins_apply(*g_bar);
+    if (g_bar) g_bar->update_tick();
 
     std::string name = p->name.empty() ? plugin_id : p->name;
     std::string verb = method.empty() ? "summon" : method;
@@ -642,7 +1172,7 @@ private:
         const double rh  = row_h();
         setfont(cr);
         double maxlab = 120;
-        auto   ids    = qs_plugin_layout_ids();
+        auto   ids    = qs_plugin_chip_ids();
         const char* stop_lab = "Stop Quickshell";
         auto widen = [&](const std::string& s) {
             cairo_text_extents_t e;
@@ -717,7 +1247,9 @@ private:
         measure(cr);
         if (rows_.empty()) {
             cairo_set_source_rgba(cr, cfg.c_dim.r, cfg.c_dim.g, cfg.c_dim.b, 1);
-            const char* msg = cfg.qs_plugins
+            const char* msg = cfg.qs_plugin_bar && !qs_plugin_row_ids().empty()
+                                  ? "Bar-widgets are on the plugin row"
+                                  : cfg.qs_plugins
                                   ? "Check plugins under Shell"
                                   : "Enable Quickshell plugins on Shell";
             cairo_text_extents_t e;
@@ -772,8 +1304,14 @@ private:
                 std::string id = row->id;
                 close_now();
                 if (id.empty()) qs_plugins_shutdown();
-                else if (b == BTN_RIGHT) qs_plugins_ipc(id, "hide", "");
-                else qs_plugins_activate(id, "summon", "{}");
+                else if (b == BTN_RIGHT) {
+                    qs_plugins_ipc(id, "hide", "");
+                    if (!cfg.qs_plugin_bar) {
+                        g_lazy_hold = false;
+                        g_lazy_saw_layer = false;
+                        qs_plugins_stop();
+                    }
+                } else qs_plugins_activate(id, "summon", "{}");
             }
         };
         popup_.pmotion = [this](double, double) {

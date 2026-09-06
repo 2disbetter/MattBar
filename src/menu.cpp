@@ -501,6 +501,21 @@ private:
                 }
             if (!found) defs_order_.push_back(kv);
         }
+        // Style → Menu Bar → MattBar settings (same window as the tray
+        // gear). The user extension can override this id; skip if present.
+        bool have_mattbar = false;
+        for (auto& e : defs_order_)
+            if (e.first == "style.bar.mattbar") {
+                have_mattbar = true;
+                break;
+            }
+        if (!have_mattbar) {
+            MenuDef m;
+            m.icon   = "\uf013";
+            m.label  = "MattBar settings";
+            m.action = "mattbarctl settings";
+            defs_order_.push_back({"style.bar.mattbar", std::move(m)});
+        }
         for (auto& [k, v] : defs_order_) defs_[k] = v;
         apps_ = load_apps();
         for (auto& a : apps_) a.is_app = true;

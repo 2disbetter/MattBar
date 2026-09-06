@@ -1,0 +1,6 @@
+{
+  // Style → Menu Bar → MattBar settings.
+  // Copied into ~/.config/omarchy/extensions/omarchy-menu.jsonc by install.sh.
+  // Never edit /usr/share/omarchy/.
+  "style.bar.mattbar": {"icon":"","label":"MattBar settings","action":"mattbarctl settings"}
+}

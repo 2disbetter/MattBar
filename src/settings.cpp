@@ -613,20 +613,33 @@ void SettingsWindow::draw() {
         if (shell_tab_ == ShellPlugins) {
         section(y, "Quickshell plugins");
         y += 26;
-        checkbox(24, y, "Run user Quickshell plugins", &cfg.qs_plugins);
+        checkbox(24, y, "Plugin row (bar-widgets beside MattBar)",
+                 &cfg.qs_plugin_bar);
         y += 24;
-        y = hint(y, cfg.qs_plugins
-                        ? (qs_plugins_want_runtime()
-                               ? (qs_plugins_running()
-                                      ? "sidecar is up. Escape hides an overlay; "
-                                        "it stays in memory until you Stop"
-                                      : "on: starting a stripped Quickshell "
-                                        "for the plugins checked below")
-                               : "on, but idle: check a plugin below to "
-                                 "put it in the Plugins chip")
-                        : "off: Quickshell stays dead. Check plugins below "
-                          "to choose them; click one to start the sidecar");
-        y += 26;
+        y = hint(y, cfg.qs_plugin_bar
+                        ? "on: Quickshell stays running and the strip is "
+                          "shown even with no plugins checked. Bar-widgets "
+                          "live on the row (L/C/R/M); overlay/panel/menu "
+                          "stay on the Plugins chip. Hover the MattBar edge "
+                          "to reveal both."
+                        : "off: Quickshell stays dead until you open a "
+                          "plugin from the Plugins chip. It stops when that "
+                          "plugin is dismissed or you press Stop.");
+        y += 36;
+        if (cfg.qs_plugin_bar && qs_plugin_row_ids().empty()) {
+            y = hint(y, "no bar-widget plugins checked yet — the empty "
+                        "strip still appears so you can see the host");
+            y += 24;
+        }
+        if (cfg.qs_plugin_bar) {
+            stepper(y, "Plugin row height",
+                    std::to_string(cfg.qs_plugin_bar_height) + " px",
+                    [](int d) {
+                        cfg.qs_plugin_bar_height = std::clamp(
+                            cfg.qs_plugin_bar_height + d, 16, 64);
+                    });
+            y += 26;
+        }
         y = hint(y, "Stop: right-click the Plugins chip, Stop Quickshell in "
                     "the accordion, or the button below. The chip can live "
                     "in More like any other module");
@@ -657,7 +670,8 @@ void SettingsWindow::draw() {
                           sh->summon("mattbar.plugin-remove", "");
                   }) +
                   8;
-            if (cfg.qs_plugins || qs_plugins_running())
+            if (cfg.qs_plugin_bar || qs_plugins_running() ||
+                qs_plugins_lazy_hold())
                 text_btn(bx, y, "Stop sidecar", [] { qs_plugins_shutdown(); });
         }
         y += 30;
@@ -689,11 +703,54 @@ void SettingsWindow::draw() {
                     std::string id = p.id;
                     if (p.placeable) {
                         bool on = qs_plugin_shown(id);
-                        tickbox(24, y, p.name, on, [id, on, this] {
+                        std::string lab = p.name;
+                        if (qs_plugin_is_bar_widget(p) && cfg.qs_plugin_bar)
+                            lab += " · row";
+                        else if (qs_plugin_is_summonable(p) ||
+                                 !cfg.qs_plugin_bar)
+                            lab += " · chip";
+                        tickbox(24, y, lab, on, [id, on, this] {
                             qs_plugin_set_shown(id, !on);
                             apply();
                         });
-                        if (on) {
+                        if (on && cfg.qs_plugin_bar &&
+                            qs_plugin_is_bar_widget(p)) {
+                            int z = qs_plugin_row_zone_of(id);
+                            if (z < 0) z = 0;
+                            static const char* zl[] = {"L", "C", "R", "M"};
+                            for (int tz = 0; tz < 4; ++tz) {
+                                double bx = 198.0 + tz * 22.0;
+                                double bw = 20, bh = 17;
+                                if (tz == z) col(cr, cfg.c_accent, 1.0);
+                                else col(cr, cfg.c_ws_bg);
+                                cairo_rectangle(cr, bx, y - bh / 2, bw, bh);
+                                cairo_fill(cr);
+                                text(bx + (bw - text_w(zl[tz])) / 2.0, y,
+                                     zl[tz],
+                                     tz == z ? contrast_on(cfg.c_accent)
+                                             : cfg.c_dim);
+                                add_widget(bx, y - bh / 2, bw, bh,
+                                           [id, tz, this] {
+                                               qs_plugin_row_set_zone(id, tz);
+                                               apply();
+                                           },
+                                           nullptr);
+                            }
+                            auto zv = qs_plugin_row_ids(z);
+                            size_t idx = 0;
+                            for (; idx < zv.size(); ++idx)
+                                if (zv[idx] == id) break;
+                            if (idx > 0)
+                                small_button(292, y, "^", [id, this] {
+                                    qs_plugin_row_move(id, -1);
+                                    apply();
+                                });
+                            if (idx + 1 < zv.size())
+                                small_button(322, y, "v", [id, this] {
+                                    qs_plugin_row_move(id, +1);
+                                    apply();
+                                });
+                        } else if (on) {
                             auto order = qs_plugin_layout_ids();
                             size_t idx = 0;
                             for (; idx < order.size(); ++idx)

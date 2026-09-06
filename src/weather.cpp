@@ -488,13 +488,28 @@ private:
             host_.redraw();
             return;
         }
-        std::string q = field_.text;
-        for (char& c : q)
-            if (c == ' ') c = '+';
+        // Percent-encode so a quote / semicolon in the search box cannot
+        // break out of the single-quoted curl URL (AsyncCmd is sh -c).
+        auto url_encode = [](const std::string& s) {
+            std::string o;
+            o.reserve(s.size() * 3);
+            for (unsigned char c : s) {
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                    c == '.' || c == '~')
+                    o += char(c);
+                else {
+                    char b[4];
+                    snprintf(b, sizeof b, "%%%02X", c);
+                    o += b;
+                }
+            }
+            return o;
+        };
         std::string cmd =
             "curl -fsS --max-time 5 'https://geocoding-api.open-meteo.com/v1/"
             "search?name=" +
-            q + "&count=5&language=en&format=json'";
+            url_encode(field_.text) + "&count=5&language=en&format=json'";
         g_geo.run(*sh->bar(), cmd,
                   [this](const std::string& out, int st) {
                       sugg_.clear();

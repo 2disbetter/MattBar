@@ -63,6 +63,9 @@ void    more_close();
 bool    more_is_open();
 Module* make_omarchy_button();
 Module* make_update_button();
+// `omarchy-shell omarchy.system-update refresh|clear` (omarchy-update-status).
+void    update_refresh();
+void    update_clear();
 Module* make_temp();
 // Notification centre: bell + history popup (last cfg.history_max entries,
 // clear-all, per-app mute). Deliberately quiet — see cfg.bell_show_count.

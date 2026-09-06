@@ -20,7 +20,7 @@
 #   ./install.sh --null-bar      # hide Omarchy bar only; keep Quickshell
 #   ./install.sh --blur          # Hyprland blur on the bar layer
 #   ./install.sh --prefix DIR    # binary install prefix (default /usr/local)
-#   ./install.sh --uninstall     # remove session integration
+#   ./install.sh --uninstall     # same as ./uninstall.sh
 #   ./install.sh --help
 # =============================================================================
 
@@ -31,7 +31,6 @@ PREFIX=/usr/local
 DO_TAKEOVER=0
 DO_NULL_BAR=0
 DO_BLUR=0
-DO_UNINSTALL=0
 
 usage() {
   sed -n '2,26p' "$0" | sed 's/^# \?//'
@@ -43,7 +42,18 @@ while (($#)); do
   --takeover)  DO_TAKEOVER=1 ;;
   --null-bar)  DO_NULL_BAR=1 ;;
   --blur)      DO_BLUR=1 ;;
-  --uninstall) DO_UNINSTALL=1 ;;
+  --uninstall)
+    shift
+    extra=()
+    has_prefix=0
+    for a in "$@"; do
+      [[ $a == --prefix ]] && has_prefix=1
+    done
+    if ((has_prefix == 0)); then
+      extra=(--prefix "$PREFIX")
+    fi
+    exec bash "$ROOT/uninstall.sh" "${extra[@]}" "$@"
+    ;;
   --prefix)
     PREFIX=${2:?--prefix needs a path}
     shift
@@ -227,16 +237,16 @@ o.bind("ALT + XF86AudioLowerVolume", "Volume down precise",
 
 hl.unbind("XF86AudioMicMute")
 o.bind("XF86AudioMicMute", "Mute microphone",
-  no_osd .. "omarchy-audio-input-volume mute-toggle",
+  no_osd .. "omarchy-audio-input-mute",
   { locked = true })
 
 hl.unbind("XF86MonBrightnessUp")
 hl.unbind("XF86MonBrightnessDown")
 o.bind("XF86MonBrightnessUp", "Brightness up",
-  "omarchy-brightness +5% --no-osd",
+  "omarchy-brightness-display --no-osd +5%",
   { locked = true, repeating = true })
 o.bind("XF86MonBrightnessDown", "Brightness down",
-  "omarchy-brightness -5% --no-osd",
+  "omarchy-brightness-display --no-osd 5%-",
   { locked = true, repeating = true })
 EOF
 }
@@ -266,9 +276,13 @@ o.bind("SUPER + SHIFT + ALT + comma", "Open notification history",
 
 -- --- launcher / menus -----------------------------------------------------
 hl.unbind("SUPER + SPACE")
-o.bind("SUPER + SPACE", "Apps", mb .. " menu apps")
-hl.unbind("SUPER + SHIFT + SPACE")
-o.bind("SUPER + SHIFT + SPACE", "System menu", mb .. " menu system")
+o.bind("SUPER + SPACE", "Omarchy menu", mb .. " shell toggle omarchy.menu")
+hl.unbind("SUPER + ALT + SPACE")
+o.bind("SUPER + ALT + SPACE", "Apps menu",
+  mb .. " shell toggle omarchy.menu '{\"menu\":\"apps\"}'")
+hl.unbind("SUPER + ESCAPE")
+o.bind("SUPER + ESCAPE", "System menu",
+  mb .. " shell toggle omarchy.menu '{\"menu\":\"system\"}'")
 EOF
 }
 
@@ -289,6 +303,59 @@ unbind = , XF86MonBrightnessDown
 bindel = , XF86MonBrightnessUp, exec, brightnessctl set +5%
 bindel = , XF86MonBrightnessDown, exec, brightnessctl set 5%-
 EOF
+}
+
+# Style → Menu Bar → MattBar settings. User overlay only — never
+# /usr/share/omarchy/. JSONC, so we splice before the last `}`.
+install_menu_entry() {
+  local file=$REAL_HOME/.config/omarchy/extensions/omarchy-menu.jsonc
+  mkdir -p "$(dirname "$file")"
+  if [[ -f $file ]] && grep -Fq '"style.bar.mattbar"' "$file"; then
+    log "already present in $file"
+    return 0
+  fi
+  if [[ ! -f $file ]]; then
+    cat >"$file" <<'EOF'
+{
+  "style.bar.mattbar": {"icon":"","label":"MattBar settings","action":"mattbarctl settings"},
+}
+EOF
+    log "created $file"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+if '"style.bar.mattbar"' in t:
+    sys.exit(0)
+entry = '  "style.bar.mattbar": {"icon":"","label":"MattBar settings","action":"mattbarctl settings"},\n'
+idx = t.rfind("}")
+if idx < 0:
+    p.write_text("{\n" + entry + "}\n")
+    sys.exit(0)
+head = t[:idx]
+check = head.rstrip()
+while True:
+    nl = check.rfind("\n")
+    last = check[nl + 1 :] if nl >= 0 else check
+    s = last.strip()
+    if s == "" or s.startswith("//"):
+        check = check[:nl] if nl >= 0 else ""
+        continue
+    break
+tail = check.rstrip()
+need_comma = bool(tail) and not tail.endswith("{") and not tail.endswith(",")
+insert = (",\n" if need_comma else "") + "\n" + entry
+p.write_text(t[:idx] + insert + t[idx:])
+PY
+    log "updated $file"
+  else
+    printf '\n  "style.bar.mattbar": {"icon":"","label":"MattBar settings","action":"mattbarctl settings"},\n' >>"$file"
+    log "appended MattBar settings to $file"
+  fi
 }
 
 inject_shell_keys_require() {
@@ -323,28 +390,6 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-if ((DO_UNINSTALL)); then
-  log "removing session integration for $REAL_USER"
-  run_as_user systemctl --user disable --now mattbar.service 2>/dev/null || true
-  rm -f "$REAL_HOME/.config/systemd/user/mattbar.service"
-  run_as_user systemctl --user daemon-reload 2>/dev/null || true
-  rm -f "$REAL_HOME/.config/hypr/mattbar-shell-keys.lua"
-  rm -f "$REAL_HOME/.config/hypr/mattbar-media-keys.conf"
-  rm -rf "$REAL_HOME/.config/mattbar/shims"
-  rm -rf "$REAL_HOME/.config/omarchy/plugins/mattbar.null-bar"
-  CONF=$REAL_HOME/.config/mattbar/mattbar.conf
-  if [[ -f $CONF ]]; then
-    set_conf_key "$CONF" enable_osd false
-    set_conf_key "$CONF" enable_notifications false
-    set_conf_key "$CONF" notifications_takeover false
-    set_conf_key "$CONF" quickshell_shutdown false
-  fi
-  log "done. Optional: sudo rm -f $PREFIX/bin/mattbar $PREFIX/bin/mattbarctl"
-  log "Remove leftover require()/source lines in Hyprland config, then: hyprctl reload"
-  exit 0
-fi
-
-# ---------------------------------------------------------------------------
 log "installing for user $REAL_USER (home $REAL_HOME)"
 log "prefix: $PREFIX"
 
@@ -366,7 +411,7 @@ fi
 
 if ((need_copy)); then
   log "installing binary to $DEST_BIN"
-  if [[ -w ${PREFIX}/bin ]] || [[ $PREFIX == "$REAL_HOME"* ]]; then
+  if [[ -d ${PREFIX}/bin && -w ${PREFIX}/bin ]] || [[ $PREFIX == "$REAL_HOME"* ]]; then
     mkdir -p "$PREFIX/bin"
     install -m 755 "$SRC_BIN" "$DEST_BIN"
     ln -sfn mattbar "$PREFIX/bin/mattbarctl"
@@ -493,28 +538,47 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Always drop the null-bar plugin files when we have them. The qs_plugins
+# sidecar refuses to start without this directory present. Rewriting
+# shell.json (so a still-running Quickshell hides its own bar) stays
+# opt-in via --null-bar and is skipped during full takeover.
+if [[ -d $ROOT/contrib/omarchy-null-bar ]]; then
+  mkdir -p "$REAL_HOME/.config/omarchy/plugins"
+  rm -rf "$REAL_HOME/.config/omarchy/plugins/mattbar.null-bar"
+  cp -a "$ROOT/contrib/omarchy-null-bar" "$REAL_HOME/.config/omarchy/plugins/mattbar.null-bar"
+  log "null-bar plugin files -> $REAL_HOME/.config/omarchy/plugins/mattbar.null-bar"
+fi
+# Plugin row (mattbar.plugin-bar): files only. Sidecar selects it when
+# Settings → Plugin row is on; we never rewrite the user's bar.id.
+if [[ -d $ROOT/contrib/omarchy-plugin-bar ]]; then
+  mkdir -p "$REAL_HOME/.config/omarchy/plugins"
+  rm -rf "$REAL_HOME/.config/omarchy/plugins/mattbar.plugin-bar"
+  cp -a "$ROOT/contrib/omarchy-plugin-bar" "$REAL_HOME/.config/omarchy/plugins/mattbar.plugin-bar"
+  log "plugin-bar files -> $REAL_HOME/.config/omarchy/plugins/mattbar.plugin-bar"
+fi
+
 if ((DO_NULL_BAR)) && ((DO_TAKEOVER == 0)); then
   if command -v jq >/dev/null 2>&1 && [[ -d /usr/share/omarchy || -n ${OMARCHY_PATH:-} ]]; then
     OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
-    if [[ -d $ROOT/contrib/omarchy-null-bar ]]; then
-      mkdir -p "$REAL_HOME/.config/omarchy/plugins"
-      rm -rf "$REAL_HOME/.config/omarchy/plugins/mattbar.null-bar"
-      cp -a "$ROOT/contrib/omarchy-null-bar" "$REAL_HOME/.config/omarchy/plugins/mattbar.null-bar"
+    if [[ -d $REAL_HOME/.config/omarchy/plugins/mattbar.null-bar ]]; then
       SHELL_JSON=$REAL_HOME/.config/omarchy/shell.json
       [[ -f $SHELL_JSON ]] || cp "$OMARCHY_PATH/config/omarchy/shell.json" "$SHELL_JSON"
       backup_once "$SHELL_JSON"
       tmp=$(mktemp)
       jq '.bar.id = "mattbar.null-bar"' "$SHELL_JSON" >"$tmp"
       mv "$tmp" "$SHELL_JSON"
-      log "null-bar plugin enabled"
+      log "null-bar plugin enabled in shell.json"
       command -v omarchy-restart-shell >/dev/null && omarchy-restart-shell || true
     else
       warn "--null-bar needs the full release (contrib/omarchy-null-bar)"
     fi
   else
-    warn "skipping --null-bar (need jq + Omarchy)"
+    warn "skipping --null-bar shell.json rewrite (need jq + Omarchy)"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+install_menu_entry
 
 # ---------------------------------------------------------------------------
 if command -v hyprctl >/dev/null 2>&1; then
@@ -543,7 +607,8 @@ Update later:
   and run ./install.sh again.
 
 Uninstall:
-  ./install.sh --uninstall
+  ./uninstall.sh
+  # or: ./install.sh --uninstall
 EOF
 
 if ((DO_TAKEOVER)); then

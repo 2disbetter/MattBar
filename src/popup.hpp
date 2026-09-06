@@ -91,6 +91,7 @@ struct PopupWin {
     // 0 = none (default, same as before). 1 = exclusive. 2 = on_demand
     // (falls back to exclusive if layer-shell < v4).
     uint32_t kb_mode = 0;
+    uint32_t layer = ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
     // No anchors: compositor centres the surface (command menu, lock
     // preview, etc.).
     bool centered = false;
@@ -157,8 +158,7 @@ struct PopupWin {
         }
         surf = wl_compositor_create_surface(bar->compositor());
         ls   = zwlr_layer_shell_v1_get_layer_surface(
-            bar->layer_shell(), surf, out,
-            ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, ns);
+            bar->layer_shell(), surf, out, layer, ns);
         static const zwlr_layer_surface_v1_listener lst = {
             .configure = on_configure,
             .closed    = on_closed,

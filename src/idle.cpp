@@ -223,15 +223,12 @@ void stop_screensaver() {
     saver_on = false;
 }
 
+// Formerly two blocking popens + usleep(150ms) on the lock path.
+// The detached script already SIGTERM, sleeps 0.2s, then SIGKILL — same
+// sequence, off the event loop. Window-addr bookkeeping is reset here so
+// saver_up() does not think the old surface is still mapped.
 void stop_screensaver_now() {
-    cmd_output(std::string("pkill -x omarchy-screensaver >/dev/null 2>&1 || true; "
-                           "pkill -x ttfx >/dev/null 2>&1 || true; ") +
-               kCloseSaverWin);
-    usleep(150000);
-    cmd_output(std::string("pkill -KILL -x ttfx >/dev/null 2>&1 || true; "
-                           "pkill -KILL -x omarchy-screensaver >/dev/null 2>&1 || true; ") +
-               kCloseSaverWin);
-    saver_on = false;
+    stop_screensaver();
     saver_reset_windows();
 }
 

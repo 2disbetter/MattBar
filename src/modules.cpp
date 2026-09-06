@@ -431,6 +431,7 @@ public:
         if (sock2_fd_ >= 0) close(sock2_fd_);
         if (spawn_fd_ >= 0) close(spawn_fd_);
         if (init_fd_ >= 0) close(init_fd_);
+        dismiss_.destroy();
     }
 
     void init(Bar& bar) override {
@@ -552,13 +553,7 @@ public:
             }, "agents-deferred-init");
         }
         bar.set_click_observer([this](Module* m) {
-            // The popup lives on a special workspace: while it is up,
-            // outside clicks land on the desktop layer (no fallthrough)
-            // and never change focus, so the focus-based dismissal can't
-            // see them. Interaction with the BAR is visible to us though
-            // — any click that isn't on this module hides the dropdown.
             if (m == static_cast<Module*>(this)) return;
-            sync_shown();
             if (shown_ && on_special_) {
                 DBG("agents: bar interaction elsewhere; hiding the popup");
                 show(false);
@@ -583,6 +578,10 @@ public:
                 if (!hdir_.empty()) preinstall_rules();
                 sync_shown();
                 if (term_open_ && on_special_ && shown_) place_popup();
+            }
+            if (shown_ && on_special_) {
+                evict_strays();
+                apply_dismiss_hole();
             }
         }
     }
@@ -780,7 +779,122 @@ private:
         }
         return false;
     }
-    void sync_shown() { shown_ = special_is_shown(); }
+    // Visible = the agent window is on a regular workspace. The special
+    // is only a holding area while hidden; we never overlay it, because
+    // togglespecialworkspace would swallow every other floater that
+    // mapped there (file choosers, browsers, …).
+    void sync_shown() {
+        if (!term_open_ || term_addr_.empty()) {
+            shown_ = false;
+            return;
+        }
+        std::string c = client_chunk();
+        if (c.empty()) return; // keep last bookkeeping if hypr json lags
+        shown_ = c.find("\"name\": \"special:mbagent\"") == std::string::npos;
+    }
+    static bool is_dialog_class(const std::string& cls) {
+        if (cls.empty()) return false;
+        if (cls.find("xdg-desktop-portal") != std::string::npos) return true;
+        if (cls.find("FileChooser") != std::string::npos) return true;
+        return cls == "zenity" || cls == "kdialog" ||
+               cls == "org.freedesktop.impl.portal.desktop.gtk" ||
+               cls == "org.freedesktop.impl.portal.desktop.gnome" ||
+               cls == "org.freedesktop.impl.portal.desktop.kde";
+    }
+    static bool is_dialog_title(const std::string& title) {
+        auto has = [&](const char* s) {
+            return title.find(s) != std::string::npos;
+        };
+        return has("Open File") || has("Save File") || has("Save As") ||
+               has("Open Folder") || has("File Chooser") || has("Open Files") ||
+               has("Save As…") || has("Save as");
+    }
+    bool move_term(const std::string& dest, bool silent) {
+        if (hdir_.empty() || term_addr_.empty()) return false;
+        const std::string sel = term_sel();
+        const char* dsp = silent ? "movetoworkspacesilent" : "movetoworkspace";
+        std::string legacy =
+            std::string("dispatch ") + dsp + " " + dest + "," + sel;
+        std::string lua =
+            "dispatch hl.dsp.window.move({ window = \"" + sel +
+            "\", workspace = \"" + dest + "\", follow = false })";
+        return hypr_dispatch2(hdir_, legacy, lua);
+    }
+    void close_dismiss_catcher() { dismiss_.destroy(); }
+    void apply_dismiss_hole() {
+        if (!dismiss_.surf || !bar_ || !bar_->compositor()) return;
+        int W = dismiss_.w, H = dismiss_.h;
+        if (W <= 0 || H <= 0) return;
+        int hx = 0, hy = 0, hw = 0, hh = 0;
+        std::string c = client_chunk();
+        if (!c.empty()) {
+            std::string at = json_field(c, "at"), sz = json_field(c, "size");
+            int ax = 0, ay = 0, aw = 0, ah = 0;
+            if (sscanf(at.c_str(), "[%d ,%d]", &ax, &ay) == 2 &&
+                sscanf(sz.c_str(), "[%d ,%d]", &aw, &ah) == 2 &&
+                aw > 0 && ah > 0) {
+                hx = ax;
+                hy = ay;
+                hw = aw;
+                hh = ah;
+            }
+        }
+        if (hw <= 0 || hh <= 0) {
+            PopupPx g = popup_px();
+            hx        = g.x;
+            hy        = g.y;
+            hw        = g.w;
+            hh        = g.h;
+        }
+        if (hx < 0) hx = 0;
+        if (hy < 0) hy = 0;
+        if (hx + hw > W) hw = W - hx;
+        if (hy + hh > H) hh = H - hy;
+        if (hw < 1) hw = 1;
+        if (hh < 1) hh = 1;
+        wl_region* r = wl_compositor_create_region(bar_->compositor());
+        if (!r) return;
+        if (hy > 0) wl_region_add(r, 0, 0, W, hy);
+        if (hy + hh < H) wl_region_add(r, 0, hy + hh, W, H - (hy + hh));
+        if (hx > 0) wl_region_add(r, 0, hy, hx, hh);
+        if (hx + hw < W) wl_region_add(r, hx + hw, hy, W - (hx + hw), hh);
+        wl_surface_set_input_region(dismiss_.surf, r);
+        wl_region_destroy(r);
+        wl_surface_commit(dismiss_.surf);
+    }
+    void catcher_maybe_hide(bool from_click) {
+        if (!shown_ || !on_special_) return;
+        if (now_ms() < suppress_dismiss_until_) return;
+        const uint64_t since = now_ms() - reveal_ms_;
+        if (!popup_focused_) {
+            foreign_seen_ = true;
+            if (!from_click) return;
+            if (since <= 400) return;
+        }
+        DBG("agents: dismiss catcher (%s); hiding",
+            from_click ? "click" : "mouse-out");
+        show(false);
+    }
+    void open_dismiss_catcher() {
+        if (!bar_) return;
+        dismiss_.kb_mode  = 0;
+        dismiss_.layer    = ZWLR_LAYER_SHELL_V1_LAYER_TOP;
+        dismiss_.centered = false;
+        dismiss_.paint    = [](cairo_t*) {};
+        dismiss_.click    = [this](double, double, int) {
+            catcher_maybe_hide(true);
+        };
+        dismiss_.pmotion = [this](double, double) { catcher_maybe_hide(false); };
+        dismiss_.on_configured = [this] { apply_dismiss_hole(); };
+        wl_output* out = bar_->input_output();
+        if (!out) out = bar_->focused_output();
+        if (!out) out = bar_->primary_output();
+        uint32_t a = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                     ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                     ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+        dismiss_.ensure(*bar_, a, 0, 0, 0, 0, "mattbar-dismiss", 0, 0, out);
+    }
     // Hyprland 0.56 Lua `window.resize`/`window.move` take pixel coords.
     // Percent sizes in `resizewindowpixel` are a Lua syntax error there
     // and silently leave the default 800x600 float.
@@ -981,11 +1095,16 @@ private:
         // succeeds. If the rule takes, every popup window gets
         // float/size/move compositor-side AT MAP TIME — no per-window
         // dispatch games at all.
+        // Do NOT pin this class to special:mbagent. Show/hide moves the
+        // window by address onto the current workspace and back; a
+        // workspace windowrule would yank it back onto the special and
+        // take file-chooser transients with it.
         const std::string lua =
             "dispatch (function() hl.window_rule({ enabled = true, "
             "match = { class = \"" + cls + "\" }, float = true, size = "
             "\"" + popup_size() + "\", move = \"" + popup_move() +
-            "\" }) return hl.dsp.exec_cmd(\"true\") end)()";
+            "\", group = \"barred\" }) "
+            "return hl.dsp.exec_cmd(\"true\") end)()";
         std::string r1 = hypr_request(hdir_, lua);
         std::string r2 = hypr_request(
             hdir_, "keyword windowrulev2 float,class:^(" + cls + ")$");
@@ -995,10 +1114,12 @@ private:
         std::string r4 = hypr_request(
             hdir_, "keyword windowrulev2 move " + popup_move() +
                        ",class:^(" + cls + ")$");
+        std::string r5 = hypr_request(
+            hdir_, "keyword windowrulev2 group barred,class:^(" + cls + ")$");
         DBG("agents: rule preinstall: lua-rule reply='%.120s'", r1.c_str());
         DBG("agents: rule preinstall: legacy keyword replies: "
-            "float='%.60s' size='%.60s' move='%.60s'",
-            r2.c_str(), r3.c_str(), r4.c_str());
+            "float='%.60s' size='%.60s' move='%.60s' group='%.60s'",
+            r2.c_str(), r3.c_str(), r4.c_str(), r5.c_str());
     }
     // Give the freshly adopted (still hidden) popup its real geometry.
     // exec_cmd's Lua rule table silently drops STATIC rules — float,
@@ -1119,8 +1240,10 @@ private:
     }
     // Agent terminals on special:mbagent open links in Brave; Hyprland
     // then maps those windows onto the same special (xdg-activation /
-    // opener workspace). togglespecialworkspace would raise them with
-    // the popup. Send every non-agent client back to the real workspace.
+    // opener workspace). Any other floater that maps while the special
+    // is focused lands there too. togglespecialworkspace would
+    // raise/dismiss them with the popup. Send every non-agent client
+    // back to the real workspace; address-targeted so the agent stays.
     void evict_strays() {
         if (hdir_.empty()) return;
         std::string dest = normal_ws_id();
@@ -1273,13 +1396,19 @@ private:
         if (hold_next_ && cmd != cfg.agents_term)
             DBG("agents: previous session exited fast; spawning with a "
                 "hold-open shim so the error stays visible");
+        // Hyprlang exec-rules bind to the NEW pid. Lua exec_cmd's
+        // workspace option is also pid-matched; when the terminal hands
+        // off or the pid misses, Hyprland applies it to the focused
+        // window and swallows whatever floater was up onto
+        // special:mbagent — which then vanishes with the popup. Class
+        // windowrules (preinstall_rules) put OUR terminal on the special;
+        // repair() catches a map on the wrong workspace by address.
         if (!hypr_dispatch2(
                 hdir_,
                 "dispatch exec [float; size " + sz + "; workspace "
                 "special:mbagent silent] " + cmd,
                 "dispatch hl.dsp.exec_cmd(\"" + lua_str(cmd) +
-                    "\", { float = true, size = \"" + sz +
-                    "\", workspace = \"special:mbagent\" })")) {
+                    "\", { float = true, size = \"" + sz + "\" })")) {
             // Both dialects rejected the exec (or Hyprland timed out).
             // Never latch a dead state behind a silent click.
             spawning_ = false;
@@ -1334,27 +1463,22 @@ private:
     // Move it onto our special by address, then reveal. Event addresses
     // come without the 0x selector prefix.
     void repair(const std::string& addr) {
-        std::string sel = "address:" +
-                          (addr.rfind("0x", 0) == 0 ? addr : "0x" + addr);
-        if (hypr_dispatch2(
-                hdir_,
-                "dispatch movetoworkspacesilent special:mbagent," + sel,
-                "dispatch \"movetoworkspacesilent special:mbagent," + sel +
-                    "\"")) {
-            on_special_ = true;
-            shown_      = false; // it just vanished onto the special
-            place_popup();
-            show(true);          // ...and drops back down managed
-            focus_popup();
-        } else {
-            // Can't re-home it. The window is at least VISIBLE where it
-            // is — degrade to that honestly instead of hiding a live
-            // session: no auto-dismiss, next click retries the move.
-            on_special_ = false;
-            shown_      = true;
-            DBG("agents: repair move failed; session left on the current "
-                "workspace");
-        }
+        // Mapped on a normal workspace already. Keep it there as the
+        // visible popup — do not round-trip through special:mbagent
+        // (that overlay is what swallowed file choosers).
+        term_addr_     = addr_norm(addr);
+        on_special_    = true;
+        shown_         = true;
+        reveal_ms_     = now_ms();
+        popup_focused_ = false;
+        foreign_seen_  = false;
+        hid_ms_        = 0;
+        place_popup();
+        focus_popup();
+        hint_eject();
+        DBG("agents: repaired in place on the current workspace "
+            "(addr=0x%s)",
+            term_addr_.c_str());
     }
     static std::string default_agent() {
         const char* h = getenv("HOME");
@@ -1365,27 +1489,51 @@ private:
         return f;
     }
     void show(bool want) {
-        sync_shown();
-        if (want == shown_) return;
-        if (want) evict_strays();
-        DBG("agents: %s the popup (togglespecialworkspace mbagent)",
-            want ? "revealing" : "hiding");
-        hypr_dispatch2(hdir_, "dispatch togglespecialworkspace mbagent",
-                       "dispatch hl.dsp.workspace.toggle_special("
-                       "\"mbagent\")");
-        // Bookkeeping follows the compositor, not the request. Optimistic
-        // shown_=want plus togglespecialworkspace is how a leftover
-        // desync made glyph clicks alternate show/hide (or never hide).
-        shown_ = special_is_shown();
-        if (shown_ != want)
-            DBG("agents: special did not %s (compositor shown=%d)",
-                want ? "show" : "hide", (int)shown_);
-        if (want && shown_) {
+        // Address-targeted move of OUR window only. Overlaying
+        // special:mbagent (togglespecialworkspace) made every floater
+        // that mapped while the popup was up — GTK file choosers in
+        // particular — a member of that special, so dismissing the
+        // agent took them with it.
+        evict_strays();
+        if (term_addr_.empty()) {
+            shown_ = false;
+            return;
+        }
+        if (want) {
+            std::string dest = normal_ws_id();
+            if (dest.empty()) dest = "current";
+            DBG("agents: revealing popup onto workspace %s (agent only)",
+                dest.c_str());
+            move_term(dest, false);
+            place_popup();
+            if (special_is_shown()) {
+                // Older builds left the special overlaid. Agent is
+                // already on the real workspace, so toggling it off
+                // cannot swallow the popup.
+                hypr_dispatch2(hdir_,
+                               "dispatch togglespecialworkspace mbagent",
+                               "dispatch hl.dsp.workspace.toggle_special("
+                               "\"mbagent\")");
+            }
+            evict_strays();
+            shown_         = true;
             reveal_ms_     = now_ms();
             popup_focused_ = false;
             foreign_seen_  = false;
             hid_ms_        = 0;
-        } else if (!want && !shown_) {
+            open_dismiss_catcher();
+        } else {
+            DBG("agents: hiding popup onto special:mbagent (agent only)");
+            close_dismiss_catcher();
+            move_term("special:mbagent", true);
+            evict_strays(); // file choosers that followed the parent
+            if (special_is_shown()) {
+                hypr_dispatch2(hdir_,
+                               "dispatch togglespecialworkspace mbagent",
+                               "dispatch hl.dsp.workspace.toggle_special("
+                               "\"mbagent\")");
+            }
+            shown_ = false;
             hid_ms_ = now_ms();
         }
     }
@@ -1409,11 +1557,22 @@ private:
                 // means the user is acting elsewhere (their outside
                 // clicks reach the desktop layer and can launch things —
                 // observed in the field: Omarchy's background selector).
+                std::string title =
+                    c + 1 < rest.size() ? rest.substr(c + 1) : "";
                 if (is_agent_special(ws) && !is_agent_class(cls)) {
                     DBG("agents: stray '%s' mapped on the special; "
                         "evicting",
                         cls.c_str());
                     evict_strays();
+                    return;
+                }
+                if (is_dialog_class(cls) || is_dialog_title(title)) {
+                    // File choosers must stay on the real workspace and
+                    // must not dismiss the agent. Drop the outside-click
+                    // catcher so the dialog is clickable (it is a normal
+                    // window, under our top-layer catcher).
+                    evict_strays();
+                    close_dismiss_catcher();
                     return;
                 }
                 if (shown_ && on_special_ && !is_agent_class(cls) &&
@@ -1492,20 +1651,15 @@ private:
                 term_cls_.clear();
             }
         } else if (l.rfind("activespecial>>", 0) == 0) {
-            // WORKSPACE,MONITOR — empty workspace means no special is
-            // overlaid. Keep shown_ in lockstep with the compositor so
-            // the next glyph click doesn't toggle the wrong way.
+            // Overlaying mbagent is a leftover of older builds. shown_
+            // is the agent window's workspace, not the overlay. If the
+            // overlay appears, evict everyone else so they don't hide
+            // with it.
             std::string rest = l.substr(15);
             size_t      c    = rest.find(',');
             std::string ws   = c == std::string::npos ? rest
                                                       : rest.substr(0, c);
-            bool vis = is_agent_special(ws) || ws == "mbagent";
-            if (shown_ != vis) {
-                DBG("agents: compositor special %s (activespecial '%s')",
-                    vis ? "shown" : "hidden", ws.c_str());
-                shown_ = vis;
-                if (!vis) hid_ms_ = now_ms();
-            }
+            if (is_agent_special(ws) || ws == "mbagent") evict_strays();
         } else if (l.rfind("activewindow>>", 0) == 0) {
             // CLASS,TITLE — focus-follows-mouse makes this the mouse-out
             // signal. Empty class (focus on nothing) keeps the popup up.
@@ -1521,7 +1675,10 @@ private:
             // dismissal only arms once the popup has actually been
             // focused (the user moused into it), or after a grace period
             // long past any focus-shuffle the reveal itself causes.
-            std::string cls = l.substr(14, l.find(',', 14) - 14);
+            size_t comma = l.find(',', 14);
+            std::string cls = l.substr(14, comma - 14);
+            std::string title =
+                comma == std::string::npos ? "" : l.substr(comma + 1);
             const std::string& ours =
                 term_cls_.empty() ? cfg.agents_term_class : term_cls_;
             if (!on_special_) return;
@@ -1529,6 +1686,14 @@ private:
             sync_shown();
             if (!shown_) return;
             const uint64_t since = now_ms() - reveal_ms_;
+            if (is_dialog_class(cls) || is_dialog_title(title)) {
+                DBG("agents: focus on dialog '%s' (%s); keeping popup, "
+                    "evicting strays",
+                    cls.c_str(), title.c_str());
+                evict_strays();
+                close_dismiss_catcher();
+                return;
+            }
             if (cls == ours) {
                 // Hyprland auto-focuses the special's window the moment
                 // it is re-revealed — that is NOT the user entering the
@@ -1540,6 +1705,7 @@ private:
                     popup_focused_ = true;
                     DBG("agents: popup entered "
                         "(mouse-out dismissal armed)");
+                    if (!dismiss_.surf) open_dismiss_catcher();
                 } else if (!popup_focused_) {
                     DBG("agents: auto-focus at reveal (not arming)");
                 }
@@ -1557,6 +1723,29 @@ private:
             // bar). After the reveal bounce, that is an outside click.
             DBG("agents: mouse-out (focus moved to '%s'); hiding",
                 cls.empty() ? "(none)" : cls.c_str());
+            show(false);
+        } else if (l.rfind("activewindowv2>>", 0) == 0) {
+            std::string addr = addr_norm(l.substr(16));
+            while (!addr.empty() &&
+                   (addr.back() == '\n' || addr.back() == '\r' ||
+                    addr.back() == ' '))
+                addr.pop_back();
+            if (!on_special_ || !shown_) return;
+            if (now_ms() < suppress_dismiss_until_) return;
+            if (addr == addr_norm(term_addr_)) {
+                const uint64_t since = now_ms() - reveal_ms_;
+                if (!popup_focused_ && (foreign_seen_ || since > 400)) {
+                    popup_focused_ = true;
+                    if (!dismiss_.surf) open_dismiss_catcher();
+                }
+                return;
+            }
+            if (!popup_focused_ && now_ms() - reveal_ms_ <= 400) {
+                foreign_seen_ = true;
+                return;
+            }
+            DBG("agents: mouse-out (activewindowv2 0x%s); hiding",
+                addr.c_str());
             show(false);
         }
     }
@@ -1633,8 +1822,9 @@ private:
     bool        spawned_by_us_ = false;
     bool        hinted_ = false;
     bool        term_open_ = false, shown_ = false, spawning_ = false;
-    bool        on_special_ = false; // window actually lives on the special
+    bool        on_special_ = false; // managed popup session (hide/show)
     std::string placed_size_;        // last applied agents_popup_size
+    PopupWin    dismiss_;            // outside-click / mouse-out catcher
 };
 
 
@@ -2099,8 +2289,21 @@ private:
             wsmon.push_back({id, mon});
         }
         std::sort(ws.begin(), ws.end());
-        auto act = extract_ids(hypr_request(dir_, "j/activeworkspace"));
+        std::string actj = hypr_request(dir_, "j/activeworkspace");
+        auto act = extract_ids(actj);
         int active = act.empty() ? -1 : act.front();
+        {
+            size_t k = actj.find("\"monitor\"");
+            if (k != std::string::npos && bar_) {
+                size_t q = actj.find('"', actj.find(':', k));
+                if (q != std::string::npos) {
+                    size_t e = actj.find('"', q + 1);
+                    if (e != std::string::npos)
+                        bar_->note_focused_output(
+                            actj.substr(q + 1, e - q - 1));
+                }
+            }
+        }
         // Only ask for the per-monitor picture when it can matter; on a
         // single-bar setup this is one IPC round-trip saved per refresh.
         std::map<std::string, int> actmon;
@@ -2132,6 +2335,16 @@ private:
                 '\0';
             for (const char* k : keys)
                 if (strstr(buf, k)) { relevant = true; break; }
+            // focusedmon>>DP-1,3 — keep Bar's overlay target current
+            // without forking hyprctl on every hotkey popup.
+            const char* p = buf;
+            while ((p = strstr(p, "focusedmon>>")) != nullptr) {
+                p += 12;
+                const char* e = p;
+                while (*e && *e != ',' && *e != '\n' && *e != '\r') ++e;
+                if (e > p && bar_)
+                    bar_->note_focused_output(std::string(p, e - p));
+            }
         }
         if (n == 0) { // Hyprland went away
             close(ev_fd_);
@@ -5038,6 +5251,9 @@ bool more_is_open() {
 // Powers the Omarchy menu button and update indicator.
 // ---------------------------------------------------------------------------
 namespace {
+class CustomModule;
+CustomModule* g_update = nullptr;
+
 class CustomModule : public TextModule {
 public:
     CustomModule(const bool* flag, std::string glyph, std::string font,
@@ -5046,6 +5262,16 @@ public:
         : flag_(flag), glyph_(std::move(glyph)), font_(std::move(font)),
           click_(std::move(click)), rclick_(std::move(rclick)),
           check_(std::move(check)), interval_s_(interval_s), rtsig_(rtsig) {}
+    ~CustomModule() {
+        if (g_update == this) g_update = nullptr;
+    }
+    void refresh_check() {
+        if (!check_.empty()) run_check();
+    }
+    void clear_indicator() {
+        check_cmd_.cancel();
+        if (bar_) set_text(*bar_, "");
+    }
 
     bool enabled() const override { return !flag_ || *flag_; }
 
@@ -5258,9 +5484,18 @@ Module* make_omarchy_button() {
 }
 
 Module* make_update_button() {
-    return new CustomModule(&cfg.show_update, cfg.update_glyph, "",
-                            cfg.update_click, "", cfg.update_check,
-                            cfg.update_interval_s, cfg.update_signal);
+    auto* m = new CustomModule(&cfg.show_update, cfg.update_glyph, "",
+                               cfg.update_click, "", cfg.update_check,
+                               cfg.update_interval_s, cfg.update_signal);
+    g_update = m;
+    return m;
+}
+
+void update_refresh() {
+    if (g_update) g_update->refresh_check();
+}
+void update_clear() {
+    if (g_update) g_update->clear_indicator();
 }
 
 

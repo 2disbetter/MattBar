@@ -178,10 +178,14 @@ static std::string self_exe() {
 
 static std::string runtime_dir() {
     const char* rt = getenv("XDG_RUNTIME_DIR");
-    return std::string(rt && *rt ? rt : "/tmp") + "/mattbar";
+    if (!rt || !*rt || rt[0] != '/') return {};
+    return std::string(rt) + "/mattbar";
 }
 
-static std::string shim_dir() { return runtime_dir() + "/bin"; }
+static std::string shim_dir() {
+    std::string d = runtime_dir();
+    return d.empty() ? std::string() : d + "/bin";
+}
 
 static bool mkdir_p(const std::string& path) {
     std::string cur;
@@ -243,20 +247,9 @@ static bool write_text(const std::string& path, const std::string& body) {
 static void hypr_dofile(const std::string& path) {
     for (char c : path)
         if (c == '"' || c == '\'' || c == '\n') return;
-    std::string cmd = "hyprctl eval 'dofile(\"" + path + "\")'";
-    FILE* p = popen((cmd + " 2>&1").c_str(), "r");
-    if (!p) {
-        spawn_detached(cmd);
-        return;
-    }
-    char        buf[512];
-    std::string out;
-    while (fgets(buf, sizeof buf, p)) out += buf;
-    pclose(p);
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
-        out.pop_back();
-    if (out != "ok" && !out.empty())
-        fprintf(stderr, "mattbar: hypr eval: %s\n", out.c_str());
+    // Fire-and-forget: a blocking popen here stalled the event loop
+    // (pointer, lock painting, watchdog) for the full hyprctl round-trip.
+    spawn_detached(std::string("hyprctl eval 'dofile(\"") + path + "\")'");
 }
 
 // Super+Space and Super+Ctrl+A/B/W/D/… are Lua binds (hl.bind). A PATH
@@ -264,6 +257,10 @@ static void hypr_dofile(const std::string& path) {
 // takeover, reload the installer module so Super+Space hits mattbarctl.
 static void rebind_shell_keys(bool ours, const std::string& hypr_path) {
     std::string dir = runtime_dir();
+    if (dir.empty()) {
+        fprintf(stderr, "mattbar: shell: cannot write hypr-rebind.lua without XDG_RUNTIME_DIR\n");
+        return;
+    }
     mkdir_p(dir);
     std::string file = dir + "/hypr-rebind.lua";
     std::string lua;
@@ -340,20 +337,28 @@ void Shell::apply_takeover() {
                        "systemctl --user try-restart omarchy-sleep-lock.service");
     };
     if (cfg.quickshell_shutdown) {
-        mkdir_p(dir);
-        link_one("omarchy-shell");
-        link_one("omarchy-menu");
-        std::string np = dir + ":" + orig_path;
-        setenv("PATH", np.c_str(), 1);
-        sync_sleep_lock_path(true);
-        rebind_shell_keys(true, np);
-        fprintf(stderr,
-                "mattbar: shell: Quickshell takeover on; "
-                "omarchy-shell shim at %s\n",
-                dir.c_str());
+        if (dir.empty()) {
+            fprintf(stderr,
+                    "mattbar: shell: takeover on but XDG_RUNTIME_DIR unset; "
+                    "PATH shim skipped\n");
+        } else {
+            mkdir_p(dir);
+            link_one("omarchy-shell");
+            link_one("omarchy-menu");
+            std::string np = dir + ":" + orig_path;
+            setenv("PATH", np.c_str(), 1);
+            sync_sleep_lock_path(true);
+            rebind_shell_keys(true, np);
+            fprintf(stderr,
+                    "mattbar: shell: Quickshell takeover on; "
+                    "omarchy-shell shim at %s\n",
+                    dir.c_str());
+        }
     } else {
-        unlink_one("omarchy-shell");
-        unlink_one("omarchy-menu");
+        if (!dir.empty()) {
+            unlink_one("omarchy-shell");
+            unlink_one("omarchy-menu");
+        }
         setenv("PATH", orig_path.c_str(), 1);
         sync_sleep_lock_path(false);
         hide("omarchy.menu");
@@ -558,6 +563,21 @@ std::string Shell::handle(const std::string& target, const std::string& rest) {
         return "unknown";
     }
     if (target == "image-selector") return image_selector_dispatch(rest);
+    // `omarchy-update-status` ends every `omarchy update` with
+    // `omarchy-shell -q omarchy.system-update refresh|clear`. Without this
+    // target the shim exited 1 and `set -e` aborted the updater after the
+    // real work was done.
+    if (target == "omarchy.system-update") {
+        if (method == "refresh" || method.empty()) {
+            update_refresh();
+            return "ok";
+        }
+        if (method == "clear") {
+            update_clear();
+            return "ok";
+        }
+        return "unknown";
+    }
     // `omarchy-shell omarchy.audio toggle` — target is the overlay id
     if (find(target)) {
         if (method == "toggle" || method.empty())

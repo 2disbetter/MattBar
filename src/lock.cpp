@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -236,6 +237,29 @@ const char* pam_service() {
     return "login";
 }
 
+// Best-effort wipe. A volatile walk so the store cannot be DSE'd after
+// the last read of the secret. No libc feature-macro requirement.
+void wipe_mem(void* p, size_t n) {
+    if (!p || n == 0) return;
+    volatile unsigned char* v = static_cast<volatile unsigned char*>(p);
+    while (n--) *v++ = 0;
+}
+
+void wipe_string(std::string& s) {
+    if (!s.empty()) wipe_mem(s.data(), s.size());
+    s.clear();
+}
+
+// Session account for PAM. Never invent "root" — a getpwuid miss used to
+// authenticate the typed password against root, which is fail-open.
+bool session_username(std::string& out) {
+    out.clear();
+    const passwd* pw = getpwuid(getuid());
+    if (!pw || !pw->pw_name || !pw->pw_name[0]) return false;
+    out = pw->pw_name;
+    return true;
+}
+
 void draw_one(LSurf& s);
 void request_lock_draw() { g_lock_dirty = true; }
 
@@ -271,12 +295,34 @@ int pam_conv_cb(int num_msg, const struct pam_message** msg,
     return PAM_SUCCESS;
 }
 
-void stop_password_pam() {
-    if (g_pam_pid > 0) {
-        kill(g_pam_pid, SIGTERM);
-        waitpid(g_pam_pid, nullptr, 0);
-        g_pam_pid = -1;
+// SIGTERM, one WNOHANG, then SIGKILL. Never waitpid(..., 0) here —
+// pam_authenticate / fprintd can block for seconds and would freeze
+// the lock surface and the watchdog. A leftover pid is reaped by
+// ensure_waiter(); the killed flag stops a late exit-0 from unlocking.
+void reap_or_kill(pid_t& pid, bool& killed) {
+    if (pid <= 0) return;
+    killed = true;
+    kill(pid, SIGTERM);
+    int   st = 0;
+    pid_t w  = waitpid(pid, &st, WNOHANG);
+    if (w == pid || (w < 0 && errno == ECHILD)) {
+        pid    = -1;
+        killed = false;
+        return;
     }
+    kill(pid, SIGKILL);
+    w = waitpid(pid, &st, WNOHANG);
+    if (w == pid || (w < 0 && errno == ECHILD)) {
+        pid    = -1;
+        killed = false;
+    }
+}
+
+bool g_pam_killed = false;
+bool g_fp_killed  = false;
+
+void stop_password_pam() {
+    reap_or_kill(g_pam_pid, g_pam_killed);
     g_pam_fd = -1;
     g_busy   = false;
 }
@@ -313,29 +359,29 @@ int fp_conv_cb(int num_msg, const struct pam_message** msg,
 }
 
 void stop_fingerprint() {
-    if (g_fp_pid > 0) {
-        kill(g_fp_pid, SIGTERM);
-        waitpid(g_fp_pid, nullptr, 0);
-        g_fp_pid = -1;
-    }
+    reap_or_kill(g_fp_pid, g_fp_killed);
 }
 
 void start_fingerprint() {
     if (!g_locked || g_fp_pid > 0 || !g_fp_ok) return;
+    std::string user;
+    if (!session_username(user)) {
+        fprintf(stderr, "mattbar: lock: fingerprint skipped; no session user\n");
+        return;
+    }
     pid_t pid = fork();
     if (pid == 0) {
-        const char* user = "root";
-        if (passwd* pwuid = getpwuid(getuid())) user = pwuid->pw_name;
         pam_handle_t* pamh = nullptr;
         pam_conv conv{fp_conv_cb, nullptr};
-        int rc = pam_start("omarchy-lock-fingerprint", user, &conv, &pamh);
+        int rc = pam_start("omarchy-lock-fingerprint", user.c_str(), &conv, &pamh);
         if (rc == PAM_SUCCESS) rc = pam_authenticate(pamh, 0);
         if (rc == PAM_SUCCESS) rc = pam_acct_mgmt(pamh, 0);
         if (pamh) pam_end(pamh, rc);
         _exit(rc == PAM_SUCCESS ? 0 : 1);
     }
     if (pid < 0) return;
-    g_fp_pid = pid;
+    g_fp_killed = false;
+    g_fp_pid    = pid;
 }
 
 void ensure_waiter() {
@@ -350,14 +396,23 @@ void ensure_waiter() {
             int st = 0;
             if (g_pam_pid > 0) {
                 pid_t r = waitpid(g_pam_pid, &st, WNOHANG);
-                if (r == g_pam_pid)
-                    pam_done(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+                if (r == g_pam_pid) {
+                    bool killed = g_pam_killed;
+                    g_pam_pid    = -1;
+                    g_pam_killed = false;
+                    if (!killed)
+                        pam_done(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+                }
             }
             if (g_fp_pid > 0) {
                 pid_t r = waitpid(g_fp_pid, &st, WNOHANG);
                 if (r == g_fp_pid) {
-                    g_fp_pid = -1;
-                    if (WIFEXITED(st) && WEXITSTATUS(st) == 0)
+                    bool killed = g_fp_killed;
+                    g_fp_pid    = -1;
+                    g_fp_killed = false;
+                    if (killed) {
+                        /* aborted; ignore the exit status */
+                    } else if (WIFEXITED(st) && WEXITSTATUS(st) == 0)
                         pam_done(true);
                     else if (g_locked && g_fp_ok && g_fp_retry >= 0) {
                         itimerspec ts{};
@@ -376,6 +431,13 @@ void ensure_waiter() {
 
 void start_pam() {
     if (g_busy || !g_bar) return;
+    std::string user;
+    if (!session_username(user)) {
+        wipe_string(g_field.text);
+        g_field.cursor = 0;
+        set_error("cannot resolve session user");
+        return;
+    }
     int p[2];
     if (pipe(p) != 0) return;
     pid_t pid = fork();
@@ -386,14 +448,18 @@ void start_pam() {
         ssize_t n;
         while ((n = read(p[0], buf, sizeof buf)) > 0) pw.append(buf, n);
         close(p[0]);
-        const char* user = "root";
-        if (passwd* pwuid = getpwuid(getuid())) user = pwuid->pw_name;
+        wipe_mem(buf, sizeof buf);
+        if (user.empty()) {
+            wipe_string(pw);
+            _exit(1);
+        }
         pam_handle_t* pamh = nullptr;
         pam_conv conv{pam_conv_cb, const_cast<char*>(pw.c_str())};
-        int rc = pam_start(pam_service(), user, &conv, &pamh);
+        int rc = pam_start(pam_service(), user.c_str(), &conv, &pamh);
         if (rc == PAM_SUCCESS) rc = pam_authenticate(pamh, 0);
         if (rc == PAM_SUCCESS) rc = pam_acct_mgmt(pamh, 0);
         if (pamh) pam_end(pamh, rc);
+        wipe_string(pw);
         _exit(rc == PAM_SUCCESS ? 0 : 1);
     }
     close(p[0]);
@@ -403,7 +469,9 @@ void start_pam() {
     }
     (void)!write(p[1], g_field.text.c_str(), g_field.text.size());
     close(p[1]);
-    g_field.clear();
+    wipe_string(g_field.text);
+    g_field.cursor = 0;
+    g_pam_killed = false;
     g_busy    = true;
     disarm_blank();
     g_pam_pid = pid;

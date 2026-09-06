@@ -1,6 +1,8 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// mattbarctl: a line-based control socket at $XDG_RUNTIME_DIR/mattbar.sock.
+// mattbarctl: a line-based control socket at $XDG_RUNTIME_DIR/mattbar.sock
+// (0600, same-uid SO_PEERCRED). There is no /tmp fallback — a missing
+// runtime dir means no socket, not a world-writable one.
 // The RTMIN+N signal surface is nearly full and signals can't carry
 // arguments or answer questions; the socket can do both:
 //
@@ -9,6 +11,8 @@
 //   mattbarctl profile [name]        (no name: prints active + available)
 //   mattbarctl pin on|off|toggle|status
 //   mattbarctl reveal | hide
+//   mattbarctl hold on|off|toggle|status
+//   mattbarctl settings [open|toggle|close|status]
 //   mattbarctl status                (one-line summary)
 //   mattbarctl shell ping|toggle|summon|hide <id> [payload]
 //   mattbarctl notifications dismissOne|dismissAll|invokeLast|toggleDnd
@@ -36,7 +40,7 @@ private:
 
 // Client side (used by main.cpp): send one command line, print the reply.
 // Returns the process exit code.
-int ctl_client(int argc, char** argv);
+int ctl_client(int argc, char** argv, bool quiet = false);
 // argv[0] dispatch when this binary is invoked as omarchy-shell / omarchy-menu
 // (the PATH shim used only while quickshell_shutdown is on).
 int omarchy_shell_client(int argc, char** argv);

@@ -2,7 +2,8 @@
 // Opt-in Quickshell sidecar for user Omarchy plugins while MattBar
 // takeover is on. Off (default): no qs process. On, with at least one
 // plugin placed or a service enabled: a stripped omarchy-shell child
-// (null-bar, first-party session plugins disabled) that dies with us.
+// (null-bar or mattbar.plugin-bar, first-party session plugins disabled)
+// that dies with us.
 #include "bar.hpp"
 #include <string>
 #include <vector>
@@ -29,6 +30,23 @@ bool qs_plugin_shown(const std::string& plugin_id);
 void qs_plugin_set_shown(const std::string& plugin_id, bool on);
 void qs_plugin_move(const std::string& plugin_id, int delta);
 std::vector<std::string> qs_plugin_layout_ids();
+bool qs_plugin_has_kind(const QsPlugin& p, const char* kind);
+bool qs_plugin_is_bar_widget(const QsPlugin& p);
+bool qs_plugin_is_summonable(const QsPlugin& p);
+// Overlay/panel/menu (and bar-widget-only when the row is off) — chip.
+std::vector<std::string> qs_plugin_chip_ids();
+// bar-widget plugins shown on mattbar.plugin-bar. Empty if the row is off.
+// zone: -1 = L+C+R+M, 0=left, 1=center, 2=right, 3=more (overflow ⋯).
+std::vector<std::string> qs_plugin_row_ids(int zone = -1);
+int  qs_plugin_row_zone_of(const std::string& plugin_id, int* idx = nullptr);
+void qs_plugin_row_set_zone(const std::string& plugin_id, int zone);
+void qs_plugin_row_move(const std::string& plugin_id, int delta);
+void qs_plugin_bar_migrate();
+bool qs_plugin_bar_want();
+
+void qs_plugin_bar_publish(Bar& bar);
+void qs_plugin_bar_watch(Bar& bar);
+void qs_plugin_bar_clear();
 
 Module* make_plugins();
 void    plugins_close();
@@ -38,6 +56,7 @@ Overlay* make_plugin_remove_overlay();
 
 bool qs_plugins_want_runtime();
 bool qs_plugins_running();
+bool qs_plugins_lazy_hold();
 void qs_plugins_scan();
 void qs_plugins_sync_modules(Bar& bar);
 void qs_plugins_apply(Bar& bar);

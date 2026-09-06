@@ -54,7 +54,8 @@ configure step fails on `find_library(pam)`.
 Optional runtime helpers (no build-time cost): `librsvg` (SVG tray
 icons, dlopened on first use), `iw` (SSID display), `wpctl`/`pactl`
 (PipeWire volume control and the shared audio event stream — both
-present on any Omarchy install). Full Quickshell takeover also needs
+present on any Omarchy install), `curl` (weather geocode and forecast
+fetch). Full Quickshell takeover also needs
 the Omarchy CLIs already on PATH (`hyprctl`, `omarchy-system-lock`,
 `omarchy-system-wake`, `omarchy-launch-screensaver`,
 `omarchy-hyprland-session-locked`, `omarchy-brightness-display`,
@@ -304,6 +305,26 @@ notifications_takeover = true
 quickshell_shutdown = true
 ```
 
+User Omarchy plugins keep working during takeover without bringing
+back the full first-party Quickshell shell: enable **Settings → Shell →
+Quickshell plugins** (`qs_plugins` in `mattbar.conf`). MattBar then
+starts a stripped Quickshell sidecar that loads only plugins you
+installed (`omarchy plugin add …` / Settings → Plugins). Turn the
+toggle off and the sidecar exits. The sidecar needs the null-bar
+plugin in `~/.config/omarchy/plugins/mattbar.null-bar` (install.sh
+copies it, or copy `contrib/omarchy-null-bar`).
+
+**Plugin row** (`qs_plugin_bar`, off by default): a thin Quickshell
+strip (`mattbar.plugin-bar`) stacked on the desktop-facing side of
+MattBar — below a top bar, above a bottom bar. Only `bar-widget`
+plugins render there, placed with the same **L / C / R / M** zones as
+MattBar modules (`qs_plugin_bar_left` / `_center` / `_right` /
+`_more`). More is a ⋯ overflow on the plugin row, not MattBar's Cairo
+More. Overlay, panel, and menu plugins stay on the Plugins chip /
+summon path. Same auto-hide family, zero exclusive zone. install.sh
+copies `contrib/omarchy-plugin-bar` next to null-bar; it never
+rewrites the user's `bar.id`.
+
 `quickshell_shutdown` is the actual takeover switch. Turning it on:
 
 - stops Quickshell (`quickshell kill`)
@@ -380,3 +401,25 @@ systemctl --user restart mattbar
 Current MattBar reclaims Hyprland’s LOCK blocker on startup and does
 not exit the event loop on a thaw `epoll` EPERM. If you are on a
 build older than 1.39.9, upgrade first.
+
+## 10. Uninstall
+
+To remove MattBar and reverse every Omarchy / Hyprland change the
+installer made (user config only — never `/usr/share/omarchy/`):
+
+```sh
+./uninstall.sh
+# or: ./install.sh --uninstall
+```
+
+That stops the user service, deletes `/usr/local/bin/mattbar` and
+`mattbarctl`, removes the systemd unit, PATH shim, null-bar plugin,
+Style → Menu Bar menu entry, media-key / shell-key drop-ins, layer
+rules, and the `omarchy.notifications` disable in
+`~/.config/omarchy/shell.json`, then reloads Hyprland and restarts
+the Omarchy shell.
+
+Personal binds in `~/.config/hypr/bindings.lua` that you wrote
+yourself (for example Super+A) are left alone. `--keep-config` keeps
+`~/.config/mattbar/`. `--dry-run` prints the plan without changing
+anything.
