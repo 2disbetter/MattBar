@@ -1,4 +1,5 @@
 MattBar is a minimal, auto-hiding status bar primarily for Omarchy, but can be used with Hyprland and other wlroots compositors in genenral.
+<img width="1600" height="720" alt="image" src="https://github.com/user-attachments/assets/383eeeb0-846b-419d-82f0-d1b61d34f5b2" />
 
 # Positioning
 Dock it to any edge — top, bottom, left, or right — via the Position setting in General. Changes apply instantly. On vertical edges, modules stack compactly (time-only clock, shorter labels, stacked tray icons). 
