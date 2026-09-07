@@ -276,7 +276,7 @@ std::string CtlServer::handle(const std::string& line) {
     }
     if (cmd == "agents") {
         if (arg == "pick") {
-            spawn_detached("omarchy-agent --pick");
+            agents_pick();
             return "ok";
         }
         if (arg == "toggle" || arg == "click" || arg.empty()) {

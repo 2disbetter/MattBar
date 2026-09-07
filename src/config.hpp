@@ -5,7 +5,7 @@
 // ---------------------------------------------------------------------------
 #include <string>
 
-inline constexpr const char* MATTBAR_VERSION = "1.42.2";
+inline constexpr const char* MATTBAR_VERSION = "1.43.0";
 #include <vector>
 
 struct Color { double r, g, b, a; };

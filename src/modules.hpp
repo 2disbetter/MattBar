@@ -40,6 +40,7 @@ Module* make_agents();
 // Same action as left-clicking the agents chip (grok session popup, not
 // the Claude/Codex usage dashboard). Used by `mattbarctl agents toggle`.
 void    agents_hotkey();
+void    agents_pick();
 Module* make_microphone();
 Module* make_screenrecord();
 Module* make_brightness();

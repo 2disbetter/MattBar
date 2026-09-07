@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <ctime>
@@ -56,6 +57,71 @@
 // left browsers/IDEs in mattbar.service; a restart then SIGTERM'd them
 // (Brave/Spotify/Signal dumped core) and hung 90s on jetbrainsd (16.7G
 // attributed to the unit).
+// Omarchy 4.2 agent CLIs are mise stubs in ~/.local/bin. Terminals
+// spawned from the bar often inherit a compositor PATH without that
+// directory, so `omarchy-cmd-missing grok` is true even when the stub
+// exists. Prefix it on every agent launch.
+static std::string omarchy_agent_path_export() {
+    return "export PATH=\"$HOME/.local/bin:$HOME/.local/share/mise/shims:"
+           "${PATH:-/usr/bin}\"";
+}
+
+static std::string omarchy_default_agent_name() {
+    const char* h = getenv("HOME");
+    return trim(slurp(std::string(h && *h ? h : ".") +
+                      "/.config/omarchy/defaults/agent"));
+}
+
+static bool omarchy_agent_name_ok(const std::string& a) {
+    if (a.empty()) return false;
+    for (unsigned char c : a) {
+        if (!(std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '+'))
+            return false;
+    }
+    return true;
+}
+
+static bool omarchy_agent_cli_ready() {
+    std::string a = omarchy_default_agent_name();
+    if (!omarchy_agent_name_ok(a)) return false;
+    int st = -1;
+    cmd_output(omarchy_agent_path_export() + "; command -v " + a +
+                   " >/dev/null 2>&1",
+               &st);
+    return st == 0;
+}
+
+static void omarchy_agent_pick() {
+    spawn_detached(omarchy_agent_path_export() +
+                   "; if command -v omarchy-menu >/dev/null 2>&1; then "
+                   "exec omarchy-menu summon setup.default.agent; "
+                   "fi; exec omarchy-agent --pick");
+}
+
+// Stock terminal payload. PATH first so 4.2 mise stubs resolve. If the
+// configured default is missing, run the official installer for that
+// name, then inline. If that still cannot produce a CLI, open the
+// picker instead of dying with "grok is not installed".
+static std::string omarchy_agent_inline_sh() {
+    return omarchy_agent_path_export() + "; "
+           "agent=$(omarchy-default-agent 2>/dev/null || true); "
+           "agent=$(printf %s \"$agent\" | tr -d \\\\n); "
+           "if [ -n \"$agent\" ] && command -v \"$agent\" >/dev/null 2>&1; then "
+           "  exec omarchy-agent --inline; "
+           "fi; "
+           "if [ -n \"$agent\" ]; then "
+           "  omarchy-default-agent --install \"$agent\" >/dev/null 2>&1 || "
+           "    omarchy-default-agent \"$agent\" >/dev/null 2>&1 || true; "
+           "  if command -v \"$agent\" >/dev/null 2>&1; then "
+           "    exec omarchy-agent --inline; "
+           "  fi; "
+           "fi; "
+           "if command -v omarchy-menu >/dev/null 2>&1; then "
+           "  exec omarchy-menu summon setup.default.agent; "
+           "fi; "
+           "exec omarchy-agent --pick";
+}
+
 void spawn_detached(const std::string& c) {
     if (c.empty()) return;
     pid_t pid = fork();
@@ -591,7 +657,7 @@ public:
             // Eject a live terminal popup; otherwise the same picker
             // Omarchy's agents widget launches.
             if (term_open_) { eject(); return true; }
-            spawn_detached("omarchy-agent --pick");
+            omarchy_agent_pick();
             return true;
         }
         if (button == BTN_MIDDLE) {
@@ -727,15 +793,16 @@ private:
     // stock tail is wrapped; a custom command is never rewritten.
     std::string spawn_cmd() const {
         const std::string& t = cfg.agents_term;
-        if (!hold_next_) return t;
         for (const char* tail :
              {" omarchy-agent --inline", " omarchy-agent"}) {
             const size_t n = strlen(tail);
-            if (t.size() > n && t.compare(t.size() - n, n, tail) == 0)
-                return t.substr(0, t.size() - n) + " sh -c '" +
-                       (tail + 1) +
-                       "; printf \"\\n[omarchy-agent exited %s - press "
-                       "Enter to close]\\n\" \"$?\"; read _'";
+            if (t.size() > n && t.compare(t.size() - n, n, tail) == 0) {
+                std::string inner = omarchy_agent_inline_sh();
+                if (hold_next_)
+                    inner += "; printf \"\\n[omarchy-agent exited %s - press "
+                             "Enter to close]\\n\" \"$?\"; read _";
+                return t.substr(0, t.size() - n) + " sh -c '" + inner + "'";
+            }
         }
         return t; // custom command: never rewritten
     }
@@ -1351,6 +1418,11 @@ private:
     // panel_on_fail guards against ping-pong when we arrived here FROM a
     // failed panel attempt.
     bool spawn_popup(bool panel_on_fail) {
+        if (!omarchy_agent_cli_ready()) {
+            DBG("agents: default agent missing or not on PATH; opening picker");
+            omarchy_agent_pick();
+            return true;
+        }
         if (hdir_.empty() || sock2_fd_ < 0) {
             DBG("agents: popup unavailable (no hypr sockets)");
             return false;
@@ -3558,6 +3630,7 @@ Module* make_agents() { return new AgentsModule; }
 void agents_hotkey() {
     if (AgentsModule::g) AgentsModule::g->on_click(0, BTN_LEFT);
 }
+void agents_pick() { omarchy_agent_pick(); }
 Module* make_microphone() { return new MicrophoneModule; }
 Module* make_screenrecord() { return new ScreenRecordModule; }
 
