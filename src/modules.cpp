@@ -2545,23 +2545,50 @@ Module* make_battery() { return new BatteryModule; }
 namespace {
 // --------------------------------------------------------------------------
 // nl80211: fetch the SSID of an associated wireless interface without
-// spawning iw. Family id resolved once via the genetlink controller, then
-// NL80211_CMD_GET_INTERFACE per query; the kernel includes NL80211_ATTR_SSID
-// while associated. Returns "" on any failure.
+// spawning iw. Family id is resolved once via the genetlink controller.
+//
+// GET_INTERFACE includes NL80211_ATTR_SSID on some drivers. iwlwifi (and
+// a few others) omit it even while associated — GET_INTERFACE then looks
+// like a nameless managed iface, which is why the bar used to show
+// wlp166s0. Fall back to a GET_SCAN dump and read the SSID IE from the
+// BSS marked ASSOCIATED. Returns "" on any failure.
 // --------------------------------------------------------------------------
+static uint16_t nla_typ(const nlattr* a) {
+    return a->nla_type & NLA_TYPE_MASK;
+}
+template <class F>
+static void for_each_nla(const void* data, int rem, F fn) {
+    const nlattr* a = (const nlattr*)data;
+    for (; rem >= NLA_HDRLEN && a->nla_len >= NLA_HDRLEN && rem >= a->nla_len;
+         rem -= NLA_ALIGN(a->nla_len),
+         a = (const nlattr*)((const char*)a + NLA_ALIGN(a->nla_len)))
+        fn(a);
+}
+static std::string ssid_from_ies(const char* ies, int len) {
+    for (int i = 0; i + 2 <= len; ) {
+        unsigned ie = (unsigned char)ies[i];
+        unsigned l  = (unsigned char)ies[i + 1];
+        if (i + 2 + (int)l > len) break;
+        if (ie == 0) return std::string(ies + i + 2, l);
+        i += 2 + (int)l;
+    }
+    return {};
+}
 std::string wifi_ssid(const std::string& iface) {
     unsigned idx = if_nametoindex(iface.c_str());
     if (!idx) return {};
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
     if (fd < 0) return {};
+    sockaddr_nl sa{};
+    sa.nl_family = AF_NETLINK;
+    if (bind(fd, (sockaddr*)&sa, sizeof sa) < 0) {
+        close(fd);
+        return {};
+    }
     struct Msg {
         nlmsghdr    nl;
         genlmsghdr  ge;
         char        attrs[64];
-    };
-    auto xchg = [fd](Msg& m, char* rbuf, size_t rlen) -> ssize_t {
-        if (send(fd, &m, m.nl.nlmsg_len, 0) < 0) return -1;
-        return recv(fd, rbuf, rlen, 0);
     };
     auto put_attr = [](Msg& m, uint16_t type, const void* d, uint16_t len) {
         nlattr* a = (nlattr*)((char*)&m + NLMSG_ALIGN(m.nl.nlmsg_len));
@@ -2570,7 +2597,10 @@ std::string wifi_ssid(const std::string& iface) {
         memcpy((char*)a + NLA_HDRLEN, d, len);
         m.nl.nlmsg_len = NLMSG_ALIGN(m.nl.nlmsg_len) + NLA_ALIGN(a->nla_len);
     };
-    char rbuf[4096];
+    auto send_msg = [fd](Msg& m) -> bool {
+        return send(fd, &m, m.nl.nlmsg_len, 0) == (ssize_t)m.nl.nlmsg_len;
+    };
+    char rbuf[16384];
 
     // resolve the nl80211 family id (cached across calls)
     static uint16_t fam = 0;
@@ -2582,45 +2612,118 @@ std::string wifi_ssid(const std::string& iface) {
         m.ge.cmd         = CTRL_CMD_GETFAMILY;
         m.ge.version     = 1;
         put_attr(m, CTRL_ATTR_FAMILY_NAME, "nl80211", 8);
-        ssize_t n = xchg(m, rbuf, sizeof rbuf);
+        if (!send_msg(m)) { close(fd); return {}; }
+        ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);
         if (n <= 0) { close(fd); return {}; }
         for (nlmsghdr* h = (nlmsghdr*)rbuf; NLMSG_OK(h, (size_t)n);
              h = NLMSG_NEXT(h, n)) {
             if (h->nlmsg_type == NLMSG_ERROR) break;
-            nlattr* a = (nlattr*)((char*)NLMSG_DATA(h) + GENL_HDRLEN);
-            int rem = (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN));
-            for (; rem >= NLA_HDRLEN && rem >= a->nla_len;
-                 rem -= NLA_ALIGN(a->nla_len),
-                 a = (nlattr*)((char*)a + NLA_ALIGN(a->nla_len)))
-                if (a->nla_type == CTRL_ATTR_FAMILY_ID)
-                    fam = *(uint16_t*)((char*)a + NLA_HDRLEN);
+            for_each_nla((char*)NLMSG_DATA(h) + GENL_HDRLEN,
+                         (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN)),
+                         [&](const nlattr* a) {
+                             if (nla_typ(a) == CTRL_ATTR_FAMILY_ID)
+                                 fam = *(uint16_t*)((char*)a + NLA_HDRLEN);
+                         });
         }
         if (!fam) { close(fd); return {}; }
     }
 
+    auto parse_iface_ssid = [&](nlmsghdr* h) -> std::string {
+        std::string s;
+        for_each_nla((char*)NLMSG_DATA(h) + GENL_HDRLEN,
+                     (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN)),
+                     [&](const nlattr* a) {
+                         if (nla_typ(a) == NL80211_ATTR_SSID)
+                             s.assign((char*)a + NLA_HDRLEN,
+                                      a->nla_len - NLA_HDRLEN);
+                     });
+        return s;
+    };
+    auto parse_bss_ssid = [&](nlmsghdr* h) -> std::string {
+        std::string s;
+        for_each_nla((char*)NLMSG_DATA(h) + GENL_HDRLEN,
+                     (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN)),
+                     [&](const nlattr* a) {
+                         if (nla_typ(a) != NL80211_ATTR_BSS) return;
+                         bool assoc = false;
+                         std::string ie_ssid;
+                         for_each_nla((char*)a + NLA_HDRLEN,
+                                      a->nla_len - NLA_HDRLEN,
+                                      [&](const nlattr* b) {
+                                          uint16_t t = nla_typ(b);
+                                          if (t == NL80211_BSS_STATUS &&
+                                              b->nla_len >= NLA_HDRLEN + 4) {
+                                              uint32_t st = *(uint32_t*)((char*)b +
+                                                                         NLA_HDRLEN);
+                                              assoc = st == NL80211_BSS_STATUS_ASSOCIATED ||
+                                                      st == NL80211_BSS_STATUS_IBSS_JOINED;
+                                          } else if (t == NL80211_BSS_INFORMATION_ELEMENTS) {
+                                              ie_ssid = ssid_from_ies(
+                                                  (char*)b + NLA_HDRLEN,
+                                                  b->nla_len - NLA_HDRLEN);
+                                          }
+                                      });
+                         if (assoc && !ie_ssid.empty()) s = std::move(ie_ssid);
+                     });
+        return s;
+    };
+
+    uint32_t idx32 = idx;
     Msg m{};
     m.nl.nlmsg_len   = NLMSG_LENGTH(GENL_HDRLEN);
     m.nl.nlmsg_type  = fam;
     m.nl.nlmsg_flags = NLM_F_REQUEST;
     m.ge.cmd         = NL80211_CMD_GET_INTERFACE;
     m.ge.version     = 0;
-    uint32_t idx32 = idx;
     put_attr(m, NL80211_ATTR_IFINDEX, &idx32, sizeof idx32);
-    ssize_t n = xchg(m, rbuf, sizeof rbuf);
-    close(fd);
-    if (n <= 0) return {};
     std::string ssid;
-    for (nlmsghdr* h = (nlmsghdr*)rbuf; NLMSG_OK(h, (size_t)n);
-         h = NLMSG_NEXT(h, n)) {
-        if (h->nlmsg_type != fam) continue;
-        nlattr* a = (nlattr*)((char*)NLMSG_DATA(h) + GENL_HDRLEN);
-        int rem = (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN));
-        for (; rem >= NLA_HDRLEN && rem >= a->nla_len;
-             rem -= NLA_ALIGN(a->nla_len),
-             a = (nlattr*)((char*)a + NLA_ALIGN(a->nla_len)))
-            if (a->nla_type == NL80211_ATTR_SSID)
-                ssid.assign((char*)a + NLA_HDRLEN, a->nla_len - NLA_HDRLEN);
+    if (send_msg(m)) {
+        ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);
+        for (nlmsghdr* h = (nlmsghdr*)rbuf; n > 0 && NLMSG_OK(h, (size_t)n);
+             h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type == fam) {
+                ssid = parse_iface_ssid(h);
+                if (!ssid.empty()) break;
+            }
+        }
     }
+    if (!ssid.empty()) {
+        close(fd);
+        return ssid;
+    }
+
+    // iwlwifi (and similar): SSID lives on the associated BSS, not the iface.
+    Msg d{};
+    d.nl.nlmsg_len   = NLMSG_LENGTH(GENL_HDRLEN);
+    d.nl.nlmsg_type  = fam;
+    d.nl.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    d.ge.cmd         = NL80211_CMD_GET_SCAN;
+    d.ge.version     = 0;
+    put_attr(d, NL80211_ATTR_IFINDEX, &idx32, sizeof idx32);
+    if (!send_msg(d)) {
+        close(fd);
+        return {};
+    }
+    for (;;) {
+        ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);
+        if (n <= 0) break;
+        bool done = false;
+        for (nlmsghdr* h = (nlmsghdr*)rbuf; NLMSG_OK(h, (size_t)n);
+             h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) {
+                done = true;
+                break;
+            }
+            if (h->nlmsg_type != fam) continue;
+            ssid = parse_bss_ssid(h);
+            if (!ssid.empty()) {
+                done = true;
+                break;
+            }
+        }
+        if (done) break;
+    }
+    close(fd);
     return ssid;
 }
 
@@ -2686,13 +2789,14 @@ public:
         if (stale_) {
             stale_ = false;
             refresh();
-        } else if (nl_fd_ < 0 && counter_++ % 5 == 0) {
-            refresh(); // no netlink (containers, odd kernels): old 5 s poll
+        } else if ((nl_fd_ < 0 || retry_ssid_) && counter_++ % 5 == 0) {
+            refresh(); // no netlink, or associated without SSID in cache yet
         }
     }
 private:
     void refresh() {
         std::string iface = default_iface();
+        retry_ssid_ = false;
         if (iface.empty()) {
             set_text(*bar_, "offline", cfg.c_dim);
             return;
@@ -2703,12 +2807,11 @@ private:
             return;
         }
         // In-process nl80211 query — the last steady-state external binary
-        // (iw) is gone. One genetlink round-trip to the local kernel is
-        // microseconds, the same latency class as the /proc/net/route read
-        // above, so no async machinery: it cannot stall the way a
-        // mid-association iw could. Empty answer (not associated, exotic
-        // kernel) degrades to the interface name, as before.
+        // (iw) is gone. GET_INTERFACE, then GET_SCAN for drivers that omit
+        // the iface SSID. Empty answer (not associated, empty scan cache)
+        // degrades to the interface name and retries on the next tick.
         std::string ssid = wifi_ssid(iface);
+        retry_ssid_ = ssid.empty();
         set_text(*bar_, ssid.empty() ? iface : ssid);
     }
     static std::string default_iface() {
@@ -2727,6 +2830,7 @@ private:
     unsigned counter_ = 0;
     int nl_fd_ = -1, debounce_fd_ = -1;
     bool stale_ = false;
+    bool retry_ssid_ = false;
 };
 } // namespace
 Module* make_network() { return new NetworkModule; }

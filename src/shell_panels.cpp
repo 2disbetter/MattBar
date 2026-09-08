@@ -10,6 +10,7 @@
 
 #include <linux/input-event-codes.h>
 #include <dirent.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 #include <cctype>
@@ -519,26 +520,25 @@ struct BtDev {
     enum Sect { Connected, Paired, Available } sect = Available;
 };
 
-static int bt_agent_ok(sd_bus_message* m, void*, sd_bus_error*) {
-    return sd_bus_reply_method_return(m, nullptr);
-}
-static int bt_agent_pin(sd_bus_message* m, void*, sd_bus_error*) {
-    return sd_bus_reply_method_return(m, "s", "0000");
-}
-static int bt_agent_pass(sd_bus_message* m, void*, sd_bus_error*) {
-    return sd_bus_reply_method_return(m, "u", (uint32_t)0);
-}
+static int bt_agent_ok(sd_bus_message* m, void*, sd_bus_error*);
+static int bt_agent_pin(sd_bus_message* m, void* ud, sd_bus_error*);
+static int bt_agent_pass(sd_bus_message* m, void* ud, sd_bus_error*);
+static int bt_agent_display_pin(sd_bus_message* m, void* ud, sd_bus_error*);
+static int bt_agent_display_pass(sd_bus_message* m, void* ud, sd_bus_error*);
+static int bt_agent_confirm(sd_bus_message* m, void* ud, sd_bus_error*);
+static int bt_agent_auth(sd_bus_message* m, void* ud, sd_bus_error*);
+static int bt_agent_cancel(sd_bus_message* m, void* ud, sd_bus_error*);
 static const sd_bus_vtable bt_agent_vtable[] = {
     SD_BUS_VTABLE_START(0),
     SD_BUS_METHOD("Release", "", "", bt_agent_ok, 0),
     SD_BUS_METHOD("RequestPinCode", "o", "s", bt_agent_pin, 0),
     SD_BUS_METHOD("RequestPasskey", "o", "u", bt_agent_pass, 0),
-    SD_BUS_METHOD("DisplayPinCode", "os", "", bt_agent_ok, 0),
-    SD_BUS_METHOD("DisplayPasskey", "ouq", "", bt_agent_ok, 0),
-    SD_BUS_METHOD("RequestConfirmation", "ou", "", bt_agent_ok, 0),
-    SD_BUS_METHOD("RequestAuthorization", "o", "", bt_agent_ok, 0),
+    SD_BUS_METHOD("DisplayPinCode", "os", "", bt_agent_display_pin, 0),
+    SD_BUS_METHOD("DisplayPasskey", "ouq", "", bt_agent_display_pass, 0),
+    SD_BUS_METHOD("RequestConfirmation", "ou", "", bt_agent_confirm, 0),
+    SD_BUS_METHOD("RequestAuthorization", "o", "", bt_agent_auth, 0),
     SD_BUS_METHOD("AuthorizeService", "os", "", bt_agent_ok, 0),
-    SD_BUS_METHOD("Cancel", "", "", bt_agent_ok, 0),
+    SD_BUS_METHOD("Cancel", "", "", bt_agent_cancel, 0),
     SD_BUS_VTABLE_END};
 
 static bool bt_human_name(const std::string& n) {
@@ -572,6 +572,14 @@ public:
     bool is_open() const override { return host_.is_open(); }
     ~BluetoothOverlay() override { close(); }
 
+    int  agent_pin(sd_bus_message* m);
+    int  agent_passkey(sd_bus_message* m);
+    int  agent_display_pin(sd_bus_message* m);
+    int  agent_display_pass(sd_bus_message* m);
+    int  agent_confirm(sd_bus_message* m);
+    int  agent_auth(sd_bus_message* m);
+    void agent_cancel();
+
 private:
     Host host_;
     SdPump pump_;
@@ -582,7 +590,19 @@ private:
     std::vector<Hit> hits_;
     int sel_ = 0, scroll_ = 0;
     bool powered_ = false, discovering_ = false;
+    bool adding_ = false, show_available_ = false;
     std::string pending_path_, pending_act_;
+    int scan_fd_ = -1;
+    enum class AgentAsk { None, Pin, Passkey, Confirm, Auth, Display };
+    struct {
+        sd_bus_message* msg = nullptr;
+        AgentAsk        ask = AgentAsk::None;
+        std::string     device;
+        std::string     name;
+        std::string     code;
+        bool            reply_pending = false;
+    } agent_;
+    TextField pin_;
 
     int W() const { return cfg.shell_panel_width; }
     int H() const { return cfg.shell_panel_height; }
@@ -591,6 +611,68 @@ private:
     void close() {
         stop_bus();
         host_.close();
+    }
+
+    std::string dev_label(const std::string& path) const {
+        auto it = by_path_.find(path);
+        if (it == by_path_.end()) return path;
+        if (!it->second.name.empty()) return it->second.name;
+        if (!it->second.addr.empty()) return it->second.addr;
+        return path;
+    }
+    void agent_clear() {
+        if (agent_.msg) {
+            sd_bus_message_unref(agent_.msg);
+            agent_.msg = nullptr;
+        }
+        agent_.ask = AgentAsk::None;
+        agent_.device.clear();
+        agent_.name.clear();
+        agent_.code.clear();
+        agent_.reply_pending = false;
+        pin_.clear();
+    }
+    void agent_hold(sd_bus_message* m, AgentAsk ask, const std::string& path,
+                    const std::string& code) {
+        agent_clear();
+        agent_.msg = sd_bus_message_ref(m);
+        agent_.ask = ask;
+        agent_.device = path;
+        agent_.name = dev_label(path);
+        agent_.code = code;
+        agent_.reply_pending = true;
+        pin_.clear();
+        pin_.password = ask == AgentAsk::Pin;
+        adding_ = true;
+        host_.redraw();
+    }
+    void agent_reject() {
+        if (agent_.msg && agent_.reply_pending) {
+            sd_bus_reply_method_errorf(agent_.msg, "org.bluez.Error.Rejected",
+                                       "rejected");
+        }
+        agent_clear();
+        host_.redraw();
+    }
+    void agent_accept() {
+        if (!agent_.msg || !agent_.reply_pending) return;
+        int r = 0;
+        if (agent_.ask == AgentAsk::Pin) {
+            if (pin_.text.empty()) return;
+            r = sd_bus_reply_method_return(agent_.msg, "s", pin_.text.c_str());
+        } else if (agent_.ask == AgentAsk::Passkey) {
+            if (pin_.text.empty()) return;
+            r = sd_bus_reply_method_return(agent_.msg, "u",
+                                           (uint32_t)atoi(pin_.text.c_str()));
+        } else {
+            r = sd_bus_reply_method_return(agent_.msg, nullptr);
+        }
+        (void)r;
+        agent_.reply_pending = false;
+        if (agent_.ask == AgentAsk::Pin || agent_.ask == AgentAsk::Passkey ||
+            agent_.ask == AgentAsk::Confirm || agent_.ask == AgentAsk::Auth)
+            agent_clear();
+        host_.redraw();
     }
 
     void open() {
@@ -607,7 +689,6 @@ private:
     }
 
     void rebuild() {
-        if (powered_ && !discovering_) start_discovery();
         devs_.clear();
         for (auto& [p, d] : by_path_) {
             if (p.find("/dev_") == std::string::npos && adapter_.empty())
@@ -618,7 +699,9 @@ private:
             x.sect = x.connected ? BtDev::Connected
                    : (x.paired || x.trusted) ? BtDev::Paired
                                              : BtDev::Available;
-            if (x.sect == BtDev::Available && !discovering_) continue;
+            if (x.sect == BtDev::Available && !discovering_ && !show_available_ &&
+                !adding_)
+                continue;
             devs_.push_back(std::move(x));
         }
         if (!adapter_.empty()) {
@@ -724,7 +807,6 @@ private:
             sd_bus_message_exit_container(m);
         }
         sd_bus_message_exit_container(m);
-        self->start_discovery();
         self->rebuild();
         return 0;
     }
@@ -776,6 +858,19 @@ private:
         self->pending_act_.clear();
         self->pending_path_.clear();
         if (!err && act == "pair" && path.size() && self->pump_.bus) {
+            sd_bus_message* set = nullptr;
+            if (sd_bus_message_new_method_call(
+                    self->pump_.bus, &set, "org.bluez", path.c_str(),
+                    "org.freedesktop.DBus.Properties", "Set") >= 0) {
+                sd_bus_message_append(set, "ss", "org.bluez.Device1", "Trusted");
+                sd_bus_message_open_container(set, 'v', "b");
+                sd_bus_message_append(set, "b", 1);
+                sd_bus_message_close_container(set);
+                sd_bus_call_async(self->pump_.bus, nullptr, set, nullptr,
+                                  nullptr, 0);
+                sd_bus_message_unref(set);
+            }
+            self->adding_ = false;
             self->pending_act_ = "connect";
             self->pending_path_ = path;
             sd_bus_call_method_async(self->pump_.bus, nullptr, "org.bluez",
@@ -783,23 +878,76 @@ private:
                                      "Connect", on_done, self, nullptr);
             self->pump_.process();
         }
+        if (!err && act == "connect") self->adding_ = false;
         self->rebuild();
         return 0;
     }
 
+    void arm_scan_timer(int seconds) {
+        auto* sh = mattbar_shell();
+        if (!sh || !sh->bar()) return;
+        if (scan_fd_ < 0) {
+            scan_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+            if (scan_fd_ < 0) return;
+            sh->bar()->add_fd(scan_fd_, [this](uint32_t) {
+                uint64_t n;
+                while (read(scan_fd_, &n, sizeof n) > 0) {}
+                if (discovering_ && agent_.ask == AgentAsk::None)
+                    stop_discovery();
+                host_.redraw();
+            }, "bt-scan-timeout");
+        }
+        itimerspec ts{};
+        ts.it_value.tv_sec = seconds;
+        timerfd_settime(scan_fd_, 0, &ts, nullptr);
+    }
+    void disarm_scan_timer() {
+        if (scan_fd_ < 0) return;
+        itimerspec off{};
+        timerfd_settime(scan_fd_, 0, &off, nullptr);
+    }
     void start_discovery() {
         if (!pump_.bus || adapter_.empty() || !powered_) return;
+        if (discovering_) {
+            arm_scan_timer(adding_ ? 60 : 20);
+            return;
+        }
         sd_bus_call_method_async(pump_.bus, nullptr, "org.bluez",
                                  adapter_.c_str(), "org.bluez.Adapter1",
                                  "StartDiscovery", nullptr, nullptr, nullptr);
         discovering_ = true;
+        show_available_ = true;
+        arm_scan_timer(adding_ ? 60 : 20);
+        host_.redraw();
     }
     void stop_discovery() {
-        if (!pump_.bus || adapter_.empty()) return;
-        sd_bus_call_method_async(pump_.bus, nullptr, "org.bluez",
-                                 adapter_.c_str(), "org.bluez.Adapter1",
-                                 "StopDiscovery", nullptr, nullptr, nullptr);
+        disarm_scan_timer();
+        if (!pump_.bus || adapter_.empty()) {
+            discovering_ = false;
+            return;
+        }
+        if (discovering_)
+            sd_bus_call_method_async(pump_.bus, nullptr, "org.bluez",
+                                     adapter_.c_str(), "org.bluez.Adapter1",
+                                     "StopDiscovery", nullptr, nullptr,
+                                     nullptr);
         discovering_ = false;
+    }
+    void toggle_scan() {
+        if (!powered_) {
+            toggle_power();
+            return;
+        }
+        if (discovering_) stop_discovery();
+        else start_discovery();
+        host_.redraw();
+    }
+    void begin_add() {
+        if (!powered_) toggle_power();
+        adding_ = true;
+        show_available_ = true;
+        start_discovery();
+        host_.redraw();
     }
 
     void start_bus() {
@@ -814,7 +962,7 @@ private:
         sd_bus_call_method_async(b, nullptr, "org.bluez", "/org/bluez",
                                  "org.bluez.AgentManager1", "RegisterAgent",
                                  nullptr, nullptr, "os",
-                                 "/org/bluez/mattbar/agent", "NoInputNoOutput");
+                                 "/org/bluez/mattbar/agent", "KeyboardDisplay");
         sd_bus_call_method_async(b, nullptr, "org.bluez", "/org/bluez",
                                  "org.bluez.AgentManager1", "RequestDefaultAgent",
                                  nullptr, nullptr, "o",
@@ -837,7 +985,14 @@ private:
     }
 
     void stop_bus() {
+        agent_reject();
         stop_discovery();
+        auto* sh = mattbar_shell();
+        if (scan_fd_ >= 0 && sh && sh->bar()) {
+            sh->bar()->remove_fd(scan_fd_);
+            ::close(scan_fd_);
+            scan_fd_ = -1;
+        }
         if (pump_.bus) {
             sd_bus_call_method(pump_.bus, "org.bluez", "/org/bluez",
                                "org.bluez.AgentManager1", "UnregisterAgent",
@@ -852,6 +1007,8 @@ private:
         by_path_.clear();
         adapter_.clear();
         discovering_ = false;
+        adding_ = false;
+        show_available_ = false;
         pending_act_.clear();
         pending_path_.clear();
     }
@@ -873,6 +1030,8 @@ private:
                                      d.path.c_str(), "org.bluez.Device1",
                                      "Connect", on_done, this, nullptr);
         } else {
+            adding_ = true;
+            stop_discovery();
             pending_act_ = "pair";
             pending_path_ = d.path;
             sd_bus_call_method_async(pump_.bus, nullptr, "org.bluez",
@@ -911,6 +1070,10 @@ private:
             sd_bus_message_close_container(m);
             sd_bus_call_async(pump_.bus, nullptr, m, nullptr, nullptr, 0);
             sd_bus_message_unref(m);
+            if (powered_) {
+                stop_discovery();
+                adding_ = false;
+            }
             pump_.process();
         }
     }
@@ -923,6 +1086,27 @@ private:
             toggle_power();
             return;
         }
+        if (h.kind == 5) {
+            toggle_scan();
+            return;
+        }
+        if (h.kind == 6) {
+            if (adding_) {
+                adding_ = false;
+                agent_reject();
+                stop_discovery();
+                host_.redraw();
+            } else begin_add();
+            return;
+        }
+        if (h.kind == 7) {
+            agent_accept();
+            return;
+        }
+        if (h.kind == 8) {
+            agent_reject();
+            return;
+        }
         if (h.row < 0 || h.row >= (int)devs_.size()) return;
         sel_ = h.row;
         if (btn == BTN_RIGHT) forget();
@@ -932,7 +1116,36 @@ private:
 
     void on_key(const Bar::KeyEvent& e) {
         if (!e.pressed) return;
+        if (agent_.ask == AgentAsk::Pin || agent_.ask == AgentAsk::Passkey) {
+            if (e.escape()) {
+                agent_reject();
+                return;
+            }
+            if (e.enter()) {
+                agent_accept();
+                return;
+            }
+            if (pin_.handle(e)) host_.redraw();
+            return;
+        }
+        if (agent_.ask == AgentAsk::Confirm || agent_.ask == AgentAsk::Auth) {
+            if (e.escape()) {
+                agent_reject();
+                return;
+            }
+            if (e.enter()) {
+                agent_accept();
+                return;
+            }
+            return;
+        }
         if (e.escape()) {
+            if (adding_) {
+                adding_ = false;
+                stop_discovery();
+                host_.redraw();
+                return;
+            }
             close();
             return;
         }
@@ -948,6 +1161,8 @@ private:
         }
         if (e.enter()) activate();
         if (e.keysym == 0xffff) forget();
+        if (e.keysym == 0x73 || e.keysym == 0x53) toggle_scan(); // s
+        if (e.keysym == 0x61 || e.keysym == 0x41) begin_add();   // a
     }
 
     void paint(cairo_t* cr) {
@@ -960,6 +1175,8 @@ private:
             const char* phrase = "No adapter";
             if (adapter_.empty()) phrase = "No adapter";
             else if (!powered_) phrase = "Turned Off";
+            else if (adding_ && agent_.ask == AgentAsk::None)
+                phrase = "Put the device in pairing mode, then tap it";
             else {
                 static const char* ps[] = {
                     "Untangling wires", "Streaming vikings", "Pairing mysteries",
@@ -978,26 +1195,103 @@ private:
                 else if (pending_act_ == "disconnect") sub = "DISCONNECTING\u2026";
                 else if (pending_act_ == "forget") sub = "FORGETTING\u2026";
             }
-            say(cr, 18, hh / 2.0 + 10, sub, cfg.c_dim);
+            say(cr, 18, hh / 2.0 + 10, utf8_trunc(sub, 42), cfg.c_dim);
             cairo_set_font_size(cr, fs());
         }
-        std::string tog = powered_ ? "On" : "Off";
-        double twid = tw(cr, tog) + 16;
-        col(cr, powered_ ? cfg.c_accent : cfg.c_ws_bg, 1);
-        rrect(cr, W() - 18 - twid, (hh - 22) / 2.0, twid, 22, 6);
-        cairo_fill(cr);
-        say(cr, W() - 18 - twid + 8, hh / 2.0, tog,
-            powered_ ? contrast_on(cfg.c_accent) : cfg.c_dim);
-        hits_.push_back({W() - 18.0 - twid, 8, twid, 24, -1, 4});
+        double ax = W() - 18;
+        auto hero_btn = [&](const char* label, int kind, bool on) {
+            double bw = tw(cr, label) + 16;
+            ax -= bw;
+            col(cr, on ? cfg.c_accent : cfg.c_ws_bg, 1);
+            rrect(cr, ax, (hh - 22) / 2.0, bw, 22, 6);
+            cairo_fill(cr);
+            say(cr, ax + 8, hh / 2.0, label,
+                on ? contrast_on(cfg.c_accent) : cfg.c_fg);
+            hits_.push_back({ax, 8, bw, 24, -1, kind});
+            ax -= 8;
+        };
+        hero_btn(powered_ ? "On" : "Off", 4, powered_);
+        if (powered_) {
+            hero_btn(adding_ ? "Cancel" : "Add", 6, adding_);
+            hero_btn(discovering_ ? "Stop" : "Scan", 5, discovering_);
+        }
 
         int y0 = hh + 4;
+        if (agent_.ask != AgentAsk::None) {
+            std::string title = agent_.name.empty() ? "New device" : agent_.name;
+            say(cr, 18, y0 + 14, utf8_trunc(title, 28), cfg.c_fg);
+            y0 += 28;
+            cairo_set_font_size(cr, std::max(10.0, fs() - 2));
+            if (agent_.ask == AgentAsk::Confirm) {
+                say(cr, 18, y0 + 8, "DOES THIS CODE MATCH?", cfg.c_accent);
+                cairo_set_font_size(cr, fs() + 8);
+                say(cr, 18, y0 + 36, agent_.code.empty() ? "------" : agent_.code,
+                    cfg.c_fg);
+                cairo_set_font_size(cr, fs());
+                y0 += 56;
+                double bw = tw(cr, "Confirm") + 16;
+                col(cr, cfg.c_accent, 1);
+                rrect(cr, W() - 18 - bw, y0, bw, 24, 6);
+                cairo_fill(cr);
+                say(cr, W() - 18 - bw + 8, y0 + 12, "Confirm",
+                    contrast_on(cfg.c_accent));
+                hits_.push_back({W() - 18.0 - bw, (double)y0, bw, 24, -1, 7});
+                bw = tw(cr, "Reject") + 16;
+                col(cr, cfg.c_ws_bg, 1);
+                rrect(cr, 18, y0, bw, 24, 6);
+                cairo_fill(cr);
+                say(cr, 26, y0 + 12, "Reject", cfg.c_fg);
+                hits_.push_back({18, (double)y0, bw, 24, -1, 8});
+                return;
+            }
+            if (agent_.ask == AgentAsk::Auth) {
+                say(cr, 18, y0 + 8, "ALLOW THIS DEVICE TO PAIR?", cfg.c_accent);
+                cairo_set_font_size(cr, fs());
+                y0 += 32;
+                double bw = tw(cr, "Allow") + 16;
+                col(cr, cfg.c_accent, 1);
+                rrect(cr, W() - 18 - bw, y0, bw, 24, 6);
+                cairo_fill(cr);
+                say(cr, W() - 18 - bw + 8, y0 + 12, "Allow",
+                    contrast_on(cfg.c_accent));
+                hits_.push_back({W() - 18.0 - bw, (double)y0, bw, 24, -1, 7});
+                bw = tw(cr, "Reject") + 16;
+                col(cr, cfg.c_ws_bg, 1);
+                rrect(cr, 18, y0, bw, 24, 6);
+                cairo_fill(cr);
+                say(cr, 26, y0 + 12, "Reject", cfg.c_fg);
+                hits_.push_back({18, (double)y0, bw, 24, -1, 8});
+                return;
+            }
+            if (agent_.ask == AgentAsk::Display) {
+                say(cr, 18, y0 + 8, "ENTER THIS CODE ON THE DEVICE", cfg.c_accent);
+                cairo_set_font_size(cr, fs() + 8);
+                say(cr, 18, y0 + 36, agent_.code.empty() ? "------" : agent_.code,
+                    cfg.c_fg);
+                cairo_set_font_size(cr, fs());
+                say(cr, 18, y0 + 64, "Waiting for the device\u2026", cfg.c_dim);
+                return;
+            }
+            say(cr, 18, y0 + 8,
+                agent_.ask == AgentAsk::Passkey ? "ENTER THE PASSKEY"
+                                                : "ENTER THE PIN",
+                cfg.c_accent);
+            cairo_set_font_size(cr, fs());
+            pin_.draw(cr, 18, y0 + 24, W() - 36, ov::search_h(fs()),
+                      agent_.ask == AgentAsk::Passkey ? "6-digit passkey"
+                                                      : "PIN");
+            say(cr, 18, y0 + 24 + ov::search_h(fs()) + 16,
+                "Enter to submit   Esc to cancel", cfg.c_dim);
+            return;
+        }
         int vis = std::max(1, (H() - y0 - 8) / rh);
         ov::keep_visible(sel_, scroll_, vis, (int)devs_.size());
         if (devs_.empty())
             say(cr, 18, y0 + rh / 2.0,
-                powered_ ? (discovering_ ? "Scanning for devices\u2026"
-                                         : "No devices")
-                         : "Turn Bluetooth on",
+                !powered_ ? "Turn Bluetooth on"
+                : discovering_ ? "Scanning for devices\u2026"
+                : adding_      ? "Waiting for the device to appear\u2026"
+                               : "No devices  \u2014  Scan or Add",
                 cfg.c_dim);
         int last_sect = -1;
         for (int i = 0; i < vis; ++i) {
@@ -1036,6 +1330,97 @@ private:
         }
     }
 };
+
+int BluetoothOverlay::agent_pin(sd_bus_message* m) {
+    const char* path = nullptr;
+    sd_bus_message_read(m, "o", &path);
+    agent_hold(m, AgentAsk::Pin, path ? path : "", "");
+    return 1;
+}
+int BluetoothOverlay::agent_passkey(sd_bus_message* m) {
+    const char* path = nullptr;
+    sd_bus_message_read(m, "o", &path);
+    agent_hold(m, AgentAsk::Passkey, path ? path : "", "");
+    return 1;
+}
+int BluetoothOverlay::agent_display_pin(sd_bus_message* m) {
+    const char* path = nullptr;
+    const char* pin = nullptr;
+    sd_bus_message_read(m, "os", &path, &pin);
+    agent_clear();
+    agent_.ask = AgentAsk::Display;
+    agent_.device = path ? path : "";
+    agent_.name = dev_label(agent_.device);
+    agent_.code = pin ? pin : "";
+    adding_ = true;
+    host_.redraw();
+    return sd_bus_reply_method_return(m, nullptr);
+}
+int BluetoothOverlay::agent_display_pass(sd_bus_message* m) {
+    const char* path = nullptr;
+    uint32_t pk = 0;
+    uint16_t entered = 0;
+    sd_bus_message_read(m, "ouq", &path, &pk, &entered);
+    (void)entered;
+    char code[8];
+    snprintf(code, sizeof code, "%06u", pk);
+    agent_clear();
+    agent_.ask = AgentAsk::Display;
+    agent_.device = path ? path : "";
+    agent_.name = dev_label(agent_.device);
+    agent_.code = code;
+    adding_ = true;
+    host_.redraw();
+    return sd_bus_reply_method_return(m, nullptr);
+}
+int BluetoothOverlay::agent_confirm(sd_bus_message* m) {
+    const char* path = nullptr;
+    uint32_t pk = 0;
+    sd_bus_message_read(m, "ou", &path, &pk);
+    char code[8];
+    snprintf(code, sizeof code, "%06u", pk);
+    agent_hold(m, AgentAsk::Confirm, path ? path : "", code);
+    return 1;
+}
+int BluetoothOverlay::agent_auth(sd_bus_message* m) {
+    const char* path = nullptr;
+    sd_bus_message_read(m, "o", &path);
+    agent_hold(m, AgentAsk::Auth, path ? path : "", "");
+    return 1;
+}
+void BluetoothOverlay::agent_cancel() {
+    if (agent_.msg && agent_.reply_pending)
+        sd_bus_reply_method_errorf(agent_.msg, "org.bluez.Error.Canceled",
+                                   "canceled");
+    agent_clear();
+    host_.redraw();
+}
+
+static int bt_agent_ok(sd_bus_message* m, void*, sd_bus_error*) {
+    return sd_bus_reply_method_return(m, nullptr);
+}
+static int bt_agent_pin(sd_bus_message* m, void* ud, sd_bus_error*) {
+    return static_cast<BluetoothOverlay*>(ud)->agent_pin(m);
+}
+static int bt_agent_pass(sd_bus_message* m, void* ud, sd_bus_error*) {
+    return static_cast<BluetoothOverlay*>(ud)->agent_passkey(m);
+}
+static int bt_agent_display_pin(sd_bus_message* m, void* ud, sd_bus_error*) {
+    return static_cast<BluetoothOverlay*>(ud)->agent_display_pin(m);
+}
+static int bt_agent_display_pass(sd_bus_message* m, void* ud, sd_bus_error*) {
+    return static_cast<BluetoothOverlay*>(ud)->agent_display_pass(m);
+}
+static int bt_agent_confirm(sd_bus_message* m, void* ud, sd_bus_error*) {
+    return static_cast<BluetoothOverlay*>(ud)->agent_confirm(m);
+}
+static int bt_agent_auth(sd_bus_message* m, void* ud, sd_bus_error*) {
+    return static_cast<BluetoothOverlay*>(ud)->agent_auth(m);
+}
+static int bt_agent_cancel(sd_bus_message* m, void* ud, sd_bus_error*) {
+    static_cast<BluetoothOverlay*>(ud)->agent_cancel();
+    return sd_bus_reply_method_return(m, nullptr);
+}
 
 // ---------------------------------------------------------------------------
 // Display (omarchy.monitor)

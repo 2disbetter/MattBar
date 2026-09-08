@@ -435,10 +435,10 @@ void SettingsWindow::draw() {
                     cfg.shell_network_font_size =
                         std::clamp(cfg.shell_network_font_size + d, 9.0, 22.0);
                 });
-        y += 30;
-        checkbox(24, y, "Scan on open", &cfg.shell_wifi_scan_on_open);
         y += 24;
-        y = hint(y, "left-click a network to connect; right-click forgets");
+        y = hint(y, "Scan is manual (button or R). Opening the panel does not rescan.");
+        y += 16;
+        y = hint(y, "Left-click connects; right-click forgets");
         y += 36;
 
         section(y, "Bluetooth");
@@ -449,10 +449,10 @@ void SettingsWindow::draw() {
                     cfg.shell_bluetooth_font_size =
                         std::clamp(cfg.shell_bluetooth_font_size + d, 9.0, 22.0);
                 });
-        y += 30;
-        checkbox(24, y, "Scan on open", &cfg.shell_bt_scan_on_open);
         y += 24;
-        y = hint(y, "left-click connect/disconnect; right-click forgets");
+        y = hint(y, "Scan and Add are manual. Add walks through pairing a new device.");
+        y += 16;
+        y = hint(y, "Left-click connects; right-click forgets");
         y += 36;
 
         section(y, "Display");

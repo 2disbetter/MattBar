@@ -39,7 +39,7 @@ struct Hit {
     double x, y, w, h;
     int    row  = -1;
     int    kind = 0; // 0 wifi, 4 wifi-toggle, 5 qr, 6 speed, 7 band-auto,
-                     // 8 band-pill, 9 dns-pill, 10 forget
+                     // 8 band-pill, 9 dns-pill, 10 forget, 11 scan
     std::string tag;
 };
 int hit_at(const std::vector<Hit>& hits, double x, double y) {
@@ -150,7 +150,9 @@ private:
         };
         host_.win.pkey = [this](const Bar::KeyEvent& e) { on_key(e); };
         host_.open(W(), H(), "mattbar-network", id(), true, Host::Place::BarEnd);
-        reload_list(cfg.shell_wifi_scan_on_open);
+        // Cached list only. A live rescan is the Scan button (or R), and
+        // never starts on its own while we already have a connection.
+        reload_list(false);
         refresh_details();
         arm_poll();
     }
@@ -429,6 +431,10 @@ private:
             reload_list(false);
             return;
         }
+        if (h.kind == 11) {
+            if (!scanning_) reload_list(true);
+            return;
+        }
         if (h.kind == 5) {
             auto* sh = mattbar_shell();
             if (sh) sh->summon("omarchy.wifiqr", "{}");
@@ -578,6 +584,17 @@ private:
         }
         if (!info_["iface"].empty()) hero_btn("Speed", 6);
         if (wifi_connected()) hero_btn("QR", 5);
+        if (wifi_on_) {
+            const char* sl = scanning_ ? "Scanning" : "Scan";
+            double bw = tw(cr, sl) + 14;
+            ax -= bw;
+            col(cr, scanning_ ? cfg.c_accent : cfg.c_ws_bg, 1);
+            rrect(cr, ax, y + 6, bw, 24, 6);
+            cairo_fill(cr);
+            say(cr, ax + 7, y + 18, sl,
+                scanning_ ? contrast_on(cfg.c_accent) : cfg.c_fg);
+            hits_.push_back({ax, y + 6, bw, 24, -1, 11, {}});
+        }
         y += 48;
 
         // ---- Stats (same grid as Quickshell: ping/loss, rx/tx, totals, IP) -

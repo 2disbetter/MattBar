@@ -168,8 +168,8 @@ struct Config {
     int  shell_audio_step         = 5;     // volume % per key / scroll
     bool shell_audio_show_apps    = true;  // per-app mixer in the audio panel
     bool shell_audio_show_pct     = true;  // numeric % next to sliders
-    bool shell_wifi_scan_on_open  = true;
-    bool shell_bt_scan_on_open    = true;
+    bool shell_wifi_scan_on_open  = false; // kept for conf compat; unused
+    bool shell_bt_scan_on_open    = false; // kept for conf compat; unused
     int  shell_clipboard_limit    = 300;
     bool shell_clipboard_paste    = true;  // paste into the focused window
     bool shell_emoji_insert       = true;  // type the emoji vs copy-only
