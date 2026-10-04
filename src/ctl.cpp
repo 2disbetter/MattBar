@@ -1,3 +1,5 @@
+#include "buildinfo.hpp"
+#include "hyprev.hpp"
 #include "ctl.hpp"
 #include "bar.hpp"
 #include "config.hpp"
@@ -5,6 +7,9 @@
 #include "notify.hpp"
 #include "qs_plugins.hpp"
 #include "shell.hpp"
+#include "imgwork.hpp"
+#include "shm.hpp"
+#include "wallpaper.hpp"
 
 #include <poll.h>
 #include <sys/socket.h>
@@ -18,6 +23,9 @@
 #include <cstring>
 #include <sstream>
 #include <vector>
+#include <cstdint>
+#include <string>
+#include <cstdlib>
 
 static std::string trimline(const char* s);
 
@@ -76,8 +84,7 @@ void CtlServer::init(Bar& bar) {
                     "it first for a clean debug run:\n"
                     "mattbar:     systemctl --user stop mattbar\n",
                     path_.c_str());
-            close(listen_fd_);
-            listen_fd_ = -1;
+            Bar::close_fd(listen_fd_);
             return;
         }
         close(probe);
@@ -91,8 +98,7 @@ void CtlServer::init(Bar& bar) {
         // socket, so just say so once and move on.
         fprintf(stderr, "mattbar: ctl socket unavailable at %s\n",
                 path_.c_str());
-        close(listen_fd_);
-        listen_fd_ = -1;
+        Bar::close_fd(listen_fd_);
         return;
     }
     chmod(path_.c_str(), S_IRUSR | S_IWUSR); // 0600 even if umask was looser
@@ -135,7 +141,7 @@ void CtlServer::init(Bar& bar) {
 }
 
 CtlServer::~CtlServer() {
-    if (listen_fd_ >= 0) close(listen_fd_);
+    Bar::close_fd(listen_fd_);
     if (!path_.empty()) unlink(path_.c_str());
 }
 
@@ -202,6 +208,53 @@ std::string CtlServer::handle(const std::string& line) {
         return "profile " + arg;
     }
 
+    if (cmd == "render-stats") {
+        // Draws, buffer allocations and frame-paced skips since start,
+        // plus the wallpaper engine's state (package D diagnostics).
+        // wayland-socket-full: how often the compositor's socket was full
+        // (package F) and for how long, until the queue drained.
+        const auto& wf = bar_->wl_flush_stats();
+        char buf[384];
+        snprintf(buf, sizeof buf,
+                 "bar-draws: %llu\nshm-buffers-created: %llu\n"
+                 "draws-deferred-to-frame: %llu\nimage-decodes: %llu\n"
+                 "wayland-socket-full: %llu worst=%llums last=%llums%s\n",
+                 (unsigned long long)bar_->draw_count(),
+                 (unsigned long long)g_shm_allocs,
+                 (unsigned long long)g_frames_deferred,
+                 (unsigned long long)img_decodes_total(),
+                 (unsigned long long)wf.stalls,
+                 (unsigned long long)wf.worst_stall_ms,
+                 (unsigned long long)wf.last_stall_ms,
+                 wf.stalled_now ? " (full now)" : "");
+        return std::string(buf) + "wallpaper: " + wallpaper_debug_state();
+    }
+
+    if (cmd == "ipc-stats") {
+        // Package E diagnostics: the shared Hyprland event stream, async
+        // command-socket requests, and the tray's D-Bus state.
+        auto st = hyprev::stats();
+        auto sy = hypr_sync_stats();
+        char buf[768];
+        snprintf(buf, sizeof buf,
+                 "hypr-events: %s subscribers=%d connects=%llu drops=%llu "
+                 "wakeups=%llu lines=%llu delivered=%llu\n"
+                 "hypr-requests: total=%llu failed=%llu\n"
+                 "hypr-blocking: total=%llu timeouts=%llu fast-fails=%llu "
+                 "failed=%llu worst=%llums\n",
+                 hyprev::connected() ? "up" : "down", st.subscribers,
+                 (unsigned long long)st.connects, (unsigned long long)st.drops,
+                 (unsigned long long)st.wakeups, (unsigned long long)st.lines,
+                 (unsigned long long)st.delivered,
+                 (unsigned long long)hypr_async_total(),
+                 (unsigned long long)hypr_async_failed(),
+                 (unsigned long long)sy.total, (unsigned long long)sy.timeouts,
+                 (unsigned long long)sy.fast_fails,
+                 (unsigned long long)sy.failed,
+                 (unsigned long long)sy.worst_ms);
+        return std::string(buf) + tray_debug_state();
+    }
+
     if (cmd == "pin") {
         bool cur = bar_->pinned();
         if (arg == "on" && !cur) bar_->toggle_pinned();
@@ -251,8 +304,32 @@ std::string CtlServer::handle(const std::string& line) {
         bar_->open_settings();
         return "open";
     }
+    if (cmd == "version") {
+        // The RUNNING instance (`mattbar --version` reports the file on
+        // disk): after a rebuild/reinstall, this says whether a restart
+        // is still needed.
+        const BuildInfo& b = build_info();
+        std::string out = "mattbar " + b.version + " build " + b.id +
+                          "\nbuilt: " + b.linked + "\npath: " + b.path;
+        std::string disk;
+        switch (exe_state(&disk)) {
+        case ExeState::Same:
+            out += "\non disk: this build";
+            break;
+        case ExeState::Replaced:
+            out += "\non disk: a different build (built " + disk +
+                   ") - restart mattbar to run it";
+            break;
+        case ExeState::Gone:
+            out += "\non disk: missing (uninstalled or moved)";
+            break;
+        }
+        return out;
+    }
+
     if (cmd == "status") {
-        std::string out = "mattbar " + std::string(MATTBAR_VERSION);
+        std::string out = "mattbar " + std::string(MATTBAR_VERSION) +
+                          " build " + build_info().short_id;
         out += bar_->pinned() ? " pinned" : "";
         if (nd) {
             out += nd->dnd() ? " dnd" : "";
@@ -276,7 +353,7 @@ std::string CtlServer::handle(const std::string& line) {
     }
     if (cmd == "agents") {
         if (arg == "pick") {
-            agents_pick();
+            spawn_detached("omarchy-agent --pick");
             return "ok";
         }
         if (arg == "toggle" || arg == "click" || arg.empty()) {
@@ -286,12 +363,26 @@ std::string CtlServer::handle(const std::string& line) {
         }
         return "usage: agents [toggle|pick]";
     }
+    if (cmd == "localllm") {
+        if (arg == "stop") {
+            local_llm_shutdown();
+            if (bar_) bar_->request_draw();
+            return "ok";
+        }
+        if (arg == "toggle" || arg == "click" || arg.empty()) {
+            local_llm_hotkey();
+            if (bar_) bar_->request_draw();
+            return "ok";
+        }
+        return "usage: localllm [toggle|stop]";
+    }
     if (cmd == "help" || cmd.empty())
         return "commands: dnd [on|off|toggle|status], dismiss, dismiss-all,\n"
                "invoke, restore, profile [name], pin [on|off|toggle|status],\n"
                "reveal, hide, hold [on|off|status], settings [open|toggle|close|status], status,\n"
+               "version, render-stats, ipc-stats,\n"
                "plugins [status|stop],\n"
-               "agents [toggle|pick],\n"
+               "agents [toggle|pick], localllm [toggle|stop],\n"
                "shell ping|toggle|summon|hide <id> [payload],\n"
                "notifications dismissOne|dismissAll|invokeLast|toggleDnd,\n"
                "osd show <json>, media playPause|next|previous,\n"

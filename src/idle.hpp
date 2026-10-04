@@ -19,8 +19,10 @@ void        idle_restore_pointer();
 void        idle_shutdown();
 std::string idle_status_json();
 std::string idle_set_enabled(bool on); // stay-awake inverted, like Omarchy IPC
-// Kill ttfx / org.omarchy.screensaver. Safe if none is running. Call
-// before showing the lock so the saver is not still burning CPU.
+// SIGKILL ttfx / omarchy-screensaver / the screensaver terminal (never
+// SIGTERM: the script's trap deadlocks Ghostty). Then window.kill and
+// wait until the processes are gone. Call before showing or dropping
+// the lock so a leftover saver cannot cover the session.
 void        idle_stop_screensaver();
 int         idle_screensaver_s();
 int         idle_lock_s();
@@ -29,3 +31,6 @@ void        idle_set_lock_s(int s);
 // Screensaver is covering the session. Mapping a notification overlay
 // on top is treated as activity and brings the panel back.
 bool        idle_screensaver_up();
+// Real key in the screensaver terminal (not mouse CSI, focus reports,
+// or OSC replies). Called from `mattbarctl idle screensaver-key`.
+void        idle_screensaver_key();

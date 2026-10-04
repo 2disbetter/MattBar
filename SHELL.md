@@ -144,7 +144,7 @@ UI exists. **new** = not started.
 |---|---|---|
 | Session lock | done | `ext-session-lock-v1` on every output; PAM `omarchy-lock-password`; parallel `omarchy-lock-fingerprint` when fprintd reports an enrolled finger |
 | Polkit agent | done | `org.freedesktop.PolicyKit1.AuthenticationAgent`; password via `polkit-agent-helper-1`. Fingerprint via `pam_fprintd` (lid-closed skips it) |
-| Wallpaper | done | Fullscreen layer per output; 420ms slanted wipe on `set` / `transition` / `refresh`; `setInstant` snaps |
+| Wallpaper | done | Fullscreen layer per output, including monitors plugged in later; decoded once on a worker thread and pre-scaled per output; 420ms slanted wipe paced by frame callbacks on `set` / `transition` / `refresh`; `setInstant` snaps. Settings → Look → Background picks the image and the monitor mode (`wallpaper_monitors` = same / main / mix / each, `wallpaper_outputs` for per-monitor picks) |
 | Idle | done | Screensaver after N s, lock after M s (`idle.lock` / `idle.screensaver` in shell.json); enable/disable/toggle (Stay Awake); caffeine inhibitor respected |
 | Night light | done | Own hyprsunset temperature (4000 / 6500 K); enable/disable/toggle/status/refresh; bar moon indicator |
 | Notifications | done | Daemon, popups, DND, history, IPC aliases (`dismissOne`, `dismissAll`, `invokeLast`, `showHistory`, `toggleDnd`) |

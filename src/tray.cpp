@@ -38,9 +38,23 @@
 #include <map>
 #include <set>
 #include <dlfcn.h>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility>
+#include <cstdio>
+#include <cstdlib>
+
+#ifndef DBG
+#define DBG(...)                                                              \
+    do {                                                                      \
+        if (getenv("MATTBAR_DEBUG")) {                                        \
+            fprintf(stderr, "mattbar: " __VA_ARGS__);                         \
+            fputc('\n', stderr);                                             \
+        }                                                                     \
+    } while (0)
+#endif
 
 namespace {
 
@@ -62,11 +76,39 @@ struct TrayItem {
     std::string theme_path; // StatusNotifierItem.IconThemePath
     bool only_menu = false; // ItemIsMenu, or appindicator with no Activate UI
     cairo_surface_t* icon = nullptr;
-    long icon_ms = 0;     // last icon load (throttles NewIcon storms)
-    // Bus-side filtered subscriptions, scoped to THIS item's name only.
+    // Async property loading (package E). Every D-Bus reply finds its item
+    // again by uid, so items may come and go while calls are in flight.
+    uint64_t    uid = 0;
+    std::string owner;         // unique name (:1.x) that answers for it
+    int         iface_idx = 0; // ITEM_IFACES index being tried / answered
+    bool        ready    = false; // first GetAll answered (or gave up)
+    bool        fetching = false; // a GetAll is in flight
+    bool        refetch  = false; // NewIcon arrived meanwhile / too soon
+    long        fetch_ms = 0;     // when the last GetAll was sent
+    // Bus-side filtered subscriptions, scoped to THIS item only.
     sd_bus_slot* watch_owner = nullptr; // its NameOwnerChanged
-    sd_bus_slot* watch_icon  = nullptr; // its NewIcon
+    sd_bus_slot* watch_icon  = nullptr; // its NewIcon (sender = owner)
+    std::string  icon_match_owner;      // owner watch_icon was built for
 };
+
+// D-Bus names and paths end up inside match rules; one quote from a buggy
+// app would make the rule unparseable. Accept the characters the spec
+// allows and nothing else.
+static bool bus_name_ok(const std::string& s) {
+    if (s.empty() || s.size() > 255) return false;
+    for (char c : s)
+        if (!(isalnum(static_cast<unsigned char>(c)) || c == '_' ||
+              c == '-' || c == '.' || c == ':'))
+            return false;
+    return true;
+}
+static bool obj_path_ok(const std::string& s) {
+    if (s.empty() || s[0] != '/') return false;
+    for (char c : s)
+        if (!(isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '/'))
+            return false;
+    return true;
+}
 
 static long now_ms() {
     timespec ts;
@@ -196,14 +238,46 @@ int parse_menu_node(sd_bus_message* m, MenuNode& out) {
 // ---------------------------------------------------------------------------
 class TrayModule : public Module {
 public:
+    TrayModule() { g_tray = this; }
     ~TrayModule() override {
+        if (g_tray == this) g_tray = nullptr;
+        cancel_menu_request();
         close_menu();
         for (auto& it : items_) {
             unwatch_item(it);
             if (it.icon) cairo_surface_destroy(it.icon);
         }
-        if (bus_) sd_bus_unref(bus_);
+        // Frees the in-flight call slots too; their callbacks never run.
+        Bar::unwatch_fd(bus_fd_);
+        if (bus_) sd_bus_unref(bus_); // closes bus_fd_
+        bus_fd_ = -1;
+        for (int* fd : {&refresh_fd_, &collapse_fd_, &bus_timer_fd_,
+                        &reconnect_fd_})
+            Bar::close_fd(*fd);
     }
+
+    // ctl ipc-stats
+    std::string debug_state() const {
+        int ready = 0, fetching = 0;
+        for (auto& it : items_) {
+            ready += it.ready;
+            fetching += it.fetching;
+        }
+        char b[320];
+        snprintf(b, sizeof b,
+                 "tray: bus=%s watcher=%s items=%zu ready=%d in-flight=%d "
+                 "getall-sent=%llu getall-failed=%llu newicon=%llu "
+                 "menu-requests=%llu menu-stale=%llu\n",
+                 bus_ ? "up" : "down", we_are_watcher_ ? "self" : "external",
+                 items_.size(), ready, fetching,
+                 (unsigned long long)n_getall_,
+                 (unsigned long long)n_getall_failed_,
+                 (unsigned long long)n_newicon_,
+                 (unsigned long long)n_menu_req_,
+                 (unsigned long long)n_menu_stale_);
+        return b;
+    }
+    static TrayModule* g_tray;
 
     void init(Bar& bar) override {
         bar_ = &bar;
@@ -228,15 +302,27 @@ public:
                 schedule_reconnect();
             }
         }, "dbus-reconnect");
+        // Trailing edge for NewIcon bursts: a refresh that arrives too
+        // soon after the previous one is deferred here, never dropped.
+        refresh_fd_ =
+            timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        bar.add_fd(refresh_fd_, [this](uint32_t) {
+            uint64_t n;
+            while (read(refresh_fd_, &n, sizeof n) > 0) {}
+            run_due_refreshes();
+        }, "tray-icon-refresh");
         setup_bus();
         init_collapse_timer(bar);
     }
 
     bool setup_bus() {
         if (sd_bus_open_user(&bus_) < 0) { bus_ = nullptr; return false; }
-        // Cap EVERY synchronous call (icon/menu property gets, GetLayout,
-        // host registration) at 500 ms. The sd-bus default is 25 s, which
-        // let one hung or mutually-waiting peer freeze the entire bar.
+        // Nothing here waits on a tray app any more: item properties,
+        // menus and the external-watcher handshake are all async calls
+        // with their own timeouts. The only synchronous calls left are the
+        // two RequestName calls to the bus daemon below. This cap is the
+        // default for those and for fire-and-forget calls (Activate,
+        // Scroll, Event), whose replies nobody waits for.
         sd_bus_set_method_call_timeout(bus_, 500 * 1000ULL);
 
         // Try to be THE watcher.
@@ -256,28 +342,45 @@ public:
             sd_bus_emit_signal(bus_, WATCHER_PATH, WATCHER_IFACE,
                                "StatusNotifierHostRegistered", "");
         } else {
-            // External watcher: announce ourselves, pull existing items,
-            // and follow its (un)register signals.
-            sd_bus_call_method(bus_, WATCHER_NAME, WATCHER_PATH, WATCHER_IFACE,
-                               "RegisterStatusNotifierHost", nullptr, nullptr,
-                               "s", host_name_.c_str());
-            char** strv = nullptr;
-            if (sd_bus_get_property_strv(bus_, WATCHER_NAME, WATCHER_PATH,
-                                         WATCHER_IFACE,
-                                         "RegisteredStatusNotifierItems",
-                                         nullptr, &strv) >= 0 && strv) {
-                for (char** p = strv; *p; ++p) {
-                    add_item_from_spec(*p, "");
-                    free(*p);
-                }
-                free(strv);
+            // External watcher (another bar owns the name): follow its
+            // (un)register signals, announce ourselves, pull the items it
+            // already has. All async: that watcher is just another app,
+            // and a stuck one must not stall this bar.
+            sd_bus_match_signal_async(bus_, nullptr, WATCHER_NAME,
+                                      WATCHER_PATH, WATCHER_IFACE,
+                                      "StatusNotifierItemRegistered",
+                                      on_ext_registered, on_match_installed,
+                                      this);
+            sd_bus_match_signal_async(bus_, nullptr, WATCHER_NAME,
+                                      WATCHER_PATH, WATCHER_IFACE,
+                                      "StatusNotifierItemUnregistered",
+                                      on_ext_unregistered, on_match_installed,
+                                      this);
+            sd_bus_call_method_async(bus_, nullptr, WATCHER_NAME, WATCHER_PATH,
+                                     WATCHER_IFACE,
+                                     "RegisterStatusNotifierHost", nullptr,
+                                     nullptr, "s", host_name_.c_str());
+            sd_bus_message* q = nullptr;
+            if (sd_bus_message_new_method_call(
+                    bus_, &q, WATCHER_NAME, WATCHER_PATH,
+                    "org.freedesktop.DBus.Properties", "Get") >= 0) {
+                sd_bus_message_append(q, "ss", WATCHER_IFACE,
+                                      "RegisteredStatusNotifierItems");
+                call_async(q, 5 * 1000000ULL, [this](sd_bus_message* r) {
+                    if (sd_bus_message_is_method_error(r, nullptr)) return;
+                    if (sd_bus_message_enter_container(r, 'v', "as") <= 0)
+                        return;
+                    char** strv = nullptr;
+                    if (sd_bus_message_read_strv(r, &strv) >= 0 && strv) {
+                        for (char** p = strv; *p; ++p) {
+                            add_item_from_spec(*p, "");
+                            free(*p);
+                        }
+                        free(strv);
+                    }
+                });
+                sd_bus_message_unref(q);
             }
-            sd_bus_match_signal(bus_, nullptr, WATCHER_NAME, WATCHER_PATH,
-                                WATCHER_IFACE, "StatusNotifierItemRegistered",
-                                on_ext_registered, this);
-            sd_bus_match_signal(bus_, nullptr, WATCHER_NAME, WATCHER_PATH,
-                                WATCHER_IFACE, "StatusNotifierItemUnregistered",
-                                on_ext_unregistered, this);
         }
 
         // NOTE: deliberately NO broad matches here. A global
@@ -436,6 +539,10 @@ public:
 
         if (!expanded_) return;
         double along = a + GEAR_W + CHEV_W + TRAY_ICON_GAP;
+        if (static_cast<int>(along) != logged_slot_) { // tests locate icons
+            logged_slot_ = static_cast<int>(along);
+            DBG("tray: slot at %.0f, items from %.0f", a, along);
+        }
         for (auto& it : items_) {
             if (item_hidden(it)) continue;
             double ix = vert ? (t - TRAY_ICON_SIZE) / 2.0 : along;
@@ -543,6 +650,7 @@ private:
     // of the same status, and the native icon is the worse of them.
     // If the widget lives only in More (or is disabled), show the SNI.
     bool item_hidden(const TrayItem& it) const {
+        if (!it.ready) return true; // properties not loaded yet
         if (!cfg.show_dropbox) return false;
         int z = cfg.layout_zone_of("dropbox");
         if (z < 0 || z > 2) return false;
@@ -717,8 +825,9 @@ private:
                 "mattbar: D-Bus connection lost (%s); tray disabled, "
                 "reconnecting shortly\n", why);
         close_menu();
+        cancel_menu_request();
         for (auto& it : items_) unwatch_item(it);
-        if (bus_fd_ >= 0) bar_->remove_fd(bus_fd_);
+        Bar::unwatch_fd(bus_fd_);
         bus_fd_ = -1;
         if (watcher_slot_) sd_bus_slot_unref(watcher_slot_);
         watcher_slot_ = nullptr;
@@ -736,6 +845,54 @@ private:
         schedule_reconnect();
     }
 
+    // ---- async call plumbing ---------------------------------------------
+    // One heap context per call, freed by sd-bus when the slot goes away
+    // (reply handled, timed out, or the connection torn down), so a
+    // callback can never outlive what it captured without being dropped.
+    struct Call {
+        std::function<void(sd_bus_message*)> fn;
+    };
+    static int call_trampoline(sd_bus_message* m, void* ud, sd_bus_error*) {
+        static_cast<Call*>(ud)->fn(m);
+        return 1;
+    }
+    static void call_free(void* ud) { delete static_cast<Call*>(ud); }
+
+    // Send msg; fn(reply) runs on the loop with a method return or an
+    // error (including sd-bus's own timeout error). The slot floats: the
+    // bus owns it, and freeing the bus frees it without calling fn.
+    bool call_async(sd_bus_message* msg, uint64_t usec,
+                    std::function<void(sd_bus_message*)> fn) {
+        if (!bus_) return false;
+        auto*        c    = new Call{std::move(fn)};
+        sd_bus_slot* slot = nullptr;
+        if (sd_bus_call_async(bus_, &slot, msg, call_trampoline, c, usec) <
+            0) {
+            delete c;
+            return false;
+        }
+        sd_bus_slot_set_destroy_callback(slot, call_free);
+        sd_bus_slot_set_floating(slot, 1);
+        sd_bus_slot_unref(slot);
+        return true;
+    }
+
+    // Async AddMatch replies land here. Without an install callback sd-bus
+    // treats a failed AddMatch as fatal for the whole connection.
+    static int on_match_installed(sd_bus_message* m, void*, sd_bus_error*) {
+        const sd_bus_error* e = sd_bus_message_get_error(m);
+        if (e && e->name)
+            fprintf(stderr, "mattbar: tray: match not installed: %s\n",
+                    e->message ? e->message : e->name);
+        return 0;
+    }
+
+    TrayItem* find_uid(uint64_t uid) {
+        for (auto& it : items_)
+            if (it.uid == uid) return &it;
+        return nullptr;
+    }
+
     // ---- item bookkeeping ------------------------------------------------
     // spec is either "/obj/path" (service = sender), ":1.42/obj/path",
     // "busname" (path defaults to /StatusNotifierItem)
@@ -751,22 +908,27 @@ private:
             svc  = spec.empty() ? sender : spec;
             path = "/StatusNotifierItem";
         }
-        if (svc.empty()) return false;
+        if (!bus_name_ok(svc) || !obj_path_ok(path)) {
+            if (!svc.empty())
+                fprintf(stderr, "mattbar: tray: ignoring malformed item "
+                                "registration\n");
+            return false;
+        }
         for (auto& it : items_)
             if (it.service == svc && it.path == path)
                 return false; // already known: NOT a new registration
         TrayItem item;
+        item.uid     = ++next_uid_;
         item.service = svc;
         item.path    = path;
         item.iface   = ITEM_IFACES[0];
-        fetch_menu_path(item);
-        load_icon(item);
-        if (item.menu.empty()) fetch_menu_path(item);
-        if (!item.only_menu && !item.menu.empty() && item_named(item, "dropbox"))
-            item.only_menu = true;
+        // Best guess until the first reply names the real owner: a unique
+        // name is its own owner; otherwise whoever registered it.
+        item.owner = svc[0] == ':' ? svc : sender;
         watch_item(item);
-        items_.push_back(item);
-        bar_->request_draw();
+        items_.push_back(std::move(item));
+        // Hidden until its properties arrive (no placeholder flash).
+        fetch_props(items_.back());
         return true;
     }
 
@@ -775,18 +937,45 @@ private:
             "type='signal',sender='org.freedesktop.DBus',"
             "path='/org/freedesktop/DBus',interface='org.freedesktop.DBus',"
             "member='NameOwnerChanged',arg0='" + item.service + "'";
-        sd_bus_add_match(bus_, &item.watch_owner, m1.c_str(),
-                         on_name_owner_changed, this);
-        std::string m2 = "type='signal',sender='" + item.service +
-                         "',member='NewIcon'";
-        sd_bus_add_match(bus_, &item.watch_icon, m2.c_str(), on_new_icon,
-                         this);
+        sd_bus_add_match_async(bus_, &item.watch_owner, m1.c_str(),
+                               on_name_owner_changed, on_match_installed,
+                               this);
+    }
+
+    // NewIcon is matched on the OWNER's unique name plus the item's path.
+    // Signals always carry the unique sender; items registered under a
+    // well-known name (most Qt/KDE apps) never matched the old compare of
+    // registered name against sender, so their icons never updated. The
+    // callback carries the item's uid, so no name comparison is needed.
+    void watch_icon(TrayItem& item) {
+        if (item.owner.empty() || item.owner == item.icon_match_owner) return;
+        if (item.watch_icon) sd_bus_slot_unref(item.watch_icon);
+        item.watch_icon       = nullptr;
+        item.icon_match_owner = item.owner;
+        std::string m = "type='signal',sender='" + item.owner + "',path='" +
+                        item.path + "',member='NewIcon'";
+        const uint64_t uid = item.uid;
+        auto* c = new Call{[this, uid](sd_bus_message*) {
+            if (TrayItem* it = find_uid(uid)) {
+                ++n_newicon_;
+                request_refresh(*it);
+            }
+        }};
+        if (sd_bus_add_match_async(bus_, &item.watch_icon, m.c_str(),
+                                   call_trampoline, on_match_installed,
+                                   c) < 0) {
+            delete c;
+            item.watch_icon = nullptr;
+            return;
+        }
+        sd_bus_slot_set_destroy_callback(item.watch_icon, call_free);
     }
 
     static void unwatch_item(TrayItem& item) {
         if (item.watch_owner) sd_bus_slot_unref(item.watch_owner);
         if (item.watch_icon) sd_bus_slot_unref(item.watch_icon);
         item.watch_owner = item.watch_icon = nullptr;
+        item.icon_match_owner.clear();
     }
 
     void remove_items_for(const std::string& svc) {
@@ -794,6 +983,7 @@ private:
         for (auto it = items_.begin(); it != items_.end();) {
             if (it->service == svc) {
                 if (menu_ && menu_->service == svc) close_menu();
+                if (menu_req_ && menu_req_svc_ == svc) cancel_menu_request();
                 unwatch_item(*it);
                 if (it->icon) cairo_surface_destroy(it->icon);
                 it = items_.erase(it);
@@ -814,78 +1004,209 @@ private:
                                        nullptr);
     }
 
-    void fetch_menu_path(TrayItem& item) {
-        sd_bus_message* reply = nullptr;
-        if (sd_bus_get_property(bus_, item.service.c_str(), item.path.c_str(),
-                                item.iface.c_str(), "Menu", nullptr, &reply,
-                                "o") >= 0) {
-            const char* mp = nullptr;
-            sd_bus_message_read(reply, "o", &mp);
-            if (mp && *mp && strcmp(mp, "/") != 0) item.menu = mp;
-            sd_bus_message_unref(reply);
-        }
+    // ---- properties (one async GetAll per load) --------------------------
+    // Registration used to cost up to eight blocking property reads (Menu
+    // twice, IconName, IconThemePath, Id, Title, ItemIsMenu, IconPixmap),
+    // each capped at 500 ms: ~4 s of frozen bar per registration from a
+    // hung app. Now it is one call whose reply is handled whenever it
+    // comes; a slow app only delays its own icon.
+    static constexpr uint64_t FIRST_LOAD_USEC = 10 * 1000000ULL;
+    static constexpr uint64_t REFRESH_USEC    = 5 * 1000000ULL;
+    static constexpr long     REFRESH_GAP_MS  = 500; // NewIcon storms
+
+    void fetch_props(TrayItem& item) {
+        if (!bus_) return;
+        if (item.fetching) { item.refetch = true; return; }
+        sd_bus_message* m = nullptr;
+        if (sd_bus_message_new_method_call(bus_, &m, item.service.c_str(),
+                                           item.path.c_str(),
+                                           "org.freedesktop.DBus.Properties",
+                                           "GetAll") < 0)
+            return;
+        const int idx = item.iface_idx;
+        sd_bus_message_append(m, "s", ITEM_IFACES[idx]);
+        const uint64_t uid = item.uid;
+        bool sent = call_async(
+            m, item.ready ? REFRESH_USEC : FIRST_LOAD_USEC,
+            [this, uid, idx](sd_bus_message* r) { on_props(uid, idx, r); });
+        sd_bus_message_unref(m);
+        if (!sent) return;
+        ++n_getall_;
+        item.fetching = true;
+        item.refetch  = false;
+        item.fetch_ms = now_ms();
     }
 
-    static void take_string(char* s, std::string& out) {
-        if (s) {
-            out = s;
-            free(s);
-        }
+    // NewIcon: refresh now, or at the end of the current gap — the LAST
+    // signal of a burst always gets its icon (the old throttle dropped it
+    // and could leave an in-between icon up for good).
+    void request_refresh(TrayItem& item) {
+        if (item.fetching) { item.refetch = true; return; }
+        long wait = item.fetch_ms + REFRESH_GAP_MS - now_ms();
+        if (wait <= 0) { fetch_props(item); return; }
+        item.refetch = true;
+        arm_refresh(wait);
     }
 
-    // ---- icons -----------------------------------------------------------
-    void load_icon(TrayItem& item) {
-        if (item.icon) { cairo_surface_destroy(item.icon); item.icon = nullptr; }
-        for (const char* iface : ITEM_IFACES) {
-            char* name = nullptr;
-            if (sd_bus_get_property_string(bus_, item.service.c_str(),
-                                           item.path.c_str(), iface,
-                                           "IconName", nullptr, &name) >= 0) {
-                item.iface = iface;
-                if (name && *name) item.icon_name = name;
-                char* tp = nullptr;
-                if (sd_bus_get_property_string(bus_, item.service.c_str(),
-                                               item.path.c_str(), iface,
-                                               "IconThemePath", nullptr,
-                                               &tp) >= 0)
-                    take_string(tp, item.theme_path);
-                char* id = nullptr;
-                if (sd_bus_get_property_string(bus_, item.service.c_str(),
-                                               item.path.c_str(), iface, "Id",
-                                               nullptr, &id) >= 0)
-                    take_string(id, item.id);
-                char* title = nullptr;
-                if (sd_bus_get_property_string(bus_, item.service.c_str(),
-                                               item.path.c_str(), iface,
-                                               "Title", nullptr, &title) >= 0)
-                    take_string(title, item.title);
-                int is_menu = 0;
-                if (sd_bus_get_property_trivial(
-                        bus_, item.service.c_str(), item.path.c_str(), iface,
-                        "ItemIsMenu", nullptr, 'b', &is_menu) >= 0)
-                    item.only_menu = is_menu != 0;
-                else if (!item.menu.empty() && item_named(item, "dropbox"))
-                    item.only_menu = true;
-                if (name && *name)
-                    item.icon =
-                        icon_from_theme(item.icon_name, item.theme_path);
-                free(name);
-                if (item.icon) return;
-                if (load_pixmap(item, iface)) return;
-                return; // interface answered; don't retry the other
+    void arm_refresh(long ms) {
+        itimerspec cur{};
+        timerfd_gettime(refresh_fd_, &cur);
+        long left = cur.it_value.tv_sec * 1000L +
+                    cur.it_value.tv_nsec / 1000000L;
+        if (left > 0 && left <= ms) return; // an earlier wakeup is armed
+        itimerspec ts{};
+        ts.it_value.tv_sec  = ms / 1000;
+        ts.it_value.tv_nsec = (ms % 1000) * 1000000L + 1;
+        timerfd_settime(refresh_fd_, 0, &ts, nullptr);
+    }
+
+    void run_due_refreshes() {
+        long next = -1;
+        const long now = now_ms();
+        for (auto& it : items_) {
+            if (!it.refetch || it.fetching) continue;
+            long wait = it.fetch_ms + REFRESH_GAP_MS - now;
+            if (wait <= 0) fetch_props(it);
+            else if (next < 0 || wait < next) next = wait;
+        }
+        if (next > 0) arm_refresh(next);
+    }
+
+    void on_props(uint64_t uid, int idx, sd_bus_message* r) {
+        TrayItem* ip = find_uid(uid);
+        if (!ip) return; // item went away while the call was in flight
+        TrayItem& item = *ip;
+        item.fetching = false;
+        if (sd_bus_message_is_method_error(r, nullptr)) {
+            const sd_bus_error* e = sd_bus_message_get_error(r);
+            ++n_getall_failed_;
+            auto is = [e](const char* n) {
+                return e && sd_bus_error_has_name(e, n);
+            };
+            if (is("org.freedesktop.DBus.Error.ServiceUnknown") ||
+                is("org.freedesktop.DBus.Error.NameHasNoOwner")) {
+                // Gone before its NameOwnerChanged match was in place.
+                remove_items_for(item.service);
+                return;
             }
+            const bool no_iface =
+                is("org.freedesktop.DBus.Error.UnknownInterface") ||
+                is("org.freedesktop.DBus.Error.UnknownMethod") ||
+                is("org.freedesktop.DBus.Error.UnknownProperty") ||
+                is("org.freedesktop.DBus.Error.InvalidArgs");
+            if (!item.ready && no_iface && idx == 0) {
+                item.iface_idx = 1; // freedesktop spelling of the iface
+                fetch_props(item);
+                return;
+            }
+            DBG("tray: %s%s: properties failed (%s)", item.service.c_str(),
+                item.path.c_str(), e && e->name ? e->name : "?");
+            if (!item.ready) { // placeholder, still clickable
+                item.ready = true;
+                bar_->request_draw();
+            }
+            after_props(item);
+            return;
+        }
+
+        std::string icon_name, theme_path, id, title, menu;
+        int  is_menu = 0;
+        bool have_is_menu = false, any = false;
+        cairo_surface_t* pix = nullptr;
+        if (sd_bus_message_enter_container(r, 'a', "{sv}") > 0) {
+            while (sd_bus_message_enter_container(r, 'e', "sv") > 0) {
+                const char* key = nullptr;
+                sd_bus_message_read(r, "s", &key);
+                const char* contents = nullptr;
+                char        type     = 0;
+                sd_bus_message_peek_type(r, &type, &contents);
+                std::string k = key ? key : "";
+                auto str = [&](std::string& out) {
+                    const char* v = nullptr;
+                    if (sd_bus_message_read(r, "v", contents, &v) >= 0 && v)
+                        out = v;
+                    any = true;
+                };
+                if (!contents) {
+                    sd_bus_message_skip(r, "v");
+                } else if (k == "IconName" && !strcmp(contents, "s")) {
+                    str(icon_name);
+                } else if (k == "IconThemePath" && !strcmp(contents, "s")) {
+                    str(theme_path);
+                } else if (k == "Id" && !strcmp(contents, "s")) {
+                    str(id);
+                } else if (k == "Title" && !strcmp(contents, "s")) {
+                    str(title);
+                } else if (k == "Menu" && !strcmp(contents, "o")) {
+                    str(menu);
+                } else if (k == "ItemIsMenu" && !strcmp(contents, "b")) {
+                    if (sd_bus_message_read(r, "v", "b", &is_menu) >= 0)
+                        have_is_menu = true;
+                } else if (k == "IconPixmap" && !strcmp(contents, "a(iiay)")) {
+                    any = true;
+                    if (sd_bus_message_enter_container(r, 'v', contents) > 0) {
+                        if (pix) cairo_surface_destroy(pix);
+                        pix = pixmap_from_msg(r);
+                        sd_bus_message_exit_container(r);
+                    }
+                } else {
+                    sd_bus_message_skip(r, "v");
+                }
+                sd_bus_message_exit_container(r); // dict entry
+            }
+            sd_bus_message_exit_container(r);
+        }
+        if (!any && !item.ready && idx == 0) {
+            // Empty answer for the KDE name: some implementations only
+            // speak org.freedesktop.StatusNotifierItem.
+            if (pix) cairo_surface_destroy(pix);
+            item.iface_idx = 1;
+            fetch_props(item);
+            return;
+        }
+
+        item.iface = ITEM_IFACES[idx];
+        if (const char* snd = sd_bus_message_get_sender(r); snd && *snd == ':')
+            item.owner = snd;
+        watch_icon(item);
+        item.icon_name  = icon_name;
+        item.theme_path = theme_path;
+        item.id         = id;
+        item.title      = title;
+        item.menu       = (!menu.empty() && menu != "/") ? menu : std::string();
+        item.only_menu  = have_is_menu && is_menu != 0;
+        if (!item.only_menu && !item.menu.empty() && item_named(item, "dropbox"))
+            item.only_menu = true;
+        cairo_surface_t* icon =
+            icon_name.empty() ? nullptr
+                              : icon_from_theme(icon_name, theme_path);
+        if (icon) {
+            if (pix) cairo_surface_destroy(pix);
+        } else {
+            icon = pix; // may be null: placeholder
+        }
+        if (item.icon) cairo_surface_destroy(item.icon);
+        item.icon  = icon;
+        item.ready = true;
+        bar_->request_draw();
+        after_props(item);
+    }
+
+    void after_props(TrayItem& item) {
+        if (item.refetch) {
+            item.refetch = false;
+            request_refresh(item);
         }
     }
 
-    bool load_pixmap(TrayItem& item, const char* iface) {
-        sd_bus_message* reply = nullptr;
-        if (sd_bus_get_property(bus_, item.service.c_str(), item.path.c_str(),
-                                iface, "IconPixmap", nullptr, &reply,
-                                "a(iiay)") < 0)
-            return false;
+    // IconPixmap: message positioned at the a(iiay). Picks the smallest
+    // frame at least as big as the tray icon (else the biggest), converts
+    // ARGB32 network byte order to premultiplied native cairo ARGB32.
+    static cairo_surface_t* pixmap_from_msg(sd_bus_message* reply) {
         int best_w = 0, best_h = 0;
-        std::vector<uint8_t> best;
-        sd_bus_message_enter_container(reply, 'a', "(iiay)");
+        const uint8_t* best = nullptr;
+        if (sd_bus_message_enter_container(reply, 'a', "(iiay)") <= 0)
+            return nullptr;
         while (sd_bus_message_enter_container(reply, 'r', "iiay") > 0) {
             int32_t w = 0, h = 0;
             sd_bus_message_read(reply, "ii", &w, &h);
@@ -897,22 +1218,24 @@ private:
                           (best_w < TRAY_ICON_SIZE && w > best_w) ||
                           (w >= TRAY_ICON_SIZE &&
                            (best_w < TRAY_ICON_SIZE || w < best_w));
-            if (w > 0 && h > 0 && len == static_cast<size_t>(w) * h * 4 &&
-                better) {
+            if (w > 0 && h > 0 && w <= 1024 && h <= 1024 &&
+                len == static_cast<size_t>(w) * h * 4 && better) {
                 best_w = w;
                 best_h = h;
-                best.assign(static_cast<const uint8_t*>(data),
-                            static_cast<const uint8_t*>(data) + len);
+                best   = static_cast<const uint8_t*>(data); // lives in reply
             }
         }
         sd_bus_message_exit_container(reply);
-        sd_bus_message_unref(reply);
-        if (best.empty()) return false;
+        if (!best) return nullptr;
 
-        // ARGB32 network byte order -> premultiplied native cairo ARGB32
         int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, best_w);
         cairo_surface_t* s =
             cairo_image_surface_create(CAIRO_FORMAT_ARGB32, best_w, best_h);
+        if (cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
+            cairo_surface_destroy(s);
+            return nullptr;
+        }
+        cairo_surface_flush(s);
         uint8_t* dst = cairo_image_surface_get_data(s);
         for (int y = 0; y < best_h; ++y) {
             uint32_t* row = reinterpret_cast<uint32_t*>(dst + y * stride);
@@ -924,8 +1247,7 @@ private:
             }
         }
         cairo_surface_mark_dirty(s);
-        item.icon = s;
-        return true;
+        return s;
     }
 
     // SVG rendering via librsvg, loaded with dlopen ON FIRST SVG ONLY.
@@ -982,6 +1304,28 @@ private:
         return nullptr;
     }
 
+    // pixmaps / app dirs ship 256-512 px PNGs; the bar draws ~16-24 px and
+    // the SVG path already renders at 64. Keep at most 96 (scale 3+).
+    static cairo_surface_t* shrink_icon(cairo_surface_t* s) {
+        constexpr int keep = 96;
+        int w = cairo_image_surface_get_width(s);
+        int h = cairo_image_surface_get_height(s);
+        if (w <= keep && h <= keep) return s;
+        double sf = (double)keep / std::max(w, h);
+        int    nw = std::max(1, (int)(w * sf + 0.5));
+        int    nh = std::max(1, (int)(h * sf + 0.5));
+        cairo_surface_t* d =
+            cairo_image_surface_create(CAIRO_FORMAT_ARGB32, nw, nh);
+        cairo_t* cr = cairo_create(d);
+        cairo_scale(cr, (double)nw / w, (double)nh / h);
+        cairo_set_source_surface(cr, s, 0, 0);
+        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+        cairo_surface_destroy(s);
+        return d;
+    }
+
     static cairo_surface_t* icon_from_file(const std::string& path) {
         if (path.empty() || access(path.c_str(), R_OK) != 0) return nullptr;
         auto ends = [&](const char* ext) {
@@ -991,18 +1335,53 @@ private:
         };
         if (ends(".svg") || ends(".SVG")) return icon_from_svg(path);
         cairo_surface_t* s = cairo_image_surface_create_from_png(path.c_str());
-        if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS) return s;
+        if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS)
+            return shrink_icon(s);
         cairo_surface_destroy(s);
         if (!ends(".png") && !ends(".PNG"))
             if (cairo_surface_t* svg = icon_from_svg(path)) return svg;
         return nullptr;
     }
 
+    // Theme lookup walks up to ~150 candidate paths; NewIcon storms (a
+    // chat app blinking its status icon) repeated that every time. The
+    // file each name resolved to is remembered; misses for a minute.
     static cairo_surface_t* icon_from_theme(const std::string& name,
                                             const std::string& extra_path = {}) {
         if (name.empty()) return nullptr;
+        struct Hit {
+            std::string path;
+            time_t      at = 0;
+        };
+        static std::map<std::string, Hit> hits;
+        const std::string key = extra_path + '\n' + name;
+        const time_t      now = time(nullptr);
+        auto it = hits.find(key);
+        if (it != hits.end()) {
+            if (it->second.path.empty()) {
+                if (now - it->second.at < 60) return nullptr;
+            } else if (cairo_surface_t* s = icon_from_file(it->second.path)) {
+                return s;
+            }
+            hits.erase(it); // stale miss, or the file went away
+        }
+        if (hits.size() > 256) hits.clear(); // bound it; refills on demand
+        std::string found;
+        cairo_surface_t* s = icon_search(name, extra_path, &found);
+        hits[key] = {s ? found : std::string(), now};
+        return s;
+    }
+
+    static cairo_surface_t* icon_search(const std::string& name,
+                                        const std::string& extra_path,
+                                        std::string* found) {
+        auto try_file = [&](const std::string& p) -> cairo_surface_t* {
+            cairo_surface_t* s = icon_from_file(p);
+            if (s) *found = p;
+            return s;
+        };
         if (name[0] == '/') { // absolute path
-            if (cairo_surface_t* s = icon_from_file(name)) return s;
+            if (cairo_surface_t* s = try_file(name)) return s;
             return nullptr;
         }
         // IconThemePath: apps (Dropbox, Spotify, Steam) ship a private
@@ -1010,12 +1389,12 @@ private:
         // or a flat folder of name.png files.
         if (!extra_path.empty()) {
             if (cairo_surface_t* s =
-                    icon_from_file(extra_path + "/" + name + ".png"))
+                    try_file(extra_path + "/" + name + ".png"))
                 return s;
             if (cairo_surface_t* s =
-                    icon_from_file(extra_path + "/" + name + ".svg"))
+                    try_file(extra_path + "/" + name + ".svg"))
                 return s;
-            if (cairo_surface_t* s = icon_from_file(extra_path + "/" + name))
+            if (cairo_surface_t* s = try_file(extra_path + "/" + name))
                 return s;
         }
         const char* home = getenv("HOME");
@@ -1036,7 +1415,7 @@ private:
                 for (const char* ctx : ctxs) {
                     std::string p =
                         root + "/" + sz + "/" + ctx + "/" + name + ".png";
-                    if (cairo_surface_t* s = icon_from_file(p)) return s;
+                    if (cairo_surface_t* s = try_file(p)) return s;
                 }
         // No PNG anywhere: SVG-only themes/apps (scalable dir, then the
         // same size dirs, where some themes ship .svg despite the name)
@@ -1044,19 +1423,19 @@ private:
             for (const char* ctx : ctxs) {
                 std::string p =
                     root + "/scalable/" + ctx + "/" + name + ".svg";
-                if (cairo_surface_t* s = icon_from_file(p)) return s;
+                if (cairo_surface_t* s = try_file(p)) return s;
             }
         for (auto& root : roots)
             for (const char* sz : sizes)
                 for (const char* ctx : ctxs) {
                     std::string p = root + "/" + std::string(sz) + "/" + ctx +
                                     "/" + name + ".svg";
-                    if (cairo_surface_t* s = icon_from_file(p)) return s;
+                    if (cairo_surface_t* s = try_file(p)) return s;
                 }
         std::string p = "/usr/share/pixmaps/" + name + ".png";
-        if (cairo_surface_t* s = icon_from_file(p)) return s;
+        if (cairo_surface_t* s = try_file(p)) return s;
         p = "/usr/share/pixmaps/" + name + ".svg";
-        if (cairo_surface_t* s = icon_from_file(p)) return s;
+        if (cairo_surface_t* s = try_file(p)) return s;
         return nullptr;
     }
 
@@ -1076,6 +1455,8 @@ private:
 
         wl_surface*  surf  = nullptr;
         FracSurface  frac; // fractional scaling (see frac.hpp)
+        ShmPool      pool; // reused buffers (see shm.hpp)
+        FrameGate    gate; // one commit per shown frame
         xdg_surface* xsurf = nullptr;
         xdg_popup*   popup = nullptr;
         int w = 0, h = 0;
@@ -1085,33 +1466,79 @@ private:
     };
     std::unique_ptr<Menu> menu_;
 
+    // Right-click: AboutToShow + GetLayout, both async. The popup opens
+    // when the layout arrives, anchored where the click happened; the bar
+    // is held open meanwhile. A second click, the item vanishing or the
+    // bus dropping cancels the request, and a late reply for a cancelled
+    // request is ignored.
+    static constexpr uint64_t MENU_USEC = 3 * 1000000ULL;
+
     void open_menu(const TrayItem& item) {
         close_menu();
+        cancel_menu_request();
+        if (!bus_) return;
 
-        // AboutToShow lets apps populate lazily; errors are fine to ignore
-        sd_bus_call_method(bus_, item.service.c_str(), item.menu.c_str(),
-                           MENU_IFACE, "AboutToShow", nullptr, nullptr, "i",
-                           0);
-        sd_bus_message* reply = nullptr;
-        if (sd_bus_call_method(bus_, item.service.c_str(), item.menu.c_str(),
-                               MENU_IFACE, "GetLayout", nullptr, &reply,
-                               "iias", 0, -1, 0) < 0)
+        // AboutToShow lets apps populate lazily; errors are fine to ignore.
+        // Sent first, so the app handles it before GetLayout.
+        sd_bus_call_method_async(bus_, nullptr, item.service.c_str(),
+                                 item.menu.c_str(), MENU_IFACE, "AboutToShow",
+                                 nullptr, nullptr, "i", 0);
+        sd_bus_message* m = nullptr;
+        if (sd_bus_message_new_method_call(bus_, &m, item.service.c_str(),
+                                           item.menu.c_str(), MENU_IFACE,
+                                           "GetLayout") < 0)
             return;
-        uint32_t revision = 0;
-        sd_bus_message_read(reply, "u", &revision);
-        MenuNode root;
-        parse_menu_node(reply, root);
-        sd_bus_message_unref(reply);
-        if (root.children.empty()) return;
+        sd_bus_message_append(m, "iias", 0, -1, 0);
+        const uint64_t seq    = ++menu_seq_;
+        const double   anchor = bar_->pointer_along();
+        std::string    svc    = item.service, path = item.menu;
+        bool sent = call_async(m, MENU_USEC,
+                               [this, seq, anchor, svc, path](sd_bus_message* r) {
+            on_layout(seq, anchor, svc, path, r);
+        });
+        sd_bus_message_unref(m);
+        if (!sent) return;
+        ++n_menu_req_;
+        menu_req_     = true;
+        menu_req_svc_ = item.service;
+        bar_->hold_open(true); // released in on_layout / cancel
+    }
 
-        menu_ = std::make_unique<Menu>();
-        menu_->service   = item.service;
-        menu_->menu_path = item.menu;
-        menu_->root      = std::move(root);
-        menu_->stack     = {&menu_->root};
-        menu_->anchor_x  = bar_->pointer_along();
-        bar_->hold_open(true);
-        create_popup();
+    void cancel_menu_request() {
+        if (!menu_req_) return;
+        menu_req_ = false;
+        ++menu_seq_; // the reply, if it still comes, is stale
+        if (bar_) bar_->hold_open(false);
+    }
+
+    void on_layout(uint64_t seq, double anchor, const std::string& svc,
+                   const std::string& path, sd_bus_message* r) {
+        if (seq != menu_seq_ || !menu_req_) {
+            ++n_menu_stale_;
+            return;
+        }
+        menu_req_ = false;
+        MenuNode root;
+        if (!sd_bus_message_is_method_error(r, nullptr)) {
+            uint32_t revision = 0;
+            sd_bus_message_read(r, "u", &revision);
+            parse_menu_node(r, root);
+        } else {
+            const sd_bus_error* e = sd_bus_message_get_error(r);
+            DBG("tray: GetLayout on %s%s failed (%s)", svc.c_str(),
+                path.c_str(), e && e->name ? e->name : "?");
+        }
+        if (!root.children.empty() && bar_->wm_base()) {
+            menu_ = std::make_unique<Menu>();
+            menu_->service   = svc;
+            menu_->menu_path = path;
+            menu_->root      = std::move(root);
+            menu_->stack     = {&menu_->root};
+            menu_->anchor_x  = anchor;
+            bar_->hold_open(true); // the popup's own hold
+            create_popup();
+        }
+        bar_->hold_open(false); // the request's hold
     }
 
     void build_rows() {
@@ -1195,6 +1622,9 @@ private:
         m.frac.on_change = [this] {
             if (menu_ && menu_->mapped) draw_menu();
         };
+        m.gate.fire = [this] {
+            if (menu_ && menu_->mapped) draw_menu();
+        };
         m.frac.attach(bar_->frac_mgr(), bar_->viewporter(), m.surf);
         m.xsurf = xdg_wm_base_get_xdg_surface(bar_->wm_base(), m.surf);
         static const xdg_surface_listener xsurf_listener = {
@@ -1269,6 +1699,8 @@ private:
         if (!menu_) return;
         bar_->unregister_surface(menu_->surf);
         menu_->frac.destroy();
+        menu_->gate.drop();
+        menu_->pool.clear();
         if (menu_->popup) xdg_popup_destroy(menu_->popup);
         if (menu_->xsurf) xdg_surface_destroy(menu_->xsurf);
         if (menu_->surf) wl_surface_destroy(menu_->surf);
@@ -1301,9 +1733,12 @@ private:
         }
         if (row.separator || !row.node->enabled) return;
         if (!row.node->children.empty()) { // enter submenu
-            sd_bus_call_method(bus_, m.service.c_str(), m.menu_path.c_str(),
-                               MENU_IFACE, "AboutToShow", nullptr, nullptr,
-                               "i", row.node->id);
+            // Fire-and-forget like the leaf Event: the children shown are
+            // the ones GetLayout already delivered (depth -1).
+            sd_bus_call_method_async(bus_, nullptr, m.service.c_str(),
+                                     m.menu_path.c_str(), MENU_IFACE,
+                                     "AboutToShow", nullptr, nullptr, "i",
+                                     row.node->id);
             m.stack.push_back(row.node);
             relayout();
             return;
@@ -1334,8 +1769,10 @@ private:
                            : 1;
         const int bw = m.frac.active() ? m.frac.px(m.w) : m.w * sc;
         const int bh = m.frac.active() ? m.frac.px(m.h) : m.h * sc;
-        wl_buffer* buffer = create_argb_buffer(bar_->shm(), bw, bh, &data);
-        if (!buffer) return;
+        if (!m.gate.ready()) return; // hover sweeps: once per shown frame
+        ShmBuf* buf = m.pool.acquire(bar_->shm(), bw, bh);
+        if (!buf) return;
+        data = buf->data;
 
         cairo_surface_t* cs = cairo_image_surface_create_for_data(
             static_cast<unsigned char*>(data), CAIRO_FORMAT_ARGB32, bw, bh,
@@ -1440,11 +1877,12 @@ private:
         cairo_surface_destroy(cs);
 
         m.frac.apply(m.surf, m.w, m.h, sc);
-        wl_surface_attach(m.surf, buffer, 0, 0);
+        wl_surface_attach(m.surf, buf->wl, 0, 0);
         if (wl_surface_get_version(m.surf) >= 4)
             wl_surface_damage_buffer(m.surf, 0, 0, bw, bh);
         else
             wl_surface_damage(m.surf, 0, 0, m.w, m.h);
+        m.gate.arm(m.surf);
         wl_surface_commit(m.surf);
     }
 
@@ -1455,10 +1893,9 @@ private:
         const char* spec = nullptr;
         sd_bus_message_read(m, "s", &spec);
         const char* sender = sd_bus_message_get_sender(m);
-        // Reply FIRST: the registering app blocks on this reply, and
-        // add_item_from_spec makes synchronous property calls back to that
-        // same app. Replying afterwards deadlocked both sides until the
-        // 25 s timeout.
+        // Reply FIRST: the registering app may block on this reply. (The
+        // property load below is async now, but a peer that registers
+        // synchronously should still get its answer before anything else.)
         int r = sd_bus_reply_method_return(m, "");
         bool added =
             self->add_item_from_spec(spec ? spec : "", sender ? sender : "");
@@ -1540,24 +1977,18 @@ private:
         auto* self = static_cast<TrayModule*>(userdata);
         const char *name = nullptr, *old_o = nullptr, *new_o = nullptr;
         sd_bus_message_read(m, "sss", &name, &old_o, &new_o);
-        if (name && new_o && *new_o == '\0') self->remove_items_for(name);
-        return 0;
-    }
-
-    static int on_new_icon(sd_bus_message* m, void* userdata, sd_bus_error*) {
-        auto* self = static_cast<TrayModule*>(userdata);
-        const char* sender = sd_bus_message_get_sender(m);
-        if (!sender) return 0;
+        if (!name || !new_o) return 0;
+        if (*new_o == '\0') {
+            self->remove_items_for(name);
+            return 0;
+        }
+        // A well-known name handed to another connection: that one answers
+        // (and signals) for the item now.
         for (auto& it : self->items_)
-            if (it.service == sender) {
-                // Some apps emit NewIcon in bursts or animate their icon;
-                // a full reload (D-Bus + theme search) once per second is
-                // plenty for a 20 px tray icon.
-                long now = now_ms();
-                if (now - it.icon_ms < 1000) continue;
-                it.icon_ms = now;
-                self->load_icon(it);
-                self->bar_->request_draw();
+            if (it.service == name && it.owner != new_o) {
+                it.owner = new_o;
+                self->watch_icon(it);
+                self->fetch_props(it);
             }
         return 0;
     }
@@ -1565,6 +1996,15 @@ private:
     static const sd_bus_vtable watcher_vtable[];
 
     Bar* bar_ = nullptr;
+    uint64_t next_uid_ = 0;
+    int logged_slot_ = -1;
+    int refresh_fd_ = -1;
+    // pending right-click menu request (see open_menu)
+    bool        menu_req_ = false;
+    uint64_t    menu_seq_ = 0;
+    std::string menu_req_svc_;
+    uint64_t n_getall_ = 0, n_getall_failed_ = 0, n_newicon_ = 0;
+    uint64_t n_menu_req_ = 0, n_menu_stale_ = 0;
     sd_bus* bus_ = nullptr;
     sd_bus_slot* watcher_slot_ = nullptr;
     bool we_are_watcher_ = false;
@@ -1584,6 +2024,8 @@ private:
     std::map<std::string, uint64_t> msg_counts_;
     long msg_last_ms_ = 0;
 };
+
+TrayModule* TrayModule::g_tray = nullptr;
 
 const sd_bus_vtable TrayModule::watcher_vtable[] = {
     SD_BUS_VTABLE_START(0),
@@ -1608,3 +2050,8 @@ const sd_bus_vtable TrayModule::watcher_vtable[] = {
 } // namespace
 
 Module* make_tray() { return new TrayModule; }
+
+std::string tray_debug_state() {
+    return TrayModule::g_tray ? TrayModule::g_tray->debug_state()
+                              : std::string("tray: not running\n");
+}

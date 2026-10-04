@@ -5,6 +5,7 @@
 #include <cairo/cairo.h>
 #include <algorithm>
 #include <functional>
+#include <cstdint>
 
 // ---------------------------------------------------------------------
 // Small overlay window on a wlr layer surface: used by the notification
@@ -78,6 +79,8 @@ struct PopupWin {
     wl_surface*                   surf = nullptr;
     zwlr_layer_surface_v1*        ls   = nullptr;
     FracSurface                   frac; // fractional scaling (see frac.hpp)
+    ShmPool                       pool; // reused buffers (see shm.hpp)
+    FrameGate                     gate; // one commit per shown frame
     int                           w = 0, h = 0;
     bool                          configured = false;
     double                        mx = -1, my = -1;
@@ -101,8 +104,22 @@ struct PopupWin {
     // correct compositors do not send us hits past the card. Hyprland's
     // exclusive-keyboard grab still delivers out-of-geometry clicks; the
     // Host click wrapper turns those into dismiss.
+    // Empty region: the surface cannot steal pointer events. Used at
+    // map time (default region is infinite) and for fullscreen catchers
+    // until they punch a hole.
+    void set_input_empty() {
+        if (!surf || !bar || !bar->compositor()) return;
+        wl_region* r = wl_compositor_create_region(bar->compositor());
+        if (!r) return;
+        wl_surface_set_input_region(surf, r);
+        wl_region_destroy(r);
+    }
     void clip_input_to_buffer() {
-        if (!surf || !bar || !bar->compositor() || w <= 0 || h <= 0) return;
+        if (!surf || !bar || !bar->compositor()) return;
+        if (w <= 0 || h <= 0) {
+            set_input_empty();
+            return;
+        }
         wl_region* r = wl_compositor_create_region(bar->compositor());
         if (!r) return;
         wl_region_add(r, 0, 0, w, h);
@@ -165,6 +182,7 @@ struct PopupWin {
         };
         zwlr_layer_surface_v1_add_listener(ls, &lst, this);
         frac.on_change = [this] { if (configured) draw(); };
+        gate.fire      = [this] { draw(); };
         frac.attach(bar->frac_mgr(), bar->viewporter(), surf);
         if (!centered) {
             zwlr_layer_surface_v1_set_anchor(ls, anchor);
@@ -221,11 +239,13 @@ struct PopupWin {
             sc = bar->scale_of(out ? out : bar->primary_output());
         const int bw = frac.active() ? frac.px(w) : w * sc;
         const int bh = frac.active() ? frac.px(h) : h * sc;
-        void*      data   = nullptr;
-        wl_buffer* buffer = create_argb_buffer(bar->shm(), bw, bh, &data);
-        if (!buffer) return;
+        // Frame-paced: a burst (OSD key-hold, slider drag) draws once per
+        // shown frame; the last request runs when the frame is done.
+        if (!gate.ready()) return;
+        ShmBuf* buf = pool.acquire(bar->shm(), bw, bh);
+        if (!buf) return;
         cairo_surface_t* cs = cairo_image_surface_create_for_data(
-            static_cast<unsigned char*>(data), CAIRO_FORMAT_ARGB32, bw, bh,
+            static_cast<unsigned char*>(buf->data), CAIRO_FORMAT_ARGB32, bw, bh,
             bw * 4);
         cairo_t* cr = cairo_create(cs);
         cairo_scale(cr, (double)bw / w, (double)bh / h);
@@ -240,11 +260,12 @@ struct PopupWin {
         cairo_destroy(cr);
         cairo_surface_destroy(cs);
         frac.apply(surf, w, h, sc);
-        wl_surface_attach(surf, buffer, 0, 0);
+        wl_surface_attach(surf, buf->wl, 0, 0);
         if (wl_surface_get_version(surf) >= 4)
             wl_surface_damage_buffer(surf, 0, 0, bw, bh);
         else
             wl_surface_damage(surf, 0, 0, w, h);
+        gate.arm(surf);
         wl_surface_commit(surf);
     }
 
@@ -253,6 +274,8 @@ struct PopupWin {
         bar->unregister_surface(surf);
         if (ls) zwlr_layer_surface_v1_destroy(ls);
         frac.destroy();
+        gate.drop();
+        pool.clear();
         wl_surface_destroy(surf);
         surf = nullptr;
         ls   = nullptr;

@@ -16,6 +16,10 @@
 #include <map>
 #include <sstream>
 #include <vector>
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <cstdlib>
 
 namespace {
 
@@ -84,7 +88,7 @@ public:
 
 private:
     Host host_;
-    AsyncCmd list_cmd_, details_cmd_;
+    AsyncCmd list_cmd_, details_cmd_, radio_cmd_;
     TextField psk_;
     std::vector<NetRow> all_, nets_;
     std::vector<Hit> hits_;
@@ -150,9 +154,8 @@ private:
         };
         host_.win.pkey = [this](const Bar::KeyEvent& e) { on_key(e); };
         host_.open(W(), H(), "mattbar-network", id(), true, Host::Place::BarEnd);
-        // Cached list only. A live rescan is the Scan button (or R), and
-        // never starts on its own while we already have a connection.
-        reload_list(false);
+        reload_list(false); // cached list only; Scan is a one-shot
+        if (cfg.shell_wifi_scan_on_open) reload_list(true);
         refresh_details();
         arm_poll();
     }
@@ -373,12 +376,12 @@ private:
         if (sel_ < 0 || sel_ >= (int)nets_.size()) return;
         const NetRow& n = nets_[sel_];
         if (n.in_use) {
-            spawn_detached("nmcli connection down id " + shell_quote(n.ssid));
+            spawn_helper("nmcli connection down id " + shell_quote(n.ssid));
             reload_list(false);
             return;
         }
         if (n.saved || is_open_sec(n.security)) {
-            spawn_detached(n.saved ? "nmcli connection up id " + shell_quote(n.ssid)
+            spawn_helper(n.saved ? "nmcli connection up id " + shell_quote(n.ssid)
                                    : "nmcli device wifi connect " +
                                          shell_quote(n.ssid));
             reload_list(false);
@@ -391,7 +394,7 @@ private:
     }
     void submit_psk() {
         if (psk_ssid_.empty()) return;
-        spawn_detached("nmcli device wifi connect " + shell_quote(psk_ssid_) +
+        spawn_helper("nmcli device wifi connect " + shell_quote(psk_ssid_) +
                        " password " + shell_quote(psk_.text));
         psk_ssid_.clear();
         psk_.clear();
@@ -399,7 +402,7 @@ private:
     }
     void forget_sel() {
         if (sel_ < 0 || sel_ >= (int)nets_.size()) return;
-        spawn_detached("nmcli connection delete id " +
+        spawn_helper("nmcli connection delete id " +
                        shell_quote(nets_[sel_].ssid));
         reload_list(false);
     }
@@ -411,14 +414,30 @@ private:
             close();
             return;
         }
-        spawn_detached("omarchy-dns " + shell_quote(p));
+        spawn_helper("omarchy-dns " + shell_quote(p));
         dns_ = p;
         host_.redraw();
     }
     void set_band(const std::string& b) {
-        spawn_detached("omarchy-network-band " + b);
+        spawn_helper("omarchy-network-band " + b);
         band_selected_ = b;
         host_.redraw();
+    }
+    void toggle_wifi() {
+        auto* sh = mattbar_shell();
+        if (!sh || !sh->bar()) return;
+        const bool want_on = !wifi_on_;
+        wifi_on_ = want_on;
+        host_.redraw();
+        // nmcli radio uses rfkill; wait for it before refreshing the list
+        // so the pill doesn't snap back while the radio is still flipping.
+        radio_cmd_.run(*sh->bar(),
+                       std::string("nmcli radio wifi ") + (want_on ? "on" : "off"),
+                       [this](const std::string&, int) {
+                           reload_list(false);
+                           refresh_details();
+                       },
+                       4000);
     }
 
     void on_click(double x, double y, int btn) {
@@ -426,13 +445,11 @@ private:
         if (hi < 0) return;
         const Hit& h = hits_[hi];
         if (h.kind == 4) {
-            spawn_detached(std::string("nmcli radio wifi ") +
-                           (wifi_on_ ? "off" : "on"));
-            reload_list(false);
+            toggle_wifi();
             return;
         }
         if (h.kind == 11) {
-            if (!scanning_) reload_list(true);
+            if (wifi_on_ && !scanning_) reload_list(true);
             return;
         }
         if (h.kind == 5) {
@@ -517,9 +534,7 @@ private:
             return;
         }
         if (e.keysym == 0x77 || e.keysym == 0x57) {
-            spawn_detached(std::string("nmcli radio wifi ") +
-                           (wifi_on_ ? "off" : "on"));
-            reload_list(false);
+            toggle_wifi();
             return;
         }
         TextField dummy;
@@ -571,7 +586,21 @@ private:
             ax -= 8;
         };
         {
-            std::string tog = wifi_on_ ? "On" : "Off";
+            const char* scan_lbl = scanning_ ? "Scanning\u2026" : "Scan";
+            double sbw = tw(cr, scan_lbl) + 16;
+            ax -= sbw;
+            col(cr, scanning_ ? cfg.c_accent : cfg.c_ws_bg, 1);
+            rrect(cr, ax, y + 6, sbw, 24, 6);
+            cairo_fill(cr);
+            say(cr, ax + 8, y + 18, scan_lbl,
+                scanning_ ? contrast_on(cfg.c_accent)
+                          : (wifi_on_ ? cfg.c_fg : cfg.c_dim));
+            if (wifi_on_ && !scanning_)
+                hits_.push_back({ax, y + 6, sbw, 24, -1, 11, {}});
+            ax -= 8;
+        }
+        {
+            std::string tog = wifi_on_ ? "Wi-Fi On" : "Wi-Fi Off";
             double bw = tw(cr, tog) + 16;
             ax -= bw;
             col(cr, wifi_on_ ? cfg.c_accent : cfg.c_ws_bg, 1);
@@ -584,17 +613,6 @@ private:
         }
         if (!info_["iface"].empty()) hero_btn("Speed", 6);
         if (wifi_connected()) hero_btn("QR", 5);
-        if (wifi_on_) {
-            const char* sl = scanning_ ? "Scanning" : "Scan";
-            double bw = tw(cr, sl) + 14;
-            ax -= bw;
-            col(cr, scanning_ ? cfg.c_accent : cfg.c_ws_bg, 1);
-            rrect(cr, ax, y + 6, bw, 24, 6);
-            cairo_fill(cr);
-            say(cr, ax + 7, y + 18, sl,
-                scanning_ ? contrast_on(cfg.c_accent) : cfg.c_fg);
-            hits_.push_back({ax, y + 6, bw, 24, -1, 11, {}});
-        }
         y += 48;
 
         // ---- Stats (same grid as Quickshell: ping/loss, rx/tx, totals, IP) -

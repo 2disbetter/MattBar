@@ -1,4 +1,5 @@
 #pragma once
+#include "shm.hpp"
 #include <cstdint>
 #include <csignal>
 #include <functional>
@@ -13,6 +14,7 @@
 
 #include "config.hpp"
 #include "modules.hpp"
+#include <utility>
 
 class SettingsWindow;
 class Bar;
@@ -36,6 +38,8 @@ struct ext_session_lock_manager_v1;
 struct ext_idle_notifier_v1;
 #include "frac.hpp"
 
+struct epoll_event;
+
 struct BarSurface {
     Bar*        owner = nullptr;
     wl_output*  out   = nullptr;  // nullptr = compositor picks (single-bar)
@@ -50,6 +54,8 @@ struct BarSurface {
     bool     dirty      = false;
     bool     hidden_frame_valid = false;
     bool     awaiting_configure = false;
+    ShmPool   pool;  // reused buffers (see shm.hpp)
+    FrameGate gate;  // one commit per shown frame
     bool     primary    = false;  // hosts tray, settings, notification popups
 
     bool   ptr_inside = false;
@@ -69,12 +75,21 @@ struct BarSurface {
 
     int hide_fd = -1, reveal_fd = -1;
 
+    // Geometry last sent to the compositor (see apply_geometry).
+    uint32_t sent_anchor   = 0;
+    uint32_t sent_size     = 0;
+    bool     sent_vertical = false;
+    void     send_size(uint32_t req);
+
     std::vector<HitRect> hits;
 
     void   create(Bar& b, wl_output* o, const std::string& n);
     void   destroy();
     void   set_expanded(bool on);
-    void   apply_geometry();      // re-push size/anchors after a config change
+    // Re-push size/anchors after a config change. Returns false (and sends
+    // nothing) when they match what this surface last sent: a re-send
+    // costs a compositor configure round-trip and a full repaint.
+    bool   apply_geometry();
     void   draw();
     void   arm_hide(bool arm);
     void   arm_reveal(bool arm);
@@ -93,11 +108,18 @@ private:
 
 class Bar {
 public:
+    Bar();
+    ~Bar();
+    Bar(const Bar&) = delete;
+    Bar& operator=(const Bar&) = delete;
     // A single module may observe all bar clicks (receives the hit
     // module, or nullptr for dead space) — used by the agents dropdown
     // to dismiss on interaction elsewhere on the bar.
+    void add_click_observer(std::function<void(Module*)> f) {
+        if (f) click_observers_.push_back(std::move(f));
+    }
     void set_click_observer(std::function<void(Module*)> f) {
-        click_observer_ = std::move(f);
+        add_click_observer(std::move(f));
     }
     // Send WATCHDOG=1 now. Long-running module work (e.g. sequential
     // compositor queries) must call this between steps so a slow
@@ -119,6 +141,17 @@ public:
                 const char* label = "module");
     void remove_fd(int fd);
     void mod_fd(int fd, uint32_t events);
+    // The one way to close an fd that is, or may ever have been, handed to
+    // add_fd(): unregisters it (a no-op if it was not), closes it and sets
+    // it to -1. Safe with -1, from inside the fd's own callback, and after
+    // the Bar is gone (some AsyncCmds are globals destroyed after main()).
+    // A bare close() on a registered fd leaves its callback, and whatever
+    // it captured, in the table, and a fork holding a copy of the fd keeps
+    // the epoll registration alive under a number that may be reused.
+    static void close_fd(int& fd);
+    // For an fd that something else closes (sd-bus owns its socket):
+    // unregister only, with the same safety guarantees as close_fd().
+    static void unwatch_fd(int fd);
     // During a draw or a pointer event, "the bar" means the surface that is
     // being drawn / was clicked; outside that context it means "any bar".
     bool expanded() const;
@@ -155,6 +188,7 @@ public:
     // Reconcile bar surfaces with the outputs the config asks for. Safe to
     // call at any time: monitor hotplug and settings changes both land here.
     void        sync_surfaces();
+    void        sync_bar_surfaces();
     std::vector<std::string> output_names() const;
     struct OutputRef {
         wl_output*  wl = nullptr;
@@ -183,8 +217,17 @@ public:
     bool settings_open() const;
     void close_settings_later(); // safe to call from settings' own callbacks
     void refresh_settings();     // redraw if the window is open
-    // Re-apply cfg-derived surface geometry after a settings change.
+    // Bring every subsystem in line with cfg after a change. Diff-based:
+    // each part compares what it would do with what it last did and only
+    // acts on a real difference (see the body for the per-part rules), so
+    // an unrelated setting no longer restarts the sidecar, rebinds keys,
+    // repaints wallpapers or re-sends bar geometry.
     void apply_config();
+    // Persist cfg shortly (500 ms after the last call), coalescing bursts
+    // of settings clicks into one write. flush writes a pending save now;
+    // it runs when the settings window closes and at shutdown.
+    void save_config_soon();
+    void flush_config_save();
     void update_tick();   // arm module tick while revealed or lazy plugin session
 
     // One key event, already translated through xkbcommon. keysym is an
@@ -234,6 +277,7 @@ public:
     wl_display*    display() const { return display_; }
     wl_compositor* compositor() const { return compositor_; }
     wl_shm*        shm() const { return shm_; }
+    uint64_t draw_count() const { return draw_count_; }
     wl_seat*       seat() const { return seat_; }
     xdg_wm_base*   wm_base() const { return wm_base_; }
     zwlr_layer_surface_v1* layer_surface() const;
@@ -320,7 +364,24 @@ private:
     struct ext_idle_notifier_v1*        idle_notif_ = nullptr;
     int epoll_fd_ = -1;
     int tick_fd_  = -1;   // periodic module refresh (armed only when visible)
+    int  save_fd_      = -1;    // debounced cfg.save()
+    bool save_pending_ = false;
+    // Module tick after a settings apply: at once for the first apply of a
+    // burst, then once more when the burst settles (see tick_after_apply).
+    int  apply_tick_fd_    = -1;
+    bool apply_tick_armed_ = false;
+    bool apply_tick_again_ = false;
+    void tick_after_apply();
     std::map<int, std::function<void(uint32_t)>> fd_cbs_;
+    // fds removed while the current epoll batch is being dispatched: any
+    // event for them still in the batch predates the removal (and may now
+    // name a different file under a reused number), so it is dropped.
+    bool             dispatching_ = false;
+    std::vector<int> removed_in_batch_;
+    // Run the callbacks for one epoll batch (skip_fd: handled by the
+    // caller — the Wayland socket). test_spawn drives this directly.
+    void dispatch_fds(const struct epoll_event* evs, int n, int skip_fd);
+    static Bar*      live_; // for close_fd(); the process has one Bar
     // MATTBAR_DEBUG wakeup profiler: attribute every epoll wakeup to its fd
     std::map<int, std::string> fd_labels_;
     std::map<std::string, uint64_t> wake_counts_;
@@ -358,11 +419,29 @@ private:
     void tick_modules();
     void set_cursor(wl_pointer*, uint32_t serial);
     void route_click(int button);
-    std::function<void(Module*)> click_observer_;
+    std::vector<std::function<void(Module*)>> click_observers_;
     uint64_t wd_usec_ = 0, last_wd_ping_ = 0;
     int      exit_code_ = 0;
     void route_scroll(int dir);
     void flush_wayland();
+    // Write backpressure: when the socket is full, wl_display_flush()
+    // fails with EAGAIN and the rest stays queued in libwayland. The loop
+    // then also waits for EPOLLOUT so the queue drains the moment the
+    // compositor reads, not at the next unrelated wakeup.
+    int      wl_fd_       = -1;
+    bool     wl_want_out_ = false;
+    uint64_t wl_stall_since_ms_ = 0;
+    void     set_wl_want_out(bool on);
+public:
+    struct WlFlushStats {
+        uint64_t stalls = 0;         // episodes of a full socket
+        uint64_t worst_stall_ms = 0; // longest episode, until drained
+        uint64_t last_stall_ms = 0;
+        bool     stalled_now = false;
+    };
+    const WlFlushStats& wl_flush_stats() const { return wl_flush_stats_; }
+private:
+    WlFlushStats wl_flush_stats_;
     bool any_expanded() const;
     bool any_pointer_inside() const;
 public:

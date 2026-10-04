@@ -1,3 +1,4 @@
+#include "spawn.hpp"
 #include "audio.hpp"
 #include "bar.hpp"
 
@@ -12,6 +13,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <cstdint>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // One `pactl subscribe` for the whole process. pactl talks the PulseAudio
@@ -101,6 +104,7 @@ void AudioEvents::start(Bar& bar) {
     if (pipe2(p, O_CLOEXEC) != 0) return;
     pid_t pid = fork();
     if (pid == 0) {
+        child_reset_signals(); // no inherited blocked/ignored signals
         prctl(PR_SET_PDEATHSIG, SIGTERM);
         if (getppid() == 1) _exit(0);
         dup2(p[1], 1);
@@ -157,12 +161,13 @@ void AudioEvents::start(Bar& bar) {
 }
 
 void AudioEvents::stop() {
-    if (bar_ && fd_ >= 0) bar_->remove_fd(fd_);
-    if (fd_ >= 0) close(fd_);
-    fd_ = -1;
+    Bar::close_fd(fd_);
     if (pid_ > 0) {
         kill(pid_, SIGTERM);
-        waitpid(pid_, nullptr, WNOHANG); // reap; ECHILD is fine if too early
+        // Reap asynchronously: a single WNOHANG right after the kill (or
+        // right after the pipe's HUP, before the exit is reapable) almost
+        // always missed, leaving one zombie per restart attempt.
+        watch_child(pid_);
         pid_ = -1;
     }
 }

@@ -92,3 +92,12 @@ void   draw_rich_text(cairo_t* cr, const std::string& s, double x, double y,
 
 void notify_post(const std::string& summary, const std::string& body,
                  int urgency);
+
+// Test hooks: sanitising of sender-supplied text (markup stripped,
+// entities decoded, capped at max_bytes on a UTF-8 boundary) and the
+// popup word wrap.
+std::string notify_clean_text_for_test(const std::string& raw,
+                                       size_t max_bytes);
+std::vector<std::string> notify_wrap_for_test(cairo_t* cr,
+                                              const std::string& text,
+                                              double maxw, size_t max_lines);

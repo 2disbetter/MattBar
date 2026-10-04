@@ -59,7 +59,13 @@ bool qs_plugins_running();
 bool qs_plugins_lazy_hold();
 void qs_plugins_scan();
 void qs_plugins_sync_modules(Bar& bar);
+// Reconcile the sidecar with cfg. Starts/stops it as needed; a running
+// one is restarted (debounced) only when the shell.json it would read
+// differs from the one it started with.
 void qs_plugins_apply(Bar& bar);
+// Force the next apply to restart a running sidecar even if shell.json is
+// unchanged (plugin files on disk were replaced).
+void qs_plugins_invalidate_running();
 void qs_plugins_reap();
 void qs_plugins_stop();
 // User-facing shutdown: hide overlays, flip qs_plugins off, kill the
@@ -67,6 +73,10 @@ void qs_plugins_stop();
 // so the next click can start Quickshell again.
 void qs_plugins_shutdown();
 // Forward an IPC call to the live sidecar (`qs ipc`), or empty if down.
+// Fire-and-forget variant for calls whose reply is unused ("hide"): a
+// `quickshell ipc` start is a Qt process launch, too slow to wait on.
+void qs_plugins_ipc_async(const std::string& target, const std::string& method,
+                          const std::string& arg);
 std::string qs_plugins_ipc(const std::string& target, const std::string& method,
                            const std::string& arg);
 // Bring the sidecar up if needed and summon/toggle a placed plugin.

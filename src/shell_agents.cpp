@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <string>
+#include <utility>
 
 using ov::Host;
 using ov::col;

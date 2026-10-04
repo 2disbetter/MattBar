@@ -1,3 +1,4 @@
+#include "spawn.hpp"
 #include "polkit.hpp"
 #include "bar.hpp"
 #include "config.hpp"
@@ -13,6 +14,7 @@
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <systemd/sd-bus.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -20,6 +22,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <cstdint>
+#include <cstdlib>
 
 namespace {
 
@@ -167,7 +171,7 @@ void paint(cairo_t* cr) {
 
 void start_helper(const std::string& pw) {
     int p[2];
-    if (pipe(p) != 0) {
+    if (pipe2(p, O_CLOEXEC) != 0) { // not leaked into unrelated children
         busy = false;
         err  = "helper failed";
         win.draw();
@@ -175,9 +179,13 @@ void start_helper(const std::string& pw) {
     }
     pid_t pid = fork();
     if (pid == 0) {
+        child_reset_signals();
         close(p[1]);
-        dup2(p[0], 0);
+        dup2(p[0], 0); // dup2 clears O_CLOEXEC on the new fd 0
         close(p[0]);
+        // The helper is setuid root: hand it stdio and nothing else, even
+        // an fd some library opened without close-on-exec.
+        closefrom(3);
         execl(HELPER, "polkit-agent-helper-1", identity_user.c_str(),
               cookie.c_str(), (char*)nullptr);
         _exit(127);

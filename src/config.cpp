@@ -12,6 +12,9 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <string>
+#include <vector>
+#include <utility>
 
 Config cfg;
 
@@ -197,6 +200,8 @@ void Config::load() {
         else if (k == "vertical_width")    vertical_width = i();
         else if (k == "strip_hit_height")  strip_hit_height = i();
         else if (k == "output")            output = v;
+        else if (k == "wallpaper_monitors") wallpaper_monitors = v;
+        else if (k == "wallpaper_outputs")  wallpaper_outputs = v;
         else if (k == "strip_height")      strip_height = i();
         else if (k == "hide_delay_ms")     hide_delay_ms = i();
         else if (k == "reveal_delay_ms")   reveal_delay_ms = i();
@@ -221,6 +226,19 @@ void Config::load() {
         else if (k == "show_bluetooth")    show_bluetooth = b();
         else if (k == "bt_auto_heal")      bt_auto_heal = b();
         else if (k == "show_agents")       show_agents = b();
+        else if (k == "show_local_llm")    show_local_llm = b();
+        else if (k == "local_llm_url")     local_llm_url = v;
+        else if (k == "local_llm_chat_url") local_llm_chat_url = v;
+        else if (k == "local_llm_start_cmd") local_llm_start_cmd = v;
+        else if (k == "local_llm_stop_cmd") local_llm_stop_cmd = v;
+        else if (k == "local_llm_glyph")   local_llm_glyph = v;
+        else if (k == "local_llm_class")   local_llm_class = v;
+        else if (k == "local_llm_popup_size") {
+            local_llm_popup_size = v;
+            set_local_llm_popup_pct(local_llm_popup_w_pct(),
+                                    local_llm_popup_h_pct());
+        }
+        else if (k == "local_llm_popup_anchor") local_llm_popup_anchor = v;
         else if (k == "agents_warn_pct")   agents_warn_pct = atoi(v.c_str());
         else if (k == "agents_glyph")      agents_glyph = v;
         else if (k == "agents_click")      agents_click = v;
@@ -230,6 +248,7 @@ void Config::load() {
             agents_popup_size = v;
             set_agents_popup_pct(agents_popup_w_pct(), agents_popup_h_pct());
         }
+        else if (k == "agents_popup_anchor") agents_popup_anchor = v;
         else if (k == "agents_click_through")
             agents_click_through = (v == "true" || v == "1");
         else if (k == "show_microphone")   show_microphone = b();
@@ -287,6 +306,8 @@ void Config::load() {
         else if (k == "qs_plugin_services")     qs_plugin_services = v;
         else if (k == "idle_blank_s")
             idle_blank_s = std::clamp(atoi(v.c_str()), 0, 120);
+        else if (k == "lock_wake_blank_s")
+            lock_wake_blank_s = std::clamp(atoi(v.c_str()), 0, 300);
         else if (k == "shell_font_size")
             shell_font_size = std::clamp(atof(v.c_str()), 9.0, 28.0);
         else if (k == "shell_audio_font_size")
@@ -360,6 +381,7 @@ void Config::load() {
         else if (k == "update_click")      update_click = v;
         else if (k == "update_interval_s") update_interval_s = i();
         else if (k == "update_signal")     update_signal = i();
+        else if (k == "launch_wrapper")    launch_wrapper = v;
         else if (k == "show_temp")         show_temp = b();
         else if (k == "temp_sensor")       temp_sensor = v;
         else if (k == "temp_warn")         temp_warn = i();
@@ -430,8 +452,10 @@ void Config::save() const {
         if (s2 != std::string::npos) mkdir(dir.substr(0, s2).c_str(), 0755);
         mkdir(dir.c_str(), 0755);
     }
-    std::ofstream f(p);
-    if (!f) return;
+    // Built in memory, then written atomically (temp file + rename): an
+    // in-place truncate+write interrupted by a crash or watchdog kill left
+    // an empty mattbar.conf and every setting back at its default.
+    std::ostringstream f;
     f << "# MattBar configuration (written by the settings window)\n"
       << "# position: top | bottom | left | right\n"
       << "position = " << position << "\n"
@@ -441,6 +465,10 @@ void Config::save() const {
       << "strip_hit_height = " << strip_hit_height << "\n"
       << "# output: monitor name like DP-2; empty = compositor picks\n"
       << "output = " << output << "\n"
+      << "# wallpaper_monitors: same | main | mix | each (takeover only)\n"
+      << "wallpaper_monitors = " << wallpaper_monitors << "\n"
+      << "# wallpaper_outputs: per-monitor picks for 'each', NAME=/path|...\n"
+      << "wallpaper_outputs = " << wallpaper_outputs << "\n"
       << "# multi_monitor: one bar per output. monitors = CSV of names\n"
       << "# (empty = every output). primary_output hosts the tray, the\n"
       << "# settings window and notification/OSD popups.\n"
@@ -477,6 +505,15 @@ void Config::save() const {
       << "# no audio transport (wedge auto-recovery)\n"
       << "bt_auto_heal = " << (bt_auto_heal ? "true" : "false") << "\n"
       << "show_agents = " << (show_agents ? "true" : "false") << "\n"
+      << "show_local_llm = " << (show_local_llm ? "true" : "false") << "\n"
+      << "local_llm_url = " << local_llm_url << "\n"
+      << "local_llm_chat_url = " << local_llm_chat_url << "\n"
+      << "local_llm_start_cmd = " << local_llm_start_cmd << "\n"
+      << "local_llm_stop_cmd = " << local_llm_stop_cmd << "\n"
+      << "local_llm_glyph = " << local_llm_glyph << "\n"
+      << "local_llm_class = " << local_llm_class << "\n"
+      << "local_llm_popup_size = " << local_llm_popup_size << "\n"
+      << "local_llm_popup_anchor = " << local_llm_popup_anchor << "\n"
       << "agents_warn_pct = " << agents_warn_pct << "\n"
       << "agents_glyph = " << agents_glyph << "\n"
       << "agents_click = " << agents_click << "\n"
@@ -484,6 +521,9 @@ void Config::save() const {
       << "agents_term_class = " << agents_term_class << "\n"
       << "# agents_popup_size: W% H% of the monitor (Settings: Agents)\n"
       << "agents_popup_size = " << agents_popup_size << "\n"
+      << "# agents_popup_anchor: bar | top-left | top-right | bottom-left |\n"
+      << "# bottom-right | center. bar follows the bar edge.\n"
+      << "agents_popup_anchor = " << agents_popup_anchor << "\n"
       << "agents_click_through = "
       << (agents_click_through ? "true" : "false") << "\n"
       << "show_microphone = " << (show_microphone ? "true" : "false") << "\n"
@@ -541,6 +581,7 @@ void Config::save() const {
       << "qs_plugin_bar_more = " << qs_plugin_bar_more << "\n"
       << "qs_plugin_services = " << qs_plugin_services << "\n"
       << "idle_blank_s = " << idle_blank_s << "\n"
+      << "lock_wake_blank_s = " << lock_wake_blank_s << "\n"
       << "shell_font_size = " << static_cast<int>(shell_font_size) << "\n"
       << "shell_audio_font_size = " << static_cast<int>(shell_audio_font_size) << "\n"
       << "shell_network_font_size = " << static_cast<int>(shell_network_font_size) << "\n"
@@ -638,7 +679,20 @@ void Config::save() const {
       << "update_check = " << update_check << "\n"
       << "update_click = " << update_click << "\n"
       << "update_interval_s = " << update_interval_s << "\n"
-      << "update_signal = " << update_signal << "\n";
+      << "update_signal = " << update_signal << "\n"
+      << "# launch_wrapper: auto | none | <prefix command>\n"
+      << "launch_wrapper = " << launch_wrapper << "\n";
+    // Nothing changed since our last write (and the file is still there):
+    // skip it. Settings applies, the sidecar's qs_plugins mirror and the
+    // debounced settings save all funnel here, often with no real change.
+    static std::string last_written;
+    const std::string  body = f.str();
+    if (body == last_written && access(p.c_str(), F_OK) == 0) return;
+    if (!atomic_write(p, body)) {
+        fprintf(stderr, "mattbar: could not save %s\n", p.c_str());
+        return;
+    }
+    last_written = body;
 }
 
 
@@ -654,7 +708,8 @@ static const char* KNOWN_MODULES[] = {"omarchy",   "workspaces", "clock",
                                       "notifications",
                                       "power",
                                       "volume",    "battery",
-                                      "agents",    "microphone",
+                                      "agents",    "localllm",
+                                      "microphone",
                                       "screenrecord",
                                       "kblayout", "activewindow",
                                       "reminder", "dictation",
@@ -726,6 +781,9 @@ void Config::note_app(const std::string& app) {
     v.push_back(app);
     std::sort(v.begin(), v.end());
     if (v.size() > 40) v.resize(40);
+    // Past the cap, an app that sorts after the 40th is trimmed straight
+    // back off; saving anyway rewrote the config on every notification.
+    if (std::find(v.begin(), v.end(), app) == v.end()) return;
     known_apps = join_list(v);
     save();
 }
@@ -827,30 +885,129 @@ void Config::layout_normalize() {
     layout_set(2, right);
 }
 
-static void parse_agents_popup_pct(const std::string& s, int& w, int& h) {
-    w = 36;
-    h = 44;
+static void parse_popup_pct(const std::string& s, int def_w, int def_h,
+                            int& w, int& h) {
+    w = def_w;
+    h = def_h;
     int a = 0, b = 0;
     if (sscanf(s.c_str(), "%d%% %d%%", &a, &b) == 2) {
         w = a;
         h = b;
     }
+    w = std::clamp(w, 16, 100);
+    h = std::clamp(h, 16, 100);
+}
+
+static std::string norm_anchor(std::string a) {
+    if (a == "bar" || a == "center" || a == "top-left" || a == "top-right" ||
+        a == "bottom-left" || a == "bottom-right")
+        return a;
+    return "bar";
+}
+
+Config::PopupPlace Config::popup_place(const std::string& size,
+                                       const std::string& anchor, int def_w,
+                                       int def_h) const {
+    PopupPlace g{};
+    parse_popup_pct(size, def_w, def_h, g.w_pct, g.h_pct);
+    const std::string an = norm_anchor(anchor);
+    if (an == "center") {
+        g.x_pct = (100 - g.w_pct) / 2;
+        g.y_pct = (100 - g.h_pct) / 2;
+    } else if (an == "top-left") {
+        g.x_pct = 1;
+        g.y_pct = 1;
+    } else if (an == "top-right") {
+        g.x_pct = 100 - g.w_pct - 1;
+        g.y_pct = 1;
+    } else if (an == "bottom-left") {
+        g.x_pct = 1;
+        g.y_pct = 100 - g.h_pct - 1;
+    } else if (an == "bottom-right") {
+        g.x_pct = 100 - g.w_pct - 1;
+        g.y_pct = 100 - g.h_pct - 1;
+    } else if (position == "bottom") {
+        g.x_pct = 100 - g.w_pct - 1;
+        g.y_pct = 100 - g.h_pct - 4;
+    } else if (position == "left") {
+        g.x_pct = 2;
+        g.y_pct = 3;
+    } else if (position == "right") {
+        g.x_pct = 100 - g.w_pct - 2;
+        g.y_pct = 3;
+    } else { // top bar, or unknown
+        g.x_pct = 100 - g.w_pct - 1;
+        g.y_pct = 3;
+    }
+    if (g.x_pct < 0) g.x_pct = 0;
+    if (g.y_pct < 0) g.y_pct = 0;
+    return g;
 }
 
 int Config::agents_popup_w_pct() const {
     int w, h;
-    parse_agents_popup_pct(agents_popup_size, w, h);
+    parse_popup_pct(agents_popup_size, 36, 44, w, h);
     return w;
 }
 
 int Config::agents_popup_h_pct() const {
     int w, h;
-    parse_agents_popup_pct(agents_popup_size, w, h);
+    parse_popup_pct(agents_popup_size, 36, 44, w, h);
     return h;
 }
 
 void Config::set_agents_popup_pct(int w, int h) {
-    w = std::clamp(w, 20, 80);
-    h = std::clamp(h, 20, 90);
+    w = std::clamp(w, 16, 100);
+    h = std::clamp(h, 16, 100);
     agents_popup_size = std::to_string(w) + "% " + std::to_string(h) + "%";
+}
+
+int Config::local_llm_popup_w_pct() const {
+    int w, h;
+    parse_popup_pct(local_llm_popup_size, 70, 80, w, h);
+    return w;
+}
+
+int Config::local_llm_popup_h_pct() const {
+    int w, h;
+    parse_popup_pct(local_llm_popup_size, 70, 80, w, h);
+    return h;
+}
+
+void Config::set_local_llm_popup_pct(int w, int h) {
+    w = std::clamp(w, 16, 100);
+    h = std::clamp(h, 16, 100);
+    local_llm_popup_size = std::to_string(w) + "% " + std::to_string(h) + "%";
+}
+
+// wallpaper_outputs: "NAME=/path|NAME=/path" (paths never contain '|' in
+// practice; a name never contains '=').
+std::string Config::wallpaper_for(const std::string& out) const {
+    size_t i = 0;
+    while (i <= wallpaper_outputs.size()) {
+        size_t j = wallpaper_outputs.find('|', i);
+        if (j == std::string::npos) j = wallpaper_outputs.size();
+        std::string e  = wallpaper_outputs.substr(i, j - i);
+        size_t      eq = e.find('=');
+        if (eq != std::string::npos && e.compare(0, eq, out) == 0 &&
+            eq == out.size())
+            return e.substr(eq + 1);
+        i = j + 1;
+    }
+    return {};
+}
+
+void Config::set_wallpaper_for(const std::string& out, const std::string& path) {
+    std::string next;
+    size_t      i = 0;
+    while (i < wallpaper_outputs.size()) {
+        size_t j = wallpaper_outputs.find('|', i);
+        if (j == std::string::npos) j = wallpaper_outputs.size();
+        std::string e = wallpaper_outputs.substr(i, j - i);
+        if (!e.empty() && e.rfind(out + "=", 0) != 0)
+            next += (next.empty() ? "" : "|") + e;
+        i = j + 1;
+    }
+    if (!path.empty()) next += (next.empty() ? "" : "|") + out + "=" + path;
+    wallpaper_outputs = next;
 }

@@ -96,3 +96,15 @@ o.bind("XF86AudioPause", "Pause", mb .. " media playPause", { locked = true })
 o.bind("ALT + XF86AudioPlay", "Next track", mb .. " media next", { locked = true })
 o.bind("ALT + SHIFT + XF86AudioPlay", "Previous track",
   mb .. " media previous", { locked = true })
+hl.unbind("XF86AudioForward")
+hl.unbind("XF86AudioRewind")
+hl.unbind("XF86AudioStop")
+o.bind("XF86AudioForward", "Next track", mb .. " media next", { locked = true })
+o.bind("XF86AudioRewind", "Previous track", mb .. " media previous", { locked = true })
+o.bind("XF86AudioStop", "Pause", mb .. " media playPause", { locked = true })
+
+-- --- agent / local LLM popups --------------------------------------------
+hl.unbind("SUPER + A")
+o.bind("SUPER + A", "MattBar agent", mb .. " agents toggle")
+hl.unbind("SUPER + SHIFT + A")
+o.bind("SUPER + SHIFT + A", "MattBar local LLM", mb .. " localllm toggle")

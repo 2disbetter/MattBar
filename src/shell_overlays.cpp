@@ -2,7 +2,7 @@
 #include "overlay.hpp"
 #include "util.hpp"
 
-#include "stb_image.h"
+#include "imgwork.hpp"
 
 #include <linux/input-event-codes.h>
 #include <dirent.h>
@@ -15,8 +15,14 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <utility>
 #include <sstream>
 #include <vector>
+#include <cstdint>
+#include <string>
+#include <functional>
+#include <algorithm>
+#include <cstdlib>
 
 namespace {
 
@@ -45,43 +51,9 @@ std::string clipboard_path() {
     return home_dir() + "/.local/state/omarchy/clipboard-history.json";
 }
 
-cairo_surface_t* load_still(const std::string& path, int max_edge) {
-    if (path.empty()) return nullptr;
-    int w = 0, h = 0, n = 0;
-    unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
-    if (!px || w <= 0 || h <= 0) {
-        if (px) stbi_image_free(px);
-        return nullptr;
-    }
-    int dw = w, dh = h;
-    if (max_edge > 0 && std::max(w, h) > max_edge) {
-        double s = (double)max_edge / std::max(w, h);
-        dw = std::max(1, (int)(w * s));
-        dh = std::max(1, (int)(h * s));
-    }
-    cairo_surface_t* cs = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, dw, dh);
-    unsigned char* dst  = cairo_image_surface_get_data(cs);
-    int stride          = cairo_image_surface_get_stride(cs);
-    for (int y = 0; y < dh; ++y) {
-        int sy = y * h / dh;
-        auto* row = reinterpret_cast<uint32_t*>(dst + y * stride);
-        unsigned char* src = px + sy * w * 4;
-        for (int x = 0; x < dw; ++x) {
-            int sx = x * w / dw;
-            unsigned char r = src[sx * 4 + 0], g = src[sx * 4 + 1],
-                          b = src[sx * 4 + 2], a = src[sx * 4 + 3];
-            row[x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
-                     ((uint32_t)g << 8) | b;
-        }
-    }
-    cairo_surface_mark_dirty(cs);
-    stbi_image_free(px);
-    return cs;
-}
-
 void touch_file(const std::string& path) {
     if (path.empty()) return;
-    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd >= 0) close(fd);
 }
 
@@ -216,11 +188,11 @@ private:
         const Clip& c = rows_[sel_];
         if (c.type == "image") {
             std::string mime = c.mime.empty() ? "image/png" : c.mime;
-            spawn_detached(std::string("omarchy-clipboard-paste-file ") +
+            spawn_helper(std::string("omarchy-clipboard-paste-file ") +
                            (cfg.shell_clipboard_paste ? "" : "--copy-only ") +
                            shell_quote(mime) + " " + shell_quote(c.path));
         } else {
-            spawn_detached(std::string("omarchy-clipboard-paste-text ") +
+            spawn_helper(std::string("omarchy-clipboard-paste-text ") +
                            (cfg.shell_clipboard_paste ? "--shift-insert "
                                                       : "--copy-only ") +
                            "--history-index " + std::to_string(c.index));
@@ -468,9 +440,9 @@ private:
         if (sel_ < 0 || sel_ >= (int)rows_.size()) return;
         const std::string& e = g_emojis[rows_[sel_]].e;
         if (cfg.shell_emoji_insert)
-            spawn_detached("omarchy-menu-emoji-insert " + shell_quote(e));
+            spawn_helper("omarchy-menu-emoji-insert " + shell_quote(e));
         else
-            spawn_detached("printf %s " + shell_quote(e) + " | wl-copy");
+            spawn_helper("printf %s " + shell_quote(e) + " | wl-copy");
         close();
     }
 
@@ -592,6 +564,9 @@ struct Img {
     std::string path, thumb, label;
 };
 
+class ImagePickerOverlay;
+ImagePickerOverlay* g_picker = nullptr; // the registered instance
+
 class ImagePickerOverlay : public Overlay {
 public:
     const char* id() const override { return "omarchy.image-picker"; }
@@ -608,6 +583,8 @@ public:
         return "unknown";
     }
     ~ImagePickerOverlay() override {
+        if (g_picker == this) g_picker = nullptr;
+        on_close_ = nullptr; // shutting down: don't reopen settings
         cancel("");
         for (auto& [_, s] : cache_)
             if (s) cairo_surface_destroy(s);
@@ -629,6 +606,13 @@ private:
     double fs() const { return cfg.shell_image_font_size; }
 
     void cancel(const std::string& extra_done) {
+        drop_thumbs();
+        on_pick_ = nullptr;
+        struct After { // settings reopens once the picker has closed
+            std::function<void()> f;
+            ~After() { if (f) f(); }
+        } after{std::move(on_close_)};
+        on_close_ = nullptr;
         if (!done_file_.empty()) touch_file(done_file_);
         if (!extra_done.empty() && extra_done != done_file_)
             touch_file(extra_done);
@@ -752,12 +736,20 @@ private:
             cancel("");
             return;
         }
+        const std::string path = imgs_[idx].path;
+        auto cb = std::move(on_pick_);
+        auto oc = std::move(on_close_);
+        on_pick_  = nullptr;
+        on_close_ = nullptr;
         if (!sel_file_.empty())
-            write_file(sel_file_, imgs_[idx].path + "\n");
+            write_file(sel_file_, path + "\n");
         if (!done_file_.empty()) touch_file(done_file_);
         sel_file_.clear();
         done_file_.clear();
+        drop_thumbs();
         host_.close();
+        if (cb) cb(path);
+        if (oc) oc();
     }
 
     int current() const {
@@ -767,8 +759,37 @@ private:
         return view_.empty() ? -1 : view_[0];
     }
 
+public:
+    // Settings' background chooser: the same grid, but the pick goes to
+    // `cb` instead of Omarchy's selection/done files.
+    void choose(const std::string& rows, const std::string& selected,
+                std::function<void(const std::string&)> cb,
+                std::function<void()> on_close) {
+        if (host_.is_open()) cancel("");
+        on_close_ = std::move(on_close);
+        dirs_.clear();
+        rows_raw_ = rows;
+        selected_ = selected;
+        sel_file_.clear();
+        done_file_.clear();
+        show_labels_ = true;
+        filterable_  = true;
+        on_pick_     = std::move(cb);
+        open_parsed();
+    }
+
+private:
+    std::function<void(const std::string&)> on_pick_;
+    std::function<void()>                   on_close_; // pick or cancel
+
     void open(const std::string& payload) {
+        on_pick_  = nullptr; // an Omarchy-driven open never feeds settings
+        on_close_ = nullptr;
         parse_payload(payload);
+        open_parsed();
+    }
+
+    void open_parsed() {
         filter_.clear();
         search_.clear();
         sel_ = scroll_ = 0;
@@ -843,12 +864,39 @@ private:
         }
     }
 
+    // Thumbnails decode on the image worker: paint() only ever draws what
+    // is ready (the tile shows its placeholder until then). Opening a
+    // folder of 4K wallpapers used to freeze the bar for seconds here.
+    static constexpr int kThumbEdge = 240;
+    std::map<std::string, uint64_t> thumb_jobs_;
     cairo_surface_t* thumb(const Img& im) {
         auto it = cache_.find(im.path);
         if (it != cache_.end()) return it->second;
-        cairo_surface_t* s = load_still(im.thumb.empty() ? im.path : im.thumb, 240);
-        cache_[im.path]    = s;
-        return s;
+        if (thumb_jobs_.count(im.path)) return nullptr;
+        auto* sh = mattbar_shell();
+        const std::string src = im.thumb.empty() ? im.path : im.thumb;
+        if (!sh || !sh->bar()) {
+            return cache_[im.path] =
+                       img_decode_now(src, {kThumbEdge, kThumbEdge, ImgTarget::Fit});
+        }
+        const std::string key = im.path;
+        thumb_jobs_[key] = img_submit(
+            *sh->bar(), {{src, {{kThumbEdge, kThumbEdge, ImgTarget::Fit}}}},
+            [this, key](ImgResult& r) {
+                thumb_jobs_.erase(key);
+                cache_[key] = std::exchange(r.surfs[0][0], nullptr);
+                if (host_.is_open()) host_.redraw();
+            });
+        return nullptr;
+    }
+    // Closing forgets queued decodes and the cache (100+ thumbnails of a
+    // big folder are tens of MB held for a picker that isn't open).
+    void drop_thumbs() {
+        for (auto& [_, t] : thumb_jobs_) img_cancel(t);
+        thumb_jobs_.clear();
+        for (auto& [_, s] : cache_)
+            if (s) cairo_surface_destroy(s);
+        cache_.clear();
     }
 
     void paint(cairo_t* cr) {
@@ -1283,10 +1331,20 @@ private:
 void register_shell_overlays(Shell& sh) {
     sh.add(new ClipboardOverlay);
     sh.add(new EmojiOverlay);
-    sh.add(new ImagePickerOverlay);
+    sh.add(g_picker = new ImagePickerOverlay);
     sh.add(new WifiQrOverlay);
     sh.add(new SpeedTestOverlay);
     sh.add(new DiskSpeedTestOverlay);
+}
+
+bool image_picker_choose(const std::string& rows, const std::string& selected,
+                         std::function<void(const std::string&)> cb,
+                         std::function<void()> on_close) {
+    auto* sh = mattbar_shell();
+    if (!sh || !sh->bar()) return false;
+    if (!g_picker) return false;
+    g_picker->choose(rows, selected, std::move(cb), std::move(on_close));
+    return true;
 }
 
 std::string image_selector_dispatch(const std::string& rest) {

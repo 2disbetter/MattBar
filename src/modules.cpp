@@ -1,4 +1,6 @@
+#include "hyprev.hpp"
 #include "modules.hpp"
+#include "imgwork.hpp"
 #include "bar.hpp"
 #include "config.hpp"
 #include "nightlight.hpp"
@@ -9,6 +11,7 @@
 #include "audio.hpp"
 #include "popup.hpp"
 #include "sensors.hpp"
+#include "spawn.hpp"
 #include "util.hpp"
 #include "wallpaper.hpp"
 
@@ -38,9 +41,15 @@
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <utility>
 #include <memory>
 #include <string>
 #include <vector>
+#include <cstdint>
+#include <string_view>
+#include <sstream>
+#include <cstdio>
+#include <cstdlib>
 
 #ifndef DBG
 #define DBG(...)                                                              \
@@ -52,111 +61,11 @@
     } while (0)
 #endif
 
-// Launch a command fully detached; never blocks the bar. Double-fork +
-// setsid so the child is not in MattBar's systemd cgroup. `system("foo &")`
-// left browsers/IDEs in mattbar.service; a restart then SIGTERM'd them
-// (Brave/Spotify/Signal dumped core) and hung 90s on jetbrainsd (16.7G
-// attributed to the unit).
-// Omarchy 4.2 agent CLIs are mise stubs in ~/.local/bin. Terminals
-// spawned from the bar often inherit a compositor PATH without that
-// directory, so `omarchy-cmd-missing grok` is true even when the stub
-// exists. Prefix it on every agent launch.
-static std::string omarchy_agent_path_export() {
-    return "export PATH=\"$HOME/.local/bin:$HOME/.local/share/mise/shims:"
-           "${PATH:-/usr/bin}\"";
-}
-
-static std::string omarchy_default_agent_name() {
-    const char* h = getenv("HOME");
-    return trim(slurp(std::string(h && *h ? h : ".") +
-                      "/.config/omarchy/defaults/agent"));
-}
-
-static bool omarchy_agent_name_ok(const std::string& a) {
-    if (a.empty()) return false;
-    for (unsigned char c : a) {
-        if (!(std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '+'))
-            return false;
-    }
-    return true;
-}
-
-static bool omarchy_agent_cli_ready() {
-    std::string a = omarchy_default_agent_name();
-    if (!omarchy_agent_name_ok(a)) return false;
-    int st = -1;
-    cmd_output(omarchy_agent_path_export() + "; command -v " + a +
-                   " >/dev/null 2>&1",
-               &st);
-    return st == 0;
-}
-
-static void omarchy_agent_pick() {
-    spawn_detached(omarchy_agent_path_export() +
-                   "; if command -v omarchy-menu >/dev/null 2>&1; then "
-                   "exec omarchy-menu summon setup.default.agent; "
-                   "fi; exec omarchy-agent --pick");
-}
-
-// Stock terminal payload. PATH first so 4.2 mise stubs resolve. If the
-// configured default is missing, run the official installer for that
-// name, then inline. If that still cannot produce a CLI, open the
-// picker instead of dying with "grok is not installed".
-static std::string omarchy_agent_inline_sh() {
-    return omarchy_agent_path_export() + "; "
-           "agent=$(omarchy-default-agent 2>/dev/null || true); "
-           "agent=$(printf %s \"$agent\" | tr -d \\\\n); "
-           "if [ -n \"$agent\" ] && command -v \"$agent\" >/dev/null 2>&1; then "
-           "  exec omarchy-agent --inline; "
-           "fi; "
-           "if [ -n \"$agent\" ]; then "
-           "  omarchy-default-agent --install \"$agent\" >/dev/null 2>&1 || "
-           "    omarchy-default-agent \"$agent\" >/dev/null 2>&1 || true; "
-           "  if command -v \"$agent\" >/dev/null 2>&1; then "
-           "    exec omarchy-agent --inline; "
-           "  fi; "
-           "fi; "
-           "if command -v omarchy-menu >/dev/null 2>&1; then "
-           "  exec omarchy-menu summon setup.default.agent; "
-           "fi; "
-           "exec omarchy-agent --pick";
-}
-
-void spawn_detached(const std::string& c) {
-    if (c.empty()) return;
-    pid_t pid = fork();
-    if (pid < 0) return;
-    if (pid > 0) {
-        waitpid(pid, nullptr, 0);
-        return;
-    }
-    if (setsid() < 0) _exit(127);
-    pid_t g = fork();
-    if (g < 0) _exit(127);
-    if (g > 0) _exit(0);
-    uid_t uid = getuid();
-    char cg[160];
-    snprintf(cg, sizeof cg,
-             "/sys/fs/cgroup/user.slice/user-%u.slice/user@%u.service/"
-             "cgroup.procs",
-             (unsigned)uid, (unsigned)uid);
-    int cfd = open(cg, O_WRONLY | O_CLOEXEC);
-    if (cfd >= 0) {
-        char b[32];
-        int n = snprintf(b, sizeof b, "%d\n", (int)getpid());
-        (void)!write(cfd, b, (size_t)n);
-        close(cfd);
-    }
-    int z = open("/dev/null", O_RDWR | O_CLOEXEC);
-    if (z >= 0) {
-        dup2(z, 0);
-        dup2(z, 1);
-        dup2(z, 2);
-        if (z > 2) close(z);
-    }
-    execl("/bin/sh", "sh", "-c", c.c_str(), (char*)nullptr);
-    _exit(127);
-}
+// spawn_detached / spawn_helper live in spawn.cpp: posix_spawn with clean
+// signal state, pidfd reaping, and (for user launches) a systemd scope so
+// apps survive a bar restart. The old double-fork wrote itself into
+// user@UID.service/cgroup.procs, which cgroup v2 rejects (EBUSY) for that
+// inner node — launched apps silently stayed in mattbar.service.
 
 static const char* kPowerStateDir =
     "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/powerprofiles";
@@ -167,7 +76,7 @@ void persist_power_profile(const std::string& profile) {
     // (PPD profiles are power-saver|balanced|performance).
     for (char c : profile)
         if (c == '\'' || c == '/' || c == '\n') return;
-    spawn_detached(std::string("d=\"") + kPowerStateDir +
+    spawn_helper(std::string("d=\"") + kPowerStateDir +
                    "\"; mkdir -p \"$d\"; printf '%s\\n' '" + profile +
                    "' >\"$d/ac\"; printf '%s\\n' '" + profile +
                    "' >\"$d/battery\"; powerprofilesctl set '" + profile +
@@ -230,14 +139,11 @@ void AsyncCmd::run(Bar& bar, const std::string& cmd, Done cb,
 void AsyncCmd::start(const std::string& cmd) {
     int p[2];
     if (pipe2(p, O_CLOEXEC) != 0) return;
-    pid_t pid = fork();
-    if (pid == 0) {
-        dup2(p[1], 1);
-        dup2(p[1], 2);
-        close(p[0]);
-        execl("/bin/sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
-        _exit(127);
-    }
+    SpawnOpts o;
+    o.stdout_fd    = p[1];
+    o.merge_stderr = true;
+    o.new_pgroup   = true; // the timeout kill reaches the whole pipeline
+    pid_t pid      = spawn_sh(cmd, o);
     close(p[1]);
     if (pid < 0) {
         close(p[0]);
@@ -245,32 +151,37 @@ void AsyncCmd::start(const std::string& cmd) {
     }
     pid_ = pid;
     fd_  = p[0];
+    ++gen_;
     buf_.clear();
     line_pos_ = 0;
     fcntl(fd_, F_SETFL, O_NONBLOCK);
+    // The pipe only carries output. A hang-up means every writer closed it,
+    // NOT that the command exited (`exec >&-`, or bash exec'ing a single
+    // `cmd >/dev/null`), so HUP just drops the pipe; completion is driven
+    // by the exit notification below. The old blocking waitpid() on HUP
+    // stalled the loop for the command's whole runtime.
     bar_->add_fd(fd_, [this](uint32_t ev) {
-        char    b[1024];
-        ssize_t n;
-        while ((n = read(fd_, b, sizeof b)) > 0) {
-            buf_.append(b, n);
-            drain_lines();
-        }
-        if (ev & (EPOLLHUP | EPOLLERR)) {
-            int st = -1, ws = 0;
-            if (waitpid(pid_, &ws, 0) == pid_ && WIFEXITED(ws))
-                st = WEXITSTATUS(ws);
-            finish(st);
-        }
+        drain_pipe();
+        if (fd_ >= 0 && (ev & (EPOLLHUP | EPOLLERR))) close_pipe();
     }, "async-cmd");
+    std::weak_ptr<char> alive = alive_;
+    const uint64_t      gen   = gen_;
+    watch_child(pid, [this, alive, gen](int st) {
+        if (alive.expired() || gen != gen_ || pid_ <= 0) return; // stale
+        // Everything sh wrote before exiting is already in the pipe; a
+        // grandchild that inherited stdout must not hold completion up.
+        drain_pipe();
+        finish(st);
+    });
     if (timer_fd_ < 0) {
         timer_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
         bar_->add_fd(timer_fd_, [this](uint32_t) {
             uint64_t v;
             while (read(timer_fd_, &v, sizeof v) > 0) {}
-            if (pid_ > 0) { // overdue: kill it, deliver what we have
-                kill(pid_, SIGKILL);
-                waitpid(pid_, nullptr, 0);
-                finish(-1);
+            if (pid_ > 0) { // overdue: kill the group, deliver what we have
+                kill(-pid_, SIGKILL);
+                drain_pipe();
+                finish(-1); // the exit notification reaps it later
             }
         }, "async-cmd-timeout");
     }
@@ -279,6 +190,19 @@ void AsyncCmd::start(const std::string& cmd) {
     ts.it_value.tv_nsec = (timeout_ms_ % 1000) * 1000000L;
     timerfd_settime(timer_fd_, 0, &ts, nullptr);
 }
+
+void AsyncCmd::drain_pipe() {
+    if (fd_ < 0) return;
+    char    b[4096];
+    ssize_t n;
+    while ((n = read(fd_, b, sizeof b)) > 0) {
+        buf_.append(b, n);
+        drain_lines();
+    }
+    if (n == 0) close_pipe(); // EOF
+}
+
+void AsyncCmd::close_pipe() { Bar::close_fd(fd_); }
 
 void AsyncCmd::drain_lines() {
     if (!on_line_) return;
@@ -292,7 +216,7 @@ void AsyncCmd::drain_lines() {
 void AsyncCmd::cancel() {
     pending_ = false;
     if (pid_ <= 0) return;
-    kill(pid_, SIGTERM);
+    kill(-pid_, SIGTERM); // whole process group
 }
 
 void AsyncCmd::finish(int status) {
@@ -302,11 +226,7 @@ void AsyncCmd::finish(int status) {
     }
     itimerspec off{};
     if (timer_fd_ >= 0) timerfd_settime(timer_fd_, 0, &off, nullptr);
-    if (fd_ >= 0) {
-        bar_->remove_fd(fd_);
-        close(fd_);
-        fd_ = -1;
-    }
+    close_pipe();
     pid_ = -1;
     std::string out = std::move(buf_);
     buf_.clear();
@@ -319,12 +239,15 @@ void AsyncCmd::finish(int status) {
 }
 
 AsyncCmd::~AsyncCmd() {
-    if (pid_ > 0) {
-        kill(pid_, SIGKILL);
-        waitpid(pid_, nullptr, 0);
-    }
-    if (fd_ >= 0) close(fd_);
-    if (timer_fd_ >= 0) close(timer_fd_);
+    // No waitpid here: the exit notification (watch_child) reaps the child
+    // and sees alive_ expired. bar_ is not touched either — some AsyncCmds
+    // are globals destroyed after main()'s Bar is gone; Bar::close_fd()
+    // copes with that. Both fds' callbacks capture `this`, so they must
+    // leave the loop's table with it.
+    alive_.reset();
+    if (pid_ > 0) kill(-pid_, SIGKILL);
+    Bar::close_fd(fd_);
+    Bar::close_fd(timer_fd_);
 }
 
 // ---------------------------------------------------------------------------
@@ -467,13 +390,6 @@ void clock_cycle_format() {
 
 // Hyprland IPC helpers defined further down; declared inside the unnamed
 // namespace so these names unify with their internal-linkage definitions.
-namespace {
-std::string hypr_socket_dir();
-int         unix_connect(const std::string& path);
-std::string hypr_request(const std::string& dir, const std::string& req);
-bool        hypr_dispatch2(const std::string& dir, const std::string& legacy,
-                           const std::string& lua);
-} // namespace
 
 // ---------------------------------------------------------------------------
 // AI agent usage — a reader of Omarchy Quattro's agents data contract.
@@ -492,9 +408,9 @@ public:
     AgentsModule() { g = this; }
     ~AgentsModule() override {
         if (g == this) g = nullptr;
-        if (ino_fd_ >= 0) close(ino_fd_);
-        if (deb_fd_ >= 0) close(deb_fd_);
-        if (sock2_fd_ >= 0) close(sock2_fd_);
+        Bar::close_fd(ino_fd_);
+        Bar::close_fd(deb_fd_);
+        hyprev::unsubscribe(sub_);
         if (spawn_fd_ >= 0) close(spawn_fd_);
         if (init_fd_ >= 0) close(init_fd_);
         dismiss_.destroy();
@@ -532,44 +448,27 @@ public:
         // our terminal appears (openwindow), dies (closewindow), and when
         // focus leaves it (activewindow) — which, under focus-follows-
         // mouse, IS the mouse-out signal that dismisses the popup.
-        hdir_ = hypr_socket_dir();
+        hdir_ = hypr_instance_dir();
         DBG("agents: popup term='%s' class='%s' hypr-sockets=%s",
             cfg.agents_term.c_str(), cfg.agents_term_class.c_str(),
             hdir_.empty() ? "MISSING" : "ok");
         if (!hdir_.empty()) {
-            sock2_fd_ = unix_connect(hdir_ + "/.socket2.sock");
-            if (sock2_fd_ >= 0) {
-                // unix_connect() returns a BLOCKING socket (fine for the
-                // one-shot request path). A level-triggered drain loop on a
-                // blocking fd hangs the event loop on the read after the
-                // last byte — which the sd_notify watchdog then correctly
-                // "fixes" by having systemd kill the bar, taking the pactl
-                // subscribe child with it, in a 10-second loop. Nonblocking
-                // is not optional here.
-                fcntl(sock2_fd_, F_SETFL, O_NONBLOCK);
-                bar.add_fd(sock2_fd_, [this](uint32_t) {
-                    char buf[2048];
-                    ssize_t n;
-                    while ((n = read(sock2_fd_, buf, sizeof buf)) > 0)
-                        sock2_buf_.append(buf, n);
-                    size_t p;
-                    while ((p = sock2_buf_.find('\n')) != std::string::npos) {
-                        sock2_line(sock2_buf_.substr(0, p));
-                        sock2_buf_.erase(0, p + 1);
-                    }
-                    if (n == 0) { // EOF: Hyprland restarted. A closed
-                        // stream in level-triggered epoll spins forever;
-                        // tear down and degrade the popup to panel-only.
-                        bar_->remove_fd(sock2_fd_);
-                        close(sock2_fd_);
-                        sock2_fd_  = -1;
-                        term_open_ = shown_ = spawning_ = on_special_ = false;
-                        term_cls_.clear();
-                        arm_spawn(false);
-                        sock2_buf_.clear();
-                    }
-                }, "agents-socket2");
-            }
+            // Shared event stream (hyprev.hpp): line-buffered, reconnects.
+            // A drop resets the popup state (its window may be gone with
+            // the compositor); once the stream is back, clicks can spawn a
+            // popup again instead of degrading to panel-only for good.
+            sub_ = hyprev::subscribe(
+                bar,
+                {"openwindow", "closewindow", "activespecial",
+                 "activewindow", "activewindowv2"},
+                [this](const HyprEvent& ev) { sock2_line(std::string(ev.line)); },
+                [this](bool up) {
+                    if (up) return;
+                    close_dismiss_catcher();
+                    term_open_ = shown_ = spawning_ = on_special_ = false;
+                    term_cls_.clear();
+                    arm_spawn(false);
+                });
         }
         // A spawn that never produces a window we recognise must not latch
         // into a silent click. This timer is armed with each spawn dispatch
@@ -610,11 +509,12 @@ public:
                     if (cfg.agents_click_through) enable_click_through();
                     bar.ping_watchdog();
                 }
-                if (!hdir_.empty() && sock2_fd_ >= 0 && discover_session())
+                if (!hdir_.empty() && stream_ok() && discover_session())
                     DBG("agents: found existing session window 0x%s from "
                         "a previous run (shown=%d)", term_addr_.c_str(),
                         (int)shown_);
-                placed_size_ = popup_size();
+                placed_size_ = popup_size() + "|" + cfg.agents_popup_anchor +
+                               "|" + cfg.position;
                 bar.ping_watchdog();
             }, "agents-deferred-init");
         }
@@ -638,7 +538,8 @@ public:
         // Settings steppers persist agents_popup_size then apply_config
         // ticks modules: resize the live grok window in place.
         if (init_done_) {
-            std::string sz = popup_size();
+            std::string sz = popup_size() + "|" + cfg.agents_popup_anchor +
+                             "|" + cfg.position;
             if (sz != placed_size_) {
                 placed_size_ = sz;
                 if (!hdir_.empty()) preinstall_rules();
@@ -657,7 +558,7 @@ public:
             // Eject a live terminal popup; otherwise the same picker
             // Omarchy's agents widget launches.
             if (term_open_) { eject(); return true; }
-            omarchy_agent_pick();
+            spawn_detached("omarchy-agent --pick");
             return true;
         }
         if (button == BTN_MIDDLE) {
@@ -693,7 +594,7 @@ public:
         } else {
             DBG("agents: click: no default agent -> panel");
         }
-        const bool popup_possible = !hdir_.empty() && sock2_fd_ >= 0;
+        const bool popup_possible = !hdir_.empty() && stream_ok();
         if (panelable || !popup_possible) {
             if (!popup_possible)
                 DBG("agents: click: hypr sockets unavailable -> panel only");
@@ -793,34 +694,34 @@ private:
     // stock tail is wrapped; a custom command is never rewritten.
     std::string spawn_cmd() const {
         const std::string& t = cfg.agents_term;
-        for (const char* tail :
-             {" omarchy-agent --inline", " omarchy-agent"}) {
-            const size_t n = strlen(tail);
-            if (t.size() > n && t.compare(t.size() - n, n, tail) == 0) {
-                std::string inner = omarchy_agent_inline_sh();
-                if (hold_next_)
-                    inner += "; printf \"\\n[omarchy-agent exited %s - press "
-                             "Enter to close]\\n\" \"$?\"; read _";
-                return t.substr(0, t.size() - n) + " sh -c '" + inner + "'";
+        std::string cmd = t;
+        if (hold_next_) {
+            for (const char* tail :
+                 {" omarchy-agent --inline", " omarchy-agent"}) {
+                const size_t n = strlen(tail);
+                if (t.size() > n && t.compare(t.size() - n, n, tail) == 0) {
+                    cmd = t.substr(0, t.size() - n) + " sh -c '" +
+                          (tail + 1) +
+                          "; printf \"\\n[omarchy-agent exited %s - press "
+                          "Enter to close]\\n\" \"$?\"; read _'";
+                    break;
+                }
             }
         }
-        return t; // custom command: never rewritten
+        // Hyprland exec inherits compositor PATH. After takeover that can
+        // be MattBar's unit PATH (/usr/bin only), so grok in ~/.local/bin
+        // looks "not installed". Force the enriched PATH onto the session.
+        const char* p = getenv("PATH");
+        if (p && *p) cmd = std::string("env PATH=") + p + " " + cmd;
+        return cmd;
     }
     // Place the popup so it visually hangs off the bar instead of
     // floating mid-screen: flush to the bar's edge, aligned toward the
     // right module cluster where the agents glyph lives. Everything is
     // computed in monitor-% so one rule works on any resolution.
     static std::string popup_move() {
-        int w = 36, h = 44;
-        sscanf(popup_size().c_str(), "%d%% %d%%", &w, &h);
-        int x, y;
-        if (cfg.position == "bottom") { x = 100 - w - 1; y = 100 - h - 4; }
-        else if (cfg.position == "left")  { x = 2;            y = 3; }
-        else if (cfg.position == "right") { x = 100 - w - 2;  y = 3; }
-        else /* top */                    { x = 100 - w - 1;  y = 3; }
-        if (x < 0) x = 0;
-        if (y < 0) y = 0;
-        return std::to_string(x) + "% " + std::to_string(y) + "%";
+        auto g = cfg.popup_place(popup_size(), cfg.agents_popup_anchor, 36, 44);
+        return std::to_string(g.x_pct) + "% " + std::to_string(g.y_pct) + "%";
     }
     static std::string addr_norm(std::string a) {
         if (a.rfind("0x", 0) == 0 || a.rfind("0X", 0) == 0) a = a.substr(2);
@@ -961,6 +862,7 @@ private:
                      ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
                      ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
         dismiss_.ensure(*bar_, a, 0, 0, 0, 0, "mattbar-dismiss", 0, 0, out);
+        dismiss_.set_input_empty();
     }
     // Hyprland 0.56 Lua `window.resize`/`window.move` take pixel coords.
     // Percent sizes in `resizewindowpixel` are a Lua syntax error there
@@ -969,8 +871,6 @@ private:
         int w, h, x, y;
     };
     PopupPx popup_px() {
-        int pw = 36, ph = 44;
-        sscanf(popup_size().c_str(), "%d%% %d%%", &pw, &ph);
         int         mw = 0, mh = 0;
         std::string mons = hypr_request(hdir_, "j/monitors");
         size_t      f    = mons.find("\"focused\": true");
@@ -994,25 +894,15 @@ private:
         }
         if (mw <= 0) mw = 1920;
         if (mh <= 0) mh = 1080;
-        int w = mw * pw / 100, h = mh * ph / 100;
+        auto g = cfg.popup_place(popup_size(), cfg.agents_popup_anchor, 36, 44);
+        int w = mw * g.w_pct / 100, h = mh * g.h_pct / 100;
+        int x = mw * g.x_pct / 100, y = mh * g.y_pct / 100;
         if (w < 200) w = 200;
         if (h < 150) h = 150;
-        int x, y;
-        if (cfg.position == "bottom") {
-            x = mw - w - mw / 100;
-            y = mh - h - mh * 4 / 100;
-        } else if (cfg.position == "left") {
-            x = mw * 2 / 100;
-            y = mh * 3 / 100;
-        } else if (cfg.position == "right") {
-            x = mw - w - mw * 2 / 100;
-            y = mh * 3 / 100;
-        } else {
-            x = mw - w - mw / 100;
-            y = mh * 3 / 100;
-        }
         if (x < 0) x = 0;
         if (y < 0) y = 0;
+        if (x + w > mw) x = std::max(0, mw - w);
+        if (y + h > mh) y = std::max(0, mh - h);
         return {w, h, x, y};
     }
     // Focus the popup right after revealing it. This does two jobs: it
@@ -1027,7 +917,7 @@ private:
     void hint_eject() {
         if (hinted_) return;
         hinted_ = true;
-        spawn_detached(
+        spawn_helper(
             "notify-send MattBar 'Tip: RIGHT-CLICK the robot icon in the "
             "bar to pop this agent session out into a normal window.'");
     }
@@ -1172,21 +1062,21 @@ private:
             "\"" + popup_size() + "\", move = \"" + popup_move() +
             "\", group = \"barred\" }) "
             "return hl.dsp.exec_cmd(\"true\") end)()";
-        std::string r1 = hypr_request(hdir_, lua);
-        std::string r2 = hypr_request(
-            hdir_, "keyword windowrulev2 float,class:^(" + cls + ")$");
-        std::string r3 = hypr_request(
-            hdir_, "keyword windowrulev2 size " + popup_size() +
-                       ",class:^(" + cls + ")$");
-        std::string r4 = hypr_request(
-            hdir_, "keyword windowrulev2 move " + popup_move() +
-                       ",class:^(" + cls + ")$");
-        std::string r5 = hypr_request(
-            hdir_, "keyword windowrulev2 group barred,class:^(" + cls + ")$");
-        DBG("agents: rule preinstall: lua-rule reply='%.120s'", r1.c_str());
-        DBG("agents: rule preinstall: legacy keyword replies: "
-            "float='%.60s' size='%.60s' move='%.60s' group='%.60s'",
-            r2.c_str(), r3.c_str(), r4.c_str(), r5.c_str());
+        // Nothing reads the replies but the debug log: send all five
+        // without blocking (they were five chained blocking round-trips).
+        if (!bar_) return;
+        hypr_fire(*bar_, lua, "agents: rule preinstall: lua-rule");
+        hypr_fire(*bar_, "keyword windowrulev2 float,class:^(" + cls + ")$",
+                  "agents: rule preinstall: float");
+        hypr_fire(*bar_, "keyword windowrulev2 size " + popup_size() +
+                             ",class:^(" + cls + ")$",
+                  "agents: rule preinstall: size");
+        hypr_fire(*bar_, "keyword windowrulev2 move " + popup_move() +
+                             ",class:^(" + cls + ")$",
+                  "agents: rule preinstall: move");
+        hypr_fire(*bar_, "keyword windowrulev2 group barred,class:^(" + cls +
+                             ")$",
+                  "agents: rule preinstall: group");
     }
     // Give the freshly adopted (still hidden) popup its real geometry.
     // exec_cmd's Lua rule table silently drops STATIC rules — float,
@@ -1275,6 +1165,7 @@ private:
         // Follow it so the user lands on their promoted session.
         hypr_dispatch2(hdir_, "dispatch workspace " + ws,
                        "dispatch hl.dsp.focus({ workspace = " + ws + " })");
+        close_dismiss_catcher();
         term_open_  = false;
         shown_      = false;
         on_special_ = false;
@@ -1418,12 +1309,7 @@ private:
     // panel_on_fail guards against ping-pong when we arrived here FROM a
     // failed panel attempt.
     bool spawn_popup(bool panel_on_fail) {
-        if (!omarchy_agent_cli_ready()) {
-            DBG("agents: default agent missing or not on PATH; opening picker");
-            omarchy_agent_pick();
-            return true;
-        }
-        if (hdir_.empty() || sock2_fd_ < 0) {
+        if (hdir_.empty() || !stream_ok()) {
             DBG("agents: popup unavailable (no hypr sockets)");
             return false;
         }
@@ -1569,6 +1455,7 @@ private:
         evict_strays();
         if (term_addr_.empty()) {
             shown_ = false;
+            close_dismiss_catcher();
             return;
         }
         if (want) {
@@ -1706,7 +1593,7 @@ private:
                                 "different PATH than your shell).\n"
                                 "mattbar: (clicks open the shell panel for "
                                 "the next 60 s)\n");
-                        spawn_detached(
+                        spawn_helper(
                             "notify-send -u critical MattBar 'Agent popup: "
                             "the session exits immediately. Run "
                             "omarchy-agent in a terminal to see the "
@@ -1716,6 +1603,7 @@ private:
                     fail_streak_ = 0;
                     hold_next_   = false;
                 }
+                close_dismiss_catcher();
                 term_open_  = false; // session ended; next click respawns
                 shown_      = false;
                 on_special_ = false;
@@ -1880,9 +1768,10 @@ private:
     std::string dir_, checked_, resolved_;
     int         ino_fd_ = -1, deb_fd_ = -1, watch_ = -1;
     // terminal-session popup state
-    std::string hdir_, sock2_buf_, term_addr_, term_cls_;
+    std::string hdir_, term_addr_, term_cls_;
     AsyncCmd    panel_cmd_; // observable agents_click execution
-    int         sock2_fd_  = -1, spawn_fd_ = -1, init_fd_ = -1;
+    int         sub_ = 0, spawn_fd_ = -1, init_fd_ = -1;
+    bool stream_ok() const { return sub_ > 0 && hyprev::connected(); }
     bool        init_done_ = false;
     uint64_t    adopt_ms_ = 0, fail_until_ = 0; // fast-exit detection
     uint64_t    reveal_ms_ = 0;                 // dismissal grace anchor
@@ -2094,93 +1983,11 @@ private:
 // ---------------------------------------------------------------------------
 namespace {
 
-std::string hypr_socket_dir() {
-    const char* sig = getenv("HYPRLAND_INSTANCE_SIGNATURE");
-    if (!sig) return {};
-    const char* rt = getenv("XDG_RUNTIME_DIR");
-    if (rt) {
-        std::string p = std::string(rt) + "/hypr/" + sig;
-        if (access((p + "/.socket.sock").c_str(), F_OK) == 0) return p;
-    }
-    std::string p = std::string("/tmp/hypr/") + sig; // older Hyprland
-    if (access((p + "/.socket.sock").c_str(), F_OK) == 0) return p;
-    return {};
-}
-
-int unix_connect(const std::string& path) {
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-    // Bounded I/O, always. At session start (or during a config reload)
-    // Hyprland can sit on its command socket for a long time; an unbounded
-    // connect/read here starves the sd_notify watchdog pings and systemd
-    // kills the whole cgroup — the bar AND its pactl subscribe child. Any
-    // single stall is now capped well under WatchdogSec. (Streams that get
-    // O_NONBLOCK afterwards are unaffected by these timeouts.)
-    timeval tv{2, 0};
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-// One-shot request to Hyprland's command socket.
-std::string hypr_request(const std::string& dir, const std::string& cmd) {
-    int fd = unix_connect(dir + "/.socket.sock");
-    if (fd < 0) return {};
-    (void)!write(fd, cmd.c_str(), cmd.size());
-    std::string out;
-    char buf[4096];
-    ssize_t n;
-    // SO_RCVTIMEO bounds each read; the deadline bounds a slow trickle.
-    // Worst case for the whole request stays far below the 10 s watchdog.
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    const long deadline = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L + 3000;
-    for (;;) {
-        n = read(fd, buf, sizeof buf);
-        if (n <= 0) break; // EOF, error, or RCVTIMEO expiry
-        out.append(buf, n);
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        if (ts.tv_sec * 1000L + ts.tv_nsec / 1000000L > deadline) break;
-    }
-    close(fd);
-    return out;
-}
-
-// Hyprland >= 0.55 with a Lua config (what Omarchy Quattro converts every
-// install to) evaluates a socket1 `dispatch X` as Lua: `hl.dispatch(X)`.
-// The hyprlang form `workspace 3` is a Lua syntax error there — swallowed,
-// so clicks silently do nothing. A .conf config still takes the legacy
-// dispatcher-table path, and each config type rejects the other's syntax.
-// So: send the form that last worked; on a reply that isn't "ok", try the
-// other and remember. Costs one extra round-trip per config-type change,
-// i.e. approximately never.
-bool hypr_dispatch2(const std::string& dir, const std::string& legacy,
-                    const std::string& lua) {
-    static int mode = 0; // 0 unknown, 1 legacy hyprlang, 2 lua (shared:
-                         // one compositor, one config dialect at a time)
-    auto ok = [](const std::string& r) { return r.rfind("ok", 0) == 0; };
-    if (mode == 2) {
-        if (ok(hypr_request(dir, lua))) return true;
-        if (ok(hypr_request(dir, legacy))) { mode = 1; return true; }
-        mode = 0; // compositor mid-restart? re-learn next dispatch
-        return false;
-    }
-    if (ok(hypr_request(dir, legacy))) { mode = 1; return true; }
-    if (ok(hypr_request(dir, lua))) { mode = 2; return true; }
-    mode = 0;
-    return false;
-}
-
-void hypr_dispatch_workspace(const std::string& dir, const std::string& sel) {
-    hypr_dispatch2(dir, "dispatch workspace " + sel,
-                   "dispatch hl.dsp.focus({ workspace = \"" + sel + "\" })");
+// Clicks and scrolls: nothing waits on the outcome, so never block on it.
+void hypr_dispatch_workspace(Bar& bar, const std::string& sel) {
+    hypr_dispatch2_async(bar, "dispatch workspace " + sel,
+                         "dispatch hl.dsp.focus({ workspace = \"" + sel +
+                             "\" })");
 }
 
 // Pull every top-level "id": <int> out of Hyprland's JSON without a JSON dep.
@@ -2249,25 +2056,49 @@ std::map<std::string, int> extract_active_per_monitor(
 class WorkspacesModule : public Module {
 public:
     bool enabled() const override { return cfg.show_workspaces; }
+    ~WorkspacesModule() override {
+        hyprev::unsubscribe(sub_);
+        for (uint64_t t : req_) hypr_async_cancel(t);
+        if (deb_fd_ >= 0) {
+            if (bar_) bar_->remove_fd(deb_fd_);
+            close(deb_fd_);
+        }
+    }
     void init(Bar& bar) override {
         bar_ = &bar;
-        dir_ = hypr_socket_dir();
+        dir_ = hypr_instance_dir();
         if (dir_.empty()) return;
-        refresh();
-        // persistent event stream (.socket2)
-        ev_fd_ = unix_connect(dir_ + "/.socket2.sock");
-        if (ev_fd_ >= 0) {
-            fcntl(ev_fd_, F_SETFL, O_NONBLOCK);
-            bar.add_fd(ev_fd_, [this](uint32_t) { on_events(); }, "hypr-events");
-        }
+        // Events arrive in bursts (a switch is workspace + workspacev2 +
+        // focusedmon + activewindow…): coalesce into one refresh.
+        deb_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        if (deb_fd_ >= 0)
+            bar.add_fd(deb_fd_, [this](uint32_t) {
+                uint64_t x;
+                while (read(deb_fd_, &x, sizeof x) > 0) {}
+                refresh();
+            }, "workspaces-debounce");
+        // Shared, line-buffered event stream (hyprev.hpp). The old private
+        // connection missed events split across 4 KB reads and stayed dead
+        // after a drop; the dispatcher reconnects and on_state resyncs.
+        sub_ = hyprev::subscribe(
+            bar,
+            {"workspace", "workspacev2", "createworkspace", "createworkspacev2",
+             "destroyworkspace", "destroyworkspacev2", "moveworkspace",
+             "moveworkspacev2", "renameworkspace", "focusedmon",
+             "focusedmonv2", "monitoradded", "monitoraddedv2",
+             "monitorremoved", "monitorremovedv2"},
+            [this](const HyprEvent& ev) { on_event(ev); },
+            [this](bool up) { if (up) changed(); });
+        if (enabled()) refresh(); // async: init never waits on Hyprland
+        else stale_ = true;       // first tick after it is switched on
     }
 
     void tick() override {
         if (stale_) {
             stale_ = false;
             refresh(); // deferred from events that arrived while hidden
-        } else if (ev_fd_ < 0 && !dir_.empty()) {
-            refresh(); // no event socket: poll
+        } else if (!hyprev::connected() && !dir_.empty()) {
+            refresh(); // no event stream: poll
         }
     }
 
@@ -2328,12 +2159,12 @@ public:
         double per = (cfg_vertical() ? PILL_H : PILL_W) + PILL_GAP;
         int idx = static_cast<int>(relx / per);
         if (idx < 0 || idx >= static_cast<int>(vis.size())) return false;
-        hypr_dispatch_workspace(dir_, std::to_string(vis[idx]));
+        hypr_dispatch_workspace(*bar_, std::to_string(vis[idx]));
         return true;
     }
 
     bool on_scroll(double, int dir) override { // cycle workspaces
-        hypr_dispatch_workspace(dir_, dir > 0 ? "e+1" : "e-1");
+        hypr_dispatch_workspace(*bar_, dir > 0 ? "e+1" : "e-1");
         return true;
     }
 
@@ -2350,8 +2181,44 @@ private:
         cairo_close_path(cr);
     }
 
+    // Refresh without blocking: two or three command-socket requests in
+    // parallel, applied together when all have answered. A refresh asked
+    // for while one is in flight runs once more afterwards (latest state
+    // wins); a failed round keeps the old picture and retries next tick.
     void refresh() {
-        std::string json = hypr_request(dir_, "j/workspaces");
+        if (!bar_ || dir_.empty()) return;
+        if (inflight_) { again_ = true; return; }
+        const bool mon = cfg.multi_monitor;
+        inflight_ = mon ? 3 : 2;
+        round_ok_ = true;
+        ws_json_.clear();
+        act_json_.clear();
+        mon_json_.clear();
+        req_.clear();
+        auto take = [this](std::string* dst) {
+            return [this, dst](bool ok, std::string r) {
+                if (ok && !r.empty()) *dst = std::move(r);
+                else round_ok_ = false;
+                if (--inflight_ == 0) round_done();
+            };
+        };
+        req_.push_back(hypr_async(*bar_, "j/workspaces", take(&ws_json_)));
+        req_.push_back(hypr_async(*bar_, "j/activeworkspace", take(&act_json_)));
+        if (mon) req_.push_back(hypr_async(*bar_, "j/monitors", take(&mon_json_)));
+    }
+
+    void round_done() {
+        req_.clear();
+        if (round_ok_) apply(ws_json_, act_json_, mon_json_);
+        else stale_ = true; // try again on the next tick
+        if (again_) {
+            again_ = false;
+            refresh();
+        }
+    }
+
+    void apply(const std::string& json, const std::string& actj,
+               const std::string& monj) {
         auto pairs = extract_ws_monitors(json);
         std::vector<int> ws;
         std::vector<std::pair<int, std::string>> wsmon;
@@ -2361,7 +2228,6 @@ private:
             wsmon.push_back({id, mon});
         }
         std::sort(ws.begin(), ws.end());
-        std::string actj = hypr_request(dir_, "j/activeworkspace");
         auto act = extract_ids(actj);
         int active = act.empty() ? -1 : act.front();
         {
@@ -2379,9 +2245,7 @@ private:
         // Only ask for the per-monitor picture when it can matter; on a
         // single-bar setup this is one IPC round-trip saved per refresh.
         std::map<std::string, int> actmon;
-        if (cfg.multi_monitor)
-            actmon = extract_active_per_monitor(
-                hypr_request(dir_, "j/monitors"));
+        if (!monj.empty()) actmon = extract_active_per_monitor(monj);
         if (ws != workspaces_ || active != active_ || wsmon != ws_mon_ ||
             actmon != active_mon_) {
             workspaces_ = std::move(ws);
@@ -2392,48 +2256,40 @@ private:
         }
     }
 
-    void on_events() {
-        char buf[4096];
-        ssize_t n;
-        bool relevant = false;
-        while ((n = read(ev_fd_, buf, sizeof buf)) > 0) {
-            // Hyprland's socket2 fires for every focus/window change too;
-            // only workspace-affecting events warrant a re-query.
-            static const char* keys[] = {"workspace>>",     "workspacev2>>",
-                                         "createworkspace", "destroyworkspace",
-                                         "moveworkspace",   "renameworkspace",
-                                         "focusedmon"};
-            buf[n < static_cast<ssize_t>(sizeof buf) ? n : sizeof buf - 1] =
-                '\0';
-            for (const char* k : keys)
-                if (strstr(buf, k)) { relevant = true; break; }
-            // focusedmon>>DP-1,3 — keep Bar's overlay target current
-            // without forking hyprctl on every hotkey popup.
-            const char* p = buf;
-            while ((p = strstr(p, "focusedmon>>")) != nullptr) {
-                p += 12;
-                const char* e = p;
-                while (*e && *e != ',' && *e != '\n' && *e != '\r') ++e;
-                if (e > p && bar_)
-                    bar_->note_focused_output(std::string(p, e - p));
-            }
+    // Only workspace-affecting events are subscribed (Hyprland's stream
+    // also carries every focus and title change).
+    void on_event(const HyprEvent& ev) {
+        // focusedmon>>DP-1,3 — keep Bar's overlay target current without
+        // forking hyprctl on every hotkey popup.
+        if (ev.name == "focusedmon" || ev.name == "focusedmonv2") {
+            std::string_view mon = ev.data.substr(0, ev.data.find(','));
+            if (!mon.empty() && bar_)
+                bar_->note_focused_output(std::string(mon));
         }
-        if (n == 0) { // Hyprland went away
-            close(ev_fd_);
-            ev_fd_ = -1;
+        changed();
+    }
+
+    void changed() {
+        if (!bar_) return;
+        // Switched off (init runs regardless) or hidden: no IPC, no
+        // redraw; tick() refreshes once the module is live and revealed.
+        if (!enabled() || !bar_->expanded()) {
+            stale_ = true;
             return;
         }
-        if (!relevant) return;
-        if (bar_->expanded()) {
-            refresh(); // visible: update immediately
-        } else {
-            stale_ = true; // hidden: no IPC, no redraw; refresh at reveal
-        }
+        if (deb_fd_ < 0) { refresh(); return; }
+        itimerspec ts{};
+        ts.it_value.tv_nsec = 15 * 1000000L; // visible: ~one frame later
+        timerfd_settime(deb_fd_, 0, &ts, nullptr);
     }
 
     Bar* bar_ = nullptr;
     std::string dir_;
-    int ev_fd_ = -1;
+    int sub_ = 0, deb_fd_ = -1;
+    int inflight_ = 0;
+    bool again_ = false, round_ok_ = true;
+    std::vector<uint64_t> req_;
+    std::string ws_json_, act_json_, mon_json_;
     std::vector<int> workspaces_;
     std::vector<std::pair<int, std::string>> ws_mon_; // id -> monitor
     std::map<std::string, int> active_mon_;           // monitor -> active ws
@@ -2545,50 +2401,23 @@ Module* make_battery() { return new BatteryModule; }
 namespace {
 // --------------------------------------------------------------------------
 // nl80211: fetch the SSID of an associated wireless interface without
-// spawning iw. Family id is resolved once via the genetlink controller.
-//
-// GET_INTERFACE includes NL80211_ATTR_SSID on some drivers. iwlwifi (and
-// a few others) omit it even while associated — GET_INTERFACE then looks
-// like a nameless managed iface, which is why the bar used to show
-// wlp166s0. Fall back to a GET_SCAN dump and read the SSID IE from the
-// BSS marked ASSOCIATED. Returns "" on any failure.
+// spawning iw. Family id resolved once via the genetlink controller, then
+// NL80211_CMD_GET_INTERFACE per query; the kernel includes NL80211_ATTR_SSID
+// while associated. Returns "" on any failure.
 // --------------------------------------------------------------------------
-static uint16_t nla_typ(const nlattr* a) {
-    return a->nla_type & NLA_TYPE_MASK;
-}
-template <class F>
-static void for_each_nla(const void* data, int rem, F fn) {
-    const nlattr* a = (const nlattr*)data;
-    for (; rem >= NLA_HDRLEN && a->nla_len >= NLA_HDRLEN && rem >= a->nla_len;
-         rem -= NLA_ALIGN(a->nla_len),
-         a = (const nlattr*)((const char*)a + NLA_ALIGN(a->nla_len)))
-        fn(a);
-}
-static std::string ssid_from_ies(const char* ies, int len) {
-    for (int i = 0; i + 2 <= len; ) {
-        unsigned ie = (unsigned char)ies[i];
-        unsigned l  = (unsigned char)ies[i + 1];
-        if (i + 2 + (int)l > len) break;
-        if (ie == 0) return std::string(ies + i + 2, l);
-        i += 2 + (int)l;
-    }
-    return {};
-}
 std::string wifi_ssid(const std::string& iface) {
     unsigned idx = if_nametoindex(iface.c_str());
     if (!idx) return {};
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
     if (fd < 0) return {};
-    sockaddr_nl sa{};
-    sa.nl_family = AF_NETLINK;
-    if (bind(fd, (sockaddr*)&sa, sizeof sa) < 0) {
-        close(fd);
-        return {};
-    }
     struct Msg {
         nlmsghdr    nl;
         genlmsghdr  ge;
         char        attrs[64];
+    };
+    auto xchg = [fd](Msg& m, char* rbuf, size_t rlen) -> ssize_t {
+        if (send(fd, &m, m.nl.nlmsg_len, 0) < 0) return -1;
+        return recv(fd, rbuf, rlen, 0);
     };
     auto put_attr = [](Msg& m, uint16_t type, const void* d, uint16_t len) {
         nlattr* a = (nlattr*)((char*)&m + NLMSG_ALIGN(m.nl.nlmsg_len));
@@ -2597,10 +2426,7 @@ std::string wifi_ssid(const std::string& iface) {
         memcpy((char*)a + NLA_HDRLEN, d, len);
         m.nl.nlmsg_len = NLMSG_ALIGN(m.nl.nlmsg_len) + NLA_ALIGN(a->nla_len);
     };
-    auto send_msg = [fd](Msg& m) -> bool {
-        return send(fd, &m, m.nl.nlmsg_len, 0) == (ssize_t)m.nl.nlmsg_len;
-    };
-    char rbuf[16384];
+    char rbuf[4096];
 
     // resolve the nl80211 family id (cached across calls)
     static uint16_t fam = 0;
@@ -2612,126 +2438,65 @@ std::string wifi_ssid(const std::string& iface) {
         m.ge.cmd         = CTRL_CMD_GETFAMILY;
         m.ge.version     = 1;
         put_attr(m, CTRL_ATTR_FAMILY_NAME, "nl80211", 8);
-        if (!send_msg(m)) { close(fd); return {}; }
-        ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);
+        ssize_t n = xchg(m, rbuf, sizeof rbuf);
         if (n <= 0) { close(fd); return {}; }
         for (nlmsghdr* h = (nlmsghdr*)rbuf; NLMSG_OK(h, (size_t)n);
              h = NLMSG_NEXT(h, n)) {
             if (h->nlmsg_type == NLMSG_ERROR) break;
-            for_each_nla((char*)NLMSG_DATA(h) + GENL_HDRLEN,
-                         (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN)),
-                         [&](const nlattr* a) {
-                             if (nla_typ(a) == CTRL_ATTR_FAMILY_ID)
-                                 fam = *(uint16_t*)((char*)a + NLA_HDRLEN);
-                         });
+            nlattr* a = (nlattr*)((char*)NLMSG_DATA(h) + GENL_HDRLEN);
+            int rem = (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN));
+            for (; rem >= NLA_HDRLEN && rem >= a->nla_len;
+                 rem -= NLA_ALIGN(a->nla_len),
+                 a = (nlattr*)((char*)a + NLA_ALIGN(a->nla_len)))
+                if (a->nla_type == CTRL_ATTR_FAMILY_ID)
+                    fam = *(uint16_t*)((char*)a + NLA_HDRLEN);
         }
         if (!fam) { close(fd); return {}; }
     }
 
-    auto parse_iface_ssid = [&](nlmsghdr* h) -> std::string {
-        std::string s;
-        for_each_nla((char*)NLMSG_DATA(h) + GENL_HDRLEN,
-                     (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN)),
-                     [&](const nlattr* a) {
-                         if (nla_typ(a) == NL80211_ATTR_SSID)
-                             s.assign((char*)a + NLA_HDRLEN,
-                                      a->nla_len - NLA_HDRLEN);
-                     });
-        return s;
-    };
-    auto parse_bss_ssid = [&](nlmsghdr* h) -> std::string {
-        std::string s;
-        for_each_nla((char*)NLMSG_DATA(h) + GENL_HDRLEN,
-                     (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN)),
-                     [&](const nlattr* a) {
-                         if (nla_typ(a) != NL80211_ATTR_BSS) return;
-                         bool assoc = false;
-                         std::string ie_ssid;
-                         for_each_nla((char*)a + NLA_HDRLEN,
-                                      a->nla_len - NLA_HDRLEN,
-                                      [&](const nlattr* b) {
-                                          uint16_t t = nla_typ(b);
-                                          if (t == NL80211_BSS_STATUS &&
-                                              b->nla_len >= NLA_HDRLEN + 4) {
-                                              uint32_t st = *(uint32_t*)((char*)b +
-                                                                         NLA_HDRLEN);
-                                              assoc = st == NL80211_BSS_STATUS_ASSOCIATED ||
-                                                      st == NL80211_BSS_STATUS_IBSS_JOINED;
-                                          } else if (t == NL80211_BSS_INFORMATION_ELEMENTS) {
-                                              ie_ssid = ssid_from_ies(
-                                                  (char*)b + NLA_HDRLEN,
-                                                  b->nla_len - NLA_HDRLEN);
-                                          }
-                                      });
-                         if (assoc && !ie_ssid.empty()) s = std::move(ie_ssid);
-                     });
-        return s;
-    };
-
-    uint32_t idx32 = idx;
     Msg m{};
     m.nl.nlmsg_len   = NLMSG_LENGTH(GENL_HDRLEN);
     m.nl.nlmsg_type  = fam;
     m.nl.nlmsg_flags = NLM_F_REQUEST;
     m.ge.cmd         = NL80211_CMD_GET_INTERFACE;
     m.ge.version     = 0;
+    uint32_t idx32 = idx;
     put_attr(m, NL80211_ATTR_IFINDEX, &idx32, sizeof idx32);
-    std::string ssid;
-    if (send_msg(m)) {
-        ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);
-        for (nlmsghdr* h = (nlmsghdr*)rbuf; n > 0 && NLMSG_OK(h, (size_t)n);
-             h = NLMSG_NEXT(h, n)) {
-            if (h->nlmsg_type == fam) {
-                ssid = parse_iface_ssid(h);
-                if (!ssid.empty()) break;
-            }
-        }
-    }
-    if (!ssid.empty()) {
-        close(fd);
-        return ssid;
-    }
-
-    // iwlwifi (and similar): SSID lives on the associated BSS, not the iface.
-    Msg d{};
-    d.nl.nlmsg_len   = NLMSG_LENGTH(GENL_HDRLEN);
-    d.nl.nlmsg_type  = fam;
-    d.nl.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-    d.ge.cmd         = NL80211_CMD_GET_SCAN;
-    d.ge.version     = 0;
-    put_attr(d, NL80211_ATTR_IFINDEX, &idx32, sizeof idx32);
-    if (!send_msg(d)) {
-        close(fd);
-        return {};
-    }
-    for (;;) {
-        ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);
-        if (n <= 0) break;
-        bool done = false;
-        for (nlmsghdr* h = (nlmsghdr*)rbuf; NLMSG_OK(h, (size_t)n);
-             h = NLMSG_NEXT(h, n)) {
-            if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) {
-                done = true;
-                break;
-            }
-            if (h->nlmsg_type != fam) continue;
-            ssid = parse_bss_ssid(h);
-            if (!ssid.empty()) {
-                done = true;
-                break;
-            }
-        }
-        if (done) break;
-    }
+    ssize_t n = xchg(m, rbuf, sizeof rbuf);
     close(fd);
-    return ssid;
+    if (n <= 0) return {};
+    std::string ssid;
+    for (nlmsghdr* h = (nlmsghdr*)rbuf; NLMSG_OK(h, (size_t)n);
+         h = NLMSG_NEXT(h, n)) {
+        if (h->nlmsg_type != fam) continue;
+        nlattr* a = (nlattr*)((char*)NLMSG_DATA(h) + GENL_HDRLEN);
+        int rem = (int)(h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN));
+        for (; rem >= NLA_HDRLEN && rem >= a->nla_len;
+             rem -= NLA_ALIGN(a->nla_len),
+             a = (nlattr*)((char*)a + NLA_ALIGN(a->nla_len)))
+            if (a->nla_type == NL80211_ATTR_SSID)
+                ssid.assign((char*)a + NLA_HDRLEN, a->nla_len - NLA_HDRLEN);
+    }
+    while (!ssid.empty() && ssid.back() == '\0') ssid.pop_back();
+    return trim(ssid);
+}
+
+std::string wifi_ssid_nmcli(const std::string& iface) {
+    if (iface.empty()) return {};
+    for (unsigned char c : iface)
+        if (!(std::isalnum(c) || c == '_' || c == '-' || c == '.')) return {};
+    std::string s = cmd_output(
+        "nmcli -t -g GENERAL.CONNECTION device show " + iface + " 2>/dev/null");
+    s = trim(s);
+    if (s.empty() || s == "--") return {};
+    return s;
 }
 
 class NetworkModule : public TextModule {
 public:
     ~NetworkModule() override {
-        if (nl_fd_ >= 0) close(nl_fd_);
-        if (debounce_fd_ >= 0) close(debounce_fd_);
+        Bar::close_fd(nl_fd_);
+        Bar::close_fd(debounce_fd_);
     }
     bool enabled() const override { return cfg.show_network; }
     void init(Bar& bar) override {
@@ -2747,10 +2512,8 @@ public:
             sockaddr_nl a{};
             a.nl_family = AF_NETLINK;
             a.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE;
-            if (bind(nl_fd_, (sockaddr*)&a, sizeof a) < 0) {
-                close(nl_fd_);
-                nl_fd_ = -1;
-            }
+            if (bind(nl_fd_, (sockaddr*)&a, sizeof a) < 0)
+                Bar::close_fd(nl_fd_);
         }
         if (nl_fd_ >= 0) {
             // Debounce: a Wi-Fi association is a burst of link + route
@@ -2789,14 +2552,13 @@ public:
         if (stale_) {
             stale_ = false;
             refresh();
-        } else if ((nl_fd_ < 0 || retry_ssid_) && counter_++ % 5 == 0) {
-            refresh(); // no netlink, or associated without SSID in cache yet
+        } else if (nl_fd_ < 0 && counter_++ % 5 == 0) {
+            refresh(); // no netlink (containers, odd kernels): old 5 s poll
         }
     }
 private:
     void refresh() {
         std::string iface = default_iface();
-        retry_ssid_ = false;
         if (iface.empty()) {
             set_text(*bar_, "offline", cfg.c_dim);
             return;
@@ -2807,12 +2569,17 @@ private:
             return;
         }
         // In-process nl80211 query — the last steady-state external binary
-        // (iw) is gone. GET_INTERFACE, then GET_SCAN for drivers that omit
-        // the iface SSID. Empty answer (not associated, empty scan cache)
-        // degrades to the interface name and retries on the next tick.
+        // (iw) is gone. One genetlink round-trip to the local kernel is
+        // microseconds, the same latency class as the /proc/net/route read
+        // above, so no async machinery: it cannot stall the way a
+        // mid-association iw could. Some drivers omit NL80211_ATTR_SSID
+        // on GET_INTERFACE; NetworkManager's connection name is the SSID
+        // on this box. Never label the chip with the iface (wlp0s20f3).
         std::string ssid = wifi_ssid(iface);
-        retry_ssid_ = ssid.empty();
-        set_text(*bar_, ssid.empty() ? iface : ssid);
+        if (ssid.empty() || ssid == "--" || ssid == iface)
+            ssid = wifi_ssid_nmcli(iface);
+        if (ssid.empty() || ssid == "--" || ssid == iface) ssid = "Wi-Fi";
+        set_text(*bar_, ssid);
     }
     static std::string default_iface() {
         std::istringstream rt(slurp("/proc/net/route"));
@@ -2830,7 +2597,6 @@ private:
     unsigned counter_ = 0;
     int nl_fd_ = -1, debounce_fd_ = -1;
     bool stale_ = false;
-    bool retry_ssid_ = false;
 };
 } // namespace
 Module* make_network() { return new NetworkModule; }
@@ -3077,9 +2843,9 @@ static uint64_t bt_mono_ms() {
 class BluetoothModule : public TextModule {
 public:
     ~BluetoothModule() override {
-        if (retry_fd_ >= 0) close(retry_fd_);
-        if (grace_fd_ >= 0) close(grace_fd_);
-        if (cycle_fd_ >= 0) close(cycle_fd_);
+        Bar::close_fd(retry_fd_);
+        Bar::close_fd(grace_fd_);
+        Bar::close_fd(cycle_fd_);
         if (audio_sub_) audio_events().unsubscribe(audio_sub_);
     }
     bool enabled() const override { return cfg.show_bluetooth; }
@@ -3734,7 +3500,6 @@ Module* make_agents() { return new AgentsModule; }
 void agents_hotkey() {
     if (AgentsModule::g) AgentsModule::g->on_click(0, BTN_LEFT);
 }
-void agents_pick() { omarchy_agent_pick(); }
 Module* make_microphone() { return new MicrophoneModule; }
 Module* make_screenrecord() { return new ScreenRecordModule; }
 
@@ -3818,8 +3583,8 @@ public:
     bool enabled() const override { return cfg.show_brightness; }
 
     ~BrightnessModule() override {
-        if (uevent_fd_ >= 0) close(uevent_fd_);
-        if (close_fd_ >= 0) close(close_fd_);
+        Bar::close_fd(uevent_fd_);
+        Bar::close_fd(close_fd_);
     }
 
     void init(Bar& bar) override {
@@ -3845,8 +3610,7 @@ public:
             nl.nl_family = AF_NETLINK;
             nl.nl_groups = 1;
             if (bind(uevent_fd_, (sockaddr*)&nl, sizeof nl) < 0) {
-                close(uevent_fd_);
-                uevent_fd_ = -1;
+                Bar::close_fd(uevent_fd_);
             } else {
                 bar.add_fd(uevent_fd_, [this](uint32_t) {
                     char    buf[2048];
@@ -4025,7 +3789,7 @@ private:
             DBG("brightness: sysfs write %d", raw);
             return;
         }
-        spawn_detached("brightnessctl set " + std::to_string(raw));
+        spawn_helper("brightnessctl set " + std::to_string(raw));
         DBG("brightness: brightnessctl fallback %d", raw);
     }
 
@@ -4146,9 +3910,10 @@ class MediaModule : public TextModule {
 public:
     ~MediaModule() override {
         close_popup();
+        img_cancel(art_job_);
         if (art_) cairo_surface_destroy(art_);
-        if (retry_fd_ >= 0) close(retry_fd_);
-        if (close_fd_ >= 0) close(close_fd_);
+        Bar::close_fd(retry_fd_);
+        Bar::close_fd(close_fd_);
     }
     bool enabled() const override { return cfg.show_media; }
 
@@ -4296,6 +4061,7 @@ public:
     static void switch_source() {
         if (g_media) g_media->cycle_source();
     }
+    static void invoke(const char* method);
 
 private:
     struct Player {
@@ -4560,6 +4326,8 @@ private:
         std::string url = p ? p->art_url : "";
         if (url == art_url_) return;
         art_url_ = url;
+        img_cancel(art_job_);
+        art_job_ = 0;
         if (art_) {
             cairo_surface_destroy(art_);
             art_ = nullptr;
@@ -4574,14 +4342,34 @@ private:
                     shell_quote(url),
                 [this, url, cache](const std::string&, int st) {
                     if (st != 0 || art_url_ != url) return;
-                    if (art_) cairo_surface_destroy(art_);
-                    art_ = image_load_file(cache);
-                    if (popup_.surf) popup_.draw();
+                    load_art(cache);
                 },
                 5000);
             return;
         }
-        art_ = image_load_file(file_from_url(url));
+        load_art(file_from_url(url));
+    }
+
+    // Cover art is often 1000-3000 px; it draws at 64 px. Decode on the
+    // image worker, keep 256 px (HiDPI headroom), and let a newer track
+    // cancel an older decode.
+    void load_art(const std::string& file) {
+        img_cancel(art_job_);
+        art_job_ = 0;
+        const ImgTarget t{256, 256, ImgTarget::Fit};
+        if (!bar_) {
+            if (art_) cairo_surface_destroy(art_);
+            art_ = img_decode_now(file, t);
+            return;
+        }
+        const std::string url = art_url_;
+        art_job_ = img_submit(*bar_, {{file, {t}}}, [this, url](ImgResult& r) {
+            art_job_ = 0;
+            if (art_url_ != url) return;
+            if (art_) cairo_surface_destroy(art_);
+            art_ = std::exchange(r.surfs[0][0], nullptr);
+            if (popup_.surf) popup_.draw();
+        });
     }
 
     void hold_popup(bool on) {
@@ -4872,6 +4660,7 @@ private:
     PopupWin                           popup_;
     bool                               popup_hold_ = false;
     cairo_surface_t*                   art_ = nullptr;
+    uint64_t                           art_job_ = 0;
     std::string                        art_url_;
     AsyncCmd                           art_fetch_;
     std::vector<PopHit>                popup_hits_;
@@ -4897,7 +4686,21 @@ public:
 MediaModule* MediaModule::g_media = nullptr;
 } // namespace
 Module* make_media() { return new MediaModule; }
+void MediaModule::invoke(const char* method) {
+    if (!g_media) return;
+    const Player* p = g_media->active();
+    if (!p || !g_media->bus_) return;
+    sd_bus_call_method_async(g_media->bus_, nullptr, p->name.c_str(),
+                             "/org/mpris/MediaPlayer2",
+                             "org.mpris.MediaPlayer2.Player", method, nullptr,
+                             nullptr, nullptr);
+    g_media->pump_.process();
+}
+
 void media_source_switch() { MediaModule::switch_source(); }
+void media_play_pause() { MediaModule::invoke("PlayPause"); }
+void media_next() { MediaModule::invoke("Next"); }
+void media_previous() { MediaModule::invoke("Previous"); }
 
 // Displays chip: same overlay as Super+Ctrl+D (omarchy.monitor).
 // ---------------------------------------------------------------------------
@@ -4927,7 +4730,7 @@ public:
             if (bar_) bar_->request_draw();
             return true;
         }
-        spawn_detached("mattbarctl shell toggle omarchy.monitor");
+        spawn_helper("mattbarctl shell toggle omarchy.monitor");
         return true;
     }
 
@@ -5136,7 +4939,7 @@ public:
     ~MoreModule() override {
         g = nullptr;
         close_now();
-        if (close_fd_ >= 0) close(close_fd_);
+        Bar::close_fd(close_fd_);
     }
 
     void init(Bar& bar) override {
@@ -5459,24 +5262,6 @@ public:
             return;
         }
         run_check();
-        // watch our launched child so the check re-runs on its exit
-        {
-            sigset_t cs;
-            sigemptyset(&cs);
-            sigaddset(&cs, SIGCHLD);
-            sigprocmask(SIG_BLOCK, &cs, nullptr);
-            chld_fd_ = signalfd(-1, &cs, SFD_NONBLOCK | SFD_CLOEXEC);
-            if (chld_fd_ >= 0)
-                bar.add_fd(chld_fd_, [this](uint32_t) {
-                    signalfd_siginfo si;
-                    while (read(chld_fd_, &si, sizeof si) > 0) {}
-                    if (child_ > 0 &&
-                        waitpid(child_, nullptr, WNOHANG) > 0) {
-                        child_ = -1;
-                        run_check();
-                    }
-                }, "update-child");
-        }
         if (rtsig_ > 0) {
             sigset_t ss;
             sigemptyset(&ss);
@@ -5527,9 +5312,8 @@ public:
                     while (read(deb_fd_, &x, sizeof x) > 0) {}
                     run_check();
                 }, "update-pacman-debounce");
-        } else if (ino_fd_ >= 0) {
-            close(ino_fd_);
-            ino_fd_ = -1;
+        } else {
+            Bar::close_fd(ino_fd_);
         }
     }
 
@@ -5631,12 +5415,23 @@ private:
 
     void launch_tracked() {
         if (click_.empty() || child_ > 0) return; // one at a time
-        pid_t pid = fork();
-        if (pid == 0) {
-            execl("/bin/sh", "sh", "-c", click_.c_str(), nullptr);
-            _exit(127);
-        }
-        if (pid > 0) child_ = pid;
+        // Same launch path as every other app (own scope, clean signals),
+        // but tracked: the check re-runs the moment it exits. pidfd-based,
+        // so no process-wide SIGCHLD block/signalfd is needed any more.
+        SpawnOpts o;
+        o.devnull_io  = true;
+        o.new_session = true;
+        const std::string pre = launch_prefix();
+        pid_t pid = pre.empty() ? spawn_sh(click_, o)
+                                : spawn_sh(pre + "sh -c " + sh_quote(click_), o);
+        if (pid <= 0) return;
+        child_ = pid;
+        std::weak_ptr<char> alive = alive_;
+        watch_child(pid, [this, alive](int) {
+            if (alive.expired()) return;
+            child_ = -1;
+            run_check();
+        });
     }
 
     Bar* bar_ = nullptr;
@@ -5645,8 +5440,8 @@ private:
     std::string glyph_, font_, click_, rclick_, check_;
     int interval_s_, rtsig_;
     int sig_fd_ = -1;
-    int chld_fd_ = -1;
     int ino_fd_ = -1; // pacman.log watch (see init)
+    std::shared_ptr<char> alive_ = std::make_shared<char>(0);
     int deb_fd_ = -1; // its debounce timer
     pid_t child_ = -1;
     long fast_until_ = 0;

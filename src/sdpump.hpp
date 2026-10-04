@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <functional>
+#include <cstdint>
 
 // ---------------------------------------------------------------------------
 // Shared sd-bus pump for event-driven bus modules (bluetooth: system bus,
@@ -23,9 +24,12 @@ struct SdPump {
     Bar*     bar      = nullptr;
     std::function<void(const char*)> on_teardown;
 
+    // Some pumps are globals that outlive main()'s Bar: never touch `bar`
+    // here, the static helpers cope either way.
     ~SdPump() {
-        if (bus) sd_bus_unref(bus);
-        if (timer_fd >= 0) close(timer_fd);
+        Bar::unwatch_fd(fd);
+        if (bus) sd_bus_unref(bus); // closes fd
+        Bar::close_fd(timer_fd);
     }
     // `opened` must be freshly opened; the pump takes ownership.
     void attach(Bar& b, sd_bus* opened, const char* label) {
@@ -48,15 +52,11 @@ struct SdPump {
         }, label);
     }
     void teardown(const char* why) {
-        if (bar && fd >= 0) bar->remove_fd(fd); // drop stale callback entry
-        if (bus) sd_bus_unref(bus);             // closes fd
+        Bar::unwatch_fd(fd);        // drop the callback entry first...
+        if (bus) sd_bus_unref(bus); // ...then sd-bus closes the fd
         bus = nullptr;
         fd  = -1;
-        if (timer_fd >= 0) {
-            if (bar) bar->remove_fd(timer_fd);
-            close(timer_fd);
-            timer_fd = -1;
-        }
+        Bar::close_fd(timer_fd);
         events = 0;
         barren = 0;
         if (on_teardown) on_teardown(why); // may re-attach with a fresh bus

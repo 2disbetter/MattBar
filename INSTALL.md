@@ -73,6 +73,18 @@ sudo cmake --install build
 This installs `/usr/local/bin/mattbar` plus a `mattbarctl` symlink (the
 same binary dispatching on argv[0]) for runtime control.
 
+**Which build is running?** Every binary carries a build id (the linker's
+GNU build-id, which changes whenever the code does). After updating:
+
+```sh
+mattbar --version          # the binary on disk:  mattbar 1.42.8 build 3f9a1c2 (built …)
+mattbarctl version         # the running instance, and whether it matches the disk
+```
+
+The same id is shown at the bottom of **Settings → Bar → About**, which
+also warns when a different build has been installed since the bar
+started (`systemctl --user restart mattbar` picks it up).
+
 ## 3. Run it — the systemd service (recommended)
 
 The bar is your notification daemon, tray host, and OSD, so it is worth

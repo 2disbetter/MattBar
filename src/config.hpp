@@ -5,7 +5,7 @@
 // ---------------------------------------------------------------------------
 #include <string>
 
-inline constexpr const char* MATTBAR_VERSION = "1.43.0";
+inline constexpr const char* MATTBAR_VERSION = "1.42.9";
 #include <vector>
 
 struct Color { double r, g, b, a; };
@@ -18,6 +18,15 @@ struct Config {
     int strip_height = 2;    // px, VISIBLE strip line when hidden
     int strip_hit_height = 8; // px, invisible hover zone that reveals the bar
     std::string output;       // monitor name ("DP-2"); empty = compositor picks
+    // Wallpaper (drawn by MattBar while quickshell_shutdown is on):
+    //   same: every monitor shows the background, monitors plugged in later
+    //         too (default)
+    //   main: only the main monitor; the others show the background colour
+    //   mix:  extra monitors get other images from the theme's set
+    //   each: per-monitor picks (wallpaper_outputs); a monitor without one,
+    //         including a newly plugged one, shows the background
+    std::string wallpaper_monitors = "same";
+    std::string wallpaper_outputs; // "NAME=/path|NAME=/path"
 
     // --- Multi-monitor ------------------------------------------------------
     // Off by default: exactly the old behaviour (one bar, on `output` or
@@ -147,6 +156,10 @@ struct Config {
     // hardcodes 5; 0 keeps the panel lit. Screensaver and lock delays
     // live in ~/.config/omarchy/shell.json (idle.screensaver / idle.lock).
     int  idle_blank_s            = 5;
+    // Seconds the lock screen stays lit after suspend/hibernate thaw.
+    // Pointer events from DPMS must not restart the short idle_blank_s
+    // countdown. 0 uses idle_blank_s.
+    int  lock_wake_blank_s       = 30;
     // MattBar Shell per-TUI font sizes (Settings → Shell). The launcher
     // wants a larger size; dense panels (network, audio, …) need a smaller
     // one or the same px crowds the grid into unreadability.
@@ -168,8 +181,8 @@ struct Config {
     int  shell_audio_step         = 5;     // volume % per key / scroll
     bool shell_audio_show_apps    = true;  // per-app mixer in the audio panel
     bool shell_audio_show_pct     = true;  // numeric % next to sliders
-    bool shell_wifi_scan_on_open  = false; // kept for conf compat; unused
-    bool shell_bt_scan_on_open    = false; // kept for conf compat; unused
+    bool shell_wifi_scan_on_open  = false;
+    bool shell_bt_scan_on_open    = false;
     int  shell_clipboard_limit    = 300;
     bool shell_clipboard_paste    = true;  // paste into the focused window
     bool shell_emoji_insert       = true;  // type the emoji vs copy-only
@@ -214,13 +227,35 @@ struct Config {
     // roomy enough for an 80-column agent TUI on typical monitors.
     // Edited from Settings as two percent steppers.
     std::string agents_popup_size = "36% 44%";
+    // bar | top-left | top-right | bottom-left | bottom-right | center
+    // "bar" hangs the popup off the bar edge.
+    std::string agents_popup_anchor = "bar";
     int  agents_popup_w_pct() const;
     int  agents_popup_h_pct() const;
     void set_agents_popup_pct(int w, int h);
+    struct PopupPlace {
+        int w_pct, h_pct, x_pct, y_pct;
+    };
+    PopupPlace popup_place(const std::string& size, const std::string& anchor,
+                           int def_w, int def_h) const;
     // Flip Hyprland's input:special_fallthrough so clicks outside the
     // popup reach the windows beneath (and dismiss it) instead of being
     // captured by the special workspace's blocking layer.
     bool agents_click_through = true;
+    // Local LLM chip (structure_serve / Ollama-compatible engine + chat UI)
+    bool        show_local_llm = true;
+    std::string local_llm_url  = "http://127.0.0.1:11434";
+    std::string local_llm_chat_url; // empty = structure-chat.html or /chat.html
+    std::string local_llm_start_cmd =
+        "structure_serve --model /path/model.gguf --host 127.0.0.1 --port 11434";
+    std::string local_llm_stop_cmd; // empty = POST /shutdown + pkill start bin
+    std::string local_llm_glyph = "auto";
+    std::string local_llm_class = "com.mattbar.llm";
+    std::string local_llm_popup_size   = "70% 80%";
+    std::string local_llm_popup_anchor = "center";
+    int  local_llm_popup_w_pct() const;
+    int  local_llm_popup_h_pct() const;
+    void set_local_llm_popup_pct(int w, int h);
     // Microphone module (default-source mute/volume; bluez rune = real mic)
     bool        show_microphone = true;
     bool        mic_show_pct    = false;
@@ -264,6 +299,10 @@ struct Config {
         "omarchy-launch-floating-terminal-with-presentation omarchy-update";
     int update_interval_s = 21600;              // 6 h, like Omarchy's Waybar
     int update_signal     = 7;                  // refresh on SIGRTMIN+7
+    // How apps launched from the bar are started (see spawn.hpp):
+    // auto = own systemd scope when running under systemd, none = plain
+    // child, anything else = used verbatim as a command prefix.
+    std::string launch_wrapper = "auto";
 
     // Module layout: comma-separated module ids per zone
     // (0=left, 1=center, 2=right, 3=more). Zone 3 is not on the bar:
@@ -329,6 +368,8 @@ struct Config {
     static std::vector<std::string> csv_split(const std::string&);
     static std::string csv_join(const std::vector<std::string>&);
     bool wants_monitor(const std::string& name) const;
+    std::string wallpaper_for(const std::string& out) const;
+    void        set_wallpaper_for(const std::string& out, const std::string& path);
     bool app_muted(const std::string& app) const;
     void set_app_muted(const std::string& app, bool muted);
     void note_app(const std::string& app); // remember an app we've seen

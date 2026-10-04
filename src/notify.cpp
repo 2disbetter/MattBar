@@ -1,4 +1,6 @@
+#include "spawn.hpp"
 #include "notify.hpp"
+#include "imgwork.hpp"
 #include "popup.hpp"
 #include "bar.hpp"
 #include "config.hpp"
@@ -25,6 +27,7 @@
 #include <dirent.h>
 #include <sstream>
 #include <sys/stat.h>
+#include <utility>
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -33,6 +36,12 @@
 #include <deque>
 #include <memory>
 #include <vector>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 #ifndef DBG
 #define DBG(...)                                                              \
@@ -149,7 +158,9 @@ cairo_surface_t* load_icon_spec(const std::string& spec) {
     if (spec.empty()) return nullptr;
     std::string p = strip_file_uri(spec);
     if (p[0] == '/') {
-        if (cairo_surface_t* s = image_load_file(p)) return downscale_icon(s);
+        if (cairo_surface_t* s =
+                img_decode_now(p, {ICON_KEEP, ICON_KEEP, ImgTarget::Fit}))
+            return s;
         cairo_surface_t* s = cairo_image_surface_create_from_png(p.c_str());
         if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS)
             return downscale_icon(s);
@@ -192,22 +203,94 @@ uint64_t now_ms() {
     return ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
 }
 
-std::string strip_markup(const std::string& s) {
-    std::string out;
-    bool        in = false;
-    for (char c : s) {
-        if (c == '<') in = true;
-        else if (c == '>') in = false;
-        else if (!in) out += c;
+void utf8_put(std::string& o, uint32_t cp) {
+    if (cp < 0x80) {
+        o += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        o += static_cast<char>(0xC0 | (cp >> 6));
+        o += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        o += static_cast<char>(0xE0 | (cp >> 12));
+        o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        o += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        o += static_cast<char>(0xF0 | (cp >> 18));
+        o += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        o += static_cast<char>(0x80 | (cp & 0x3F));
     }
-    // minimal entity handling for the common ones
-    auto sub = [&](const char* a, const char* b) {
-        size_t p;
-        while ((p = out.find(a)) != std::string::npos)
-            out.replace(p, strlen(a), b);
-    };
-    sub("&amp;", "&"); sub("&lt;", "<"); sub("&gt;", ">"); sub("&quot;", "\"");
+}
+
+// Drop tags and decode entities in ONE pass. The old version re-scanned
+// the whole string from the start for every entity (a 50 KB body of
+// "&amp;" stalled the loop for most of a second) and decoded twice, so
+// "&amp;lt;" came out as "<".
+std::string strip_markup(const char* s, size_t n) {
+    std::string out;
+    out.reserve(std::min<size_t>(n, 4096));
+    bool in = false;
+    for (size_t i = 0; i < n; ++i) {
+        const char c = s[i];
+        if (in) {
+            if (c == '>') in = false;
+            continue;
+        }
+        if (c == '<') { in = true; continue; }
+        if (c != '&') { out += c; continue; }
+        size_t semi = i + 1;
+        while (semi < n && semi - i <= 10 && s[semi] != ';') ++semi;
+        if (semi >= n || s[semi] != ';') { out += c; continue; }
+        const std::string_view ent(s + i + 1, semi - i - 1);
+        uint32_t cp = 0;
+        if (ent == "amp") cp = '&';
+        else if (ent == "lt") cp = '<';
+        else if (ent == "gt") cp = '>';
+        else if (ent == "quot") cp = '"';
+        else if (ent == "apos") cp = '\'';
+        else if (ent.size() > 1 && ent[0] == '#') {
+            const bool hex = ent[1] == 'x' || ent[1] == 'X';
+            for (size_t k = hex ? 2 : 1; k < ent.size(); ++k) {
+                const char d = ent[k];
+                int v = d >= '0' && d <= '9' ? d - '0'
+                        : hex && d >= 'a' && d <= 'f' ? d - 'a' + 10
+                        : hex && d >= 'A' && d <= 'F' ? d - 'A' + 10
+                                                      : -1;
+                if (v < 0 || cp > 0x10FFFF) { cp = 0; break; }
+                cp = cp * (hex ? 16 : 10) + static_cast<uint32_t>(v);
+            }
+            if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0;
+        }
+        if (!cp) { out += c; continue; } // not an entity we know: keep '&'
+        utf8_put(out, cp);
+        i = semi;
+    }
     return out;
+}
+
+// Longest prefix of s no longer than max_bytes, cut at a UTF-8 boundary
+// and marked with an ellipsis when anything was dropped.
+std::string cap_utf8(std::string s, size_t max_bytes) {
+    if (s.size() <= max_bytes) return s;
+    size_t cut = max_bytes > 3 ? max_bytes - 3 : 0; // room for the "…"
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
+        --cut;
+    s.resize(cut);
+    s += "\u2026";
+    return s;
+}
+
+// Everything a sender controls goes through here before it is stored,
+// drawn, persisted or shown in history. Without a cap a single 50 KB
+// word slipped past wrap()'s 3-line limit and was measured and drawn in
+// full on every redraw, and again in the bell's history.
+constexpr size_t kMaxRawText  = 64 * 1024; // markup is stripped from this much
+constexpr size_t kMaxApp      = 128;
+constexpr size_t kMaxSummary  = 512;
+constexpr size_t kMaxBody     = 4096;
+std::string clean_text(const char* s, size_t max_bytes) {
+    if (!s) return {};
+    const size_t n = strnlen(s, kMaxRawText);
+    return cap_utf8(strip_markup(s, n), max_bytes);
 }
 
 
@@ -341,22 +424,46 @@ std::vector<std::string> wrap(cairo_t* cr, const std::string& text,
                               double maxw, size_t max_lines) {
     std::vector<std::string> lines;
     std::string              cur;
+    if (maxw < 1) maxw = 1;
     auto width = [&](const std::string& s) {
         return rich_text_width(cr, s, cfg.font_size);
     };
+    // Longest prefix of a too-wide word that fits (at least one code
+    // point), by binary search over its UTF-8 boundaries.
+    auto fit_prefix = [&](const std::string& w) {
+        std::vector<size_t> b;
+        for (size_t k = 1; k <= w.size(); ++k)
+            if (k == w.size() ||
+                (static_cast<unsigned char>(w[k]) & 0xC0) != 0x80)
+                b.push_back(k);
+        size_t lo = 0, hi = b.size() - 1;
+        while (lo < hi) {
+            const size_t mid = (lo + hi + 1) / 2;
+            if (width(w.substr(0, b[mid])) <= maxw) lo = mid;
+            else hi = mid - 1;
+        }
+        return b[lo];
+    };
     size_t i = 0;
     while (i < text.size() && lines.size() < max_lines) {
-        size_t sp = text.find_first_of(" \n", i);
-        std::string word =
-            text.substr(i, (sp == std::string::npos ? text.size() : sp) - i);
-        std::string cand = cur.empty() ? word : cur + " " + word;
-        if (!cur.empty() && width(cand) > maxw) {
-            lines.push_back(cur);
-            cur = word;
+        const size_t sp  = text.find_first_of(" \n", i);
+        const size_t end = sp == std::string::npos ? text.size() : sp;
+        const size_t nxt = sp == std::string::npos ? text.size() : sp + 1;
+        std::string  word = text.substr(i, end - i);
+        std::string  cand = cur.empty() ? word : cur + " " + word;
+        if (word.empty() || width(cand) <= maxw) {
+            cur = std::move(cand);
+            i   = nxt;
+        } else if (!cur.empty()) {
+            lines.push_back(std::move(cur)); // the word starts the next line
+            cur.clear();
         } else {
-            cur = cand;
+            // One word wider than the line: break it rather than let it
+            // run off the popup (it used to be kept whole, however long).
+            const size_t k = fit_prefix(word);
+            lines.push_back(word.substr(0, k));
+            i += k;
         }
-        i = sp == std::string::npos ? text.size() : sp + 1;
     }
     if (!cur.empty() && lines.size() < max_lines) lines.push_back(cur);
     if (i < text.size() && !lines.empty()) lines.back() += "\u2026";
@@ -371,6 +478,7 @@ NotifyDaemon* g_daemon = nullptr;
 
 struct NotifyDaemon::Impl {
     Bar*    bar = nullptr;
+    std::vector<uint64_t> icon_jobs; // image-path decodes in flight
     SdPump  pump;
     sd_bus* bus       = nullptr;
     bool    owns      = false;
@@ -854,9 +962,9 @@ struct NotifyDaemon::Impl {
         if (sd_bus_message_read(c, "sus", &app, &replaces, &icon) < 0)
             return sd_bus_reply_method_return(c, "u", 0u);
         sd_bus_message_read(c, "ss", &sum, &body);
-        n.app     = app ? app : "";
-        n.summary = strip_markup(sum ? sum : "");
-        n.body    = strip_markup(body ? body : "");
+        n.app     = cap_utf8(app ? app : "", kMaxApp);
+        n.summary = clean_text(sum, kMaxSummary);
+        n.body    = clean_text(body, kMaxBody);
         // actions: flat list of key,label pairs
         if (sd_bus_message_enter_container(c, 'a', "s") >= 0) {
             const char* v = nullptr;
@@ -874,8 +982,18 @@ struct NotifyDaemon::Impl {
         // Spec order: image-data (already applied), image-path, app_icon,
         // then the desktop-entry's Icon. Messengers put the contact
         // avatar in image-data / image-path and the app mark in app_icon.
-        if (!n.icon && !n.image_path.empty())
-            n.icon = load_icon_spec(n.image_path);
+        // A big image-path (screenshot notifications carry the full PNG)
+        // decodes on the image worker; the app icon stands in until then.
+        std::string defer_img;
+        if (!n.icon && !n.image_path.empty()) {
+            std::string p = strip_file_uri(n.image_path);
+            struct stat st {};
+            if (self->bar && !p.empty() && p[0] == '/' &&
+                stat(p.c_str(), &st) == 0 && st.st_size > 64 * 1024)
+                defer_img = p;
+            else
+                n.icon = load_icon_spec(n.image_path);
+        }
         if (!n.icon && icon && *icon) n.icon = load_icon_spec(icon);
         if (!n.icon && !n.desktop_entry.empty())
             n.icon = icon_from_desktop(n.desktop_entry);
@@ -899,10 +1017,12 @@ struct NotifyDaemon::Impl {
             Note copy = n;
             n.icon = nullptr; // ownership moves to history
             self->to_history(std::move(copy));
+            if (!defer_img.empty()) self->defer_icon(n.id, n.image_path, defer_img);
             self->redraw();
             return sd_bus_reply_method_return(c, "u", n.id);
         }
         self->active.push_front(n);
+        if (!defer_img.empty()) self->defer_icon(n.id, n.image_path, defer_img);
         self->mark_dirty(); // active notes persist too (as history)
         DBG("notifyd: #%u [%s] '%s' / '%s'%s", n.id, n.app.c_str(),
             n.summary.c_str(), n.body.c_str(),
@@ -910,6 +1030,27 @@ struct NotifyDaemon::Impl {
         self->arm_expiry();
         self->redraw();
         return sd_bus_reply_method_return(c, "u", n.id);
+    }
+
+    // Swap the decoded image in on whichever note still carries this id
+    // and image-path (a replaced note with a different image is left be).
+    void defer_icon(uint32_t id, const std::string& spec,
+                    const std::string& file) {
+        uint64_t t = img_submit(
+            *bar, {{file, {{ICON_KEEP, ICON_KEEP, ImgTarget::Fit}}}},
+            [this, id, spec](ImgResult& r) {
+                if (!r.surfs[0][0]) return;
+                for (auto* q : {&active, &history})
+                    for (Note& x : *q)
+                        if (x.id == id && x.image_path == spec) {
+                            free_note_icon(x);
+                            x.icon = std::exchange(r.surfs[0][0], nullptr);
+                            redraw();
+                            return;
+                        }
+            });
+        icon_jobs.push_back(t);
+        if (icon_jobs.size() > 64) icon_jobs.erase(icon_jobs.begin());
     }
 
     void read_hints(sd_bus_message* c, Note& n) {
@@ -1130,9 +1271,11 @@ struct NotifyDaemon::Impl {
             n.id        = (uint32_t)strtoul(fld[0].c_str(), nullptr, 10);
             n.urgency   = atoi(fld[1].c_str());
             n.posted_at = strtoull(fld[2].c_str(), nullptr, 10);
-            n.app       = unesc(fld[4]);
-            n.summary   = unesc(fld[5]);
-            n.body      = unesc(fld[6]);
+            // Capped here too: files written before the caps existed can
+            // hold arbitrarily long entries.
+            n.app       = cap_utf8(unesc(fld[4]), kMaxApp);
+            n.summary   = cap_utf8(unesc(fld[5]), kMaxSummary);
+            n.body      = cap_utf8(unesc(fld[6]), kMaxBody);
             if (!fld[3].empty()) {
                 cairo_surface_t* s = cairo_image_surface_create_from_png(
                     (state_dir + "/" + fld[3]).c_str());
@@ -1474,12 +1617,15 @@ struct NotifyDaemon::Impl {
                     1500);
     }
 
-    void start_osd_sources() {
+    // Returns true when the audio source was (re)started by this call, i.e.
+    // the OSD just went from off to on.
+    bool start_osd_sources() {
         // Audio changes come from the shared AudioEvents stream (one pactl
         // process serving both this OSD and the volume module). It already
         // debounces bursts and filters app-stream noise ("on sink #" only),
         // so the callback just queries whichever side changed.
-        if (audio_sub == 0)
+        const bool fresh = audio_sub == 0;
+        if (fresh)
             audio_sub = audio_events().subscribe(*bar, [this](bool sink,
                                                               bool src) {
                 if (sink) query_volume();
@@ -1493,8 +1639,7 @@ struct NotifyDaemon::Impl {
                 nl.nl_family = AF_NETLINK;
                 nl.nl_groups = 1;
                 if (bind(uevent_fd, (sockaddr*)&nl, sizeof nl) < 0) {
-                    close(uevent_fd);
-                    uevent_fd = -1;
+                    Bar::close_fd(uevent_fd);
                 } else {
                     bar->add_fd(uevent_fd, [this](uint32_t) {
                         char buf[2048];
@@ -1519,12 +1664,14 @@ struct NotifyDaemon::Impl {
                 closedir(d);
             }
         }
+        return fresh;
     }
     void stop_osd_sources() {
         if (audio_sub) audio_events().unsubscribe(audio_sub);
         audio_sub = 0;
-        if (uevent_fd >= 0) close(uevent_fd);
-        uevent_fd = -1;
+        // Runtime path (OSD switched off in settings): the uevent callback
+        // captures `this` and must leave the loop's table with the fd.
+        Bar::close_fd(uevent_fd);
         osd.destroy();
     }
     void show_brightness() {
@@ -1536,7 +1683,15 @@ struct NotifyDaemon::Impl {
 };
 
 NotifyDaemon::NotifyDaemon() : im_(new Impl) { g_daemon = this; }
-NotifyDaemon::~NotifyDaemon() { delete im_; }
+NotifyDaemon::~NotifyDaemon() {
+    if (im_) {
+        for (uint64_t t : im_->icon_jobs) img_cancel(t);
+        // The save is debounced by 500 ms: a notification that arrived
+        // just before a restart or logout was otherwise never written.
+        if (im_->state_dirty) im_->save_state();
+    }
+    delete im_;
+}
 bool NotifyDaemon::owns_name() const { return im_->owns; }
 
 std::vector<NoteRecord> NotifyDaemon::history() const {
@@ -1611,9 +1766,13 @@ void NotifyDaemon::apply_enabled() {
     else im_->release();
     im_->apply_omarchy_shell();
     if (cfg.enable_osd && im_->bar) {
-        im_->start_osd_sources();
-        im_->query_volume(); // seed the change caches silently
-        im_->query_mic();
+        // Seed the change caches silently, once, when the OSD turns on.
+        // This ran on every settings apply: two wpctl spawns per click.
+        if (im_->start_osd_sources()) {
+            im_->last_vol = im_->last_mic = -1; // next reading only seeds
+            im_->query_volume();
+            im_->query_mic();
+        }
     }
     else if (!cfg.enable_osd) im_->stop_osd_sources();
 }
@@ -1658,8 +1817,8 @@ void NotifyDaemon::post(const std::string& summary, const std::string& body,
     Note n;
     n.id      = im_->next_id++;
     n.app     = "mattbar";
-    n.summary = summary;
-    n.body    = body;
+    n.summary = cap_utf8(summary, kMaxSummary);
+    n.body    = cap_utf8(body, kMaxBody);
     n.urgency = urgency;
     n.expires_at =
         urgency >= 2 || cfg.notification_timeout_s <= 0
@@ -1686,18 +1845,24 @@ void notify_post(const std::string& summary, const std::string& body,
         g_daemon->post(summary, body, urgency);
         return;
     }
-    // self-contained double-fork spawn (spawn_detached is modules-internal)
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        if (fork() == 0) {
-            const char* u = urgency >= 2 ? "critical"
-                            : urgency == 1 ? "normal" : "low";
-            execlp("notify-send", "notify-send", "-u", u, summary.c_str(),
-                   body.c_str(), (char*)nullptr);
-            _exit(127);
-        }
-        _exit(0);
-    }
-    if (pid > 0) waitpid(pid, nullptr, 0);
+    // Direct argv (no shell quoting), clean signal state, reaped async.
+    const char* u = urgency >= 2 ? "critical" : urgency == 1 ? "normal" : "low";
+    const char* argv[] = {"notify-send", "-u", u, summary.c_str(), body.c_str(),
+                          nullptr};
+    SpawnOpts o;
+    o.devnull_io = true;
+    o.new_pgroup = true;
+    pid_t pid    = spawn_argv(argv, o);
+    if (pid > 0) watch_child(pid);
+}
+
+// test_spawn hooks (package F)
+std::string notify_clean_text_for_test(const std::string& raw,
+                                       size_t max_bytes) {
+    return clean_text(raw.c_str(), max_bytes);
+}
+std::vector<std::string> notify_wrap_for_test(cairo_t* cr,
+                                              const std::string& text,
+                                              double maxw, size_t max_lines) {
+    return wrap(cr, text, maxw, max_lines);
 }

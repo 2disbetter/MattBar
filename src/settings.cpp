@@ -1,5 +1,6 @@
 #include "settings.hpp"
 #include "bar.hpp"
+#include "buildinfo.hpp"
 #include "config.hpp"
 #include "idle.hpp"
 #include "modules.hpp"
@@ -8,12 +9,21 @@
 #include "sensors.hpp"
 #include "shell.hpp"
 #include "shm.hpp"
+#include "wallpaper.hpp"
 
+#include <sys/inotify.h>
+#include <unistd.h>
 #include <cairo/cairo.h>
 #include <linux/input-event-codes.h>
 
 #include <algorithm>
 #include <string>
+#include <cstdint>
+#include <vector>
+#include <utility>
+#include <functional>
+#include <cstdio>
+#include <cmath>
 
 namespace {
 void col(cairo_t* cr, const Color& c, double a = -1) {
@@ -36,9 +46,30 @@ constexpr int ShellDesktop = 4;
 constexpr int ShellPlugins = 5;
 } // namespace
 
+// Where the window was when it stepped aside for the background picker
+// (the picker shares the overlay layer, and compositors disagree on which
+// of two overlay surfaces is on top): the reopened window lands back on
+// the same tab and scroll position.
+namespace {
+struct Resume {
+    bool   set = false;
+    int    tab = 0, shell_tab = 0;
+    double scroll = 0;
+} g_resume;
+} // namespace
+
 SettingsWindow::SettingsWindow(Bar& bar) : bar_(bar) {
+    if (g_resume.set) {
+        tab_        = g_resume.tab;
+        shell_tab_  = g_resume.shell_tab;
+        scroll_     = g_resume.scroll;
+        g_resume.set = false;
+    }
     surf_ = wl_compositor_create_surface(bar_.compositor());
     frac_.on_change = [this] { draw(); };
+    // The Look tab's background preview refreshes when a decode lands.
+    wallpaper_set_listener([this] { draw(); });
+    gate_.fire      = [this] { draw(); };
     frac_.attach(bar_.frac_mgr(), bar_.viewporter(), surf_);
     // The settings window is a singleton: it opens on the primary bar's
     // monitor, so it can't appear twice or land on a monitor you aren't
@@ -54,6 +85,9 @@ SettingsWindow::SettingsWindow(Bar& bar) : bar_(bar) {
     // no anchors -> compositor centers the surface on the output
     zwlr_layer_surface_v1_set_size(ls_, w_, h_);
     zwlr_layer_surface_v1_set_exclusive_zone(ls_, 0);
+    // Never exclusive: Hyprland then forces every pointer event onto this
+    // surface and leaves an invisible dead zone. Keys only while a field
+    // is focused (on-demand).
     zwlr_layer_surface_v1_set_keyboard_interactivity(ls_, 0);
 
     bar_.register_surface(
@@ -62,14 +96,42 @@ SettingsWindow::SettingsWindow(Bar& bar) : bar_(bar) {
                    .button = [this](int b) { on_button(b); },
                    .leave  = [this] { mx_ = my_ = -1; },
                    .scroll = [this](int d) { on_scroll(d); },
+                   .release = {},
+                   .key = [this](const Bar::KeyEvent& e) { on_key(e); },
                });
     wl_surface_commit(surf_);
+
+    // A rebuild or reinstall while the window is open should show up in
+    // Bar > About without waiting for the next click.
+    const std::string& exe = build_info().path;
+    const size_t slash = exe.rfind('/');
+    if (slash != std::string::npos && slash > 0) {
+        exe_watch_fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (exe_watch_fd_ >= 0 &&
+            inotify_add_watch(exe_watch_fd_, exe.substr(0, slash).c_str(),
+                              IN_CREATE | IN_MOVED_TO | IN_DELETE |
+                                  IN_MOVED_FROM | IN_CLOSE_WRITE) < 0)
+            Bar::close_fd(exe_watch_fd_);
+        if (exe_watch_fd_ >= 0)
+            bar_.add_fd(exe_watch_fd_, [this](uint32_t) {
+                alignas(inotify_event) char buf[4096];
+                while (read(exe_watch_fd_, buf, sizeof buf) > 0) {}
+                if (tab_ == TabBar &&
+                    static_cast<int>(exe_state()) != exe_state_shown_)
+                    draw();
+            }, "settings-exe-watch");
+    }
 }
 
 SettingsWindow::~SettingsWindow() {
+    Bar::close_fd(exe_watch_fd_);
+    bar_.flush_config_save(); // closing the window never loses the last edit
+    wallpaper_set_listener(nullptr);
     bar_.unregister_surface(surf_);
     if (ls_) zwlr_layer_surface_v1_destroy(ls_);
     frac_.destroy();
+    gate_.drop();
+    pool_.clear();
     if (surf_) wl_surface_destroy(surf_);
 }
 
@@ -91,6 +153,14 @@ void SettingsWindow::on_motion(double x, double y) {
 }
 
 void SettingsWindow::on_scroll(int dir) {
+    for (auto& wgt : widgets_) {
+        if (!wgt.scroll) continue;
+        if (mx_ < wgt.x || mx_ >= wgt.x + wgt.w || my_ < wgt.y ||
+            my_ >= wgt.y + wgt.h)
+            continue;
+        wgt.scroll(dir);
+        return;
+    }
     double next = std::clamp(scroll_ + dir * SCROLL_STEP, 0.0, scroll_max_);
     if (next != scroll_) {
         scroll_ = next;
@@ -98,13 +168,76 @@ void SettingsWindow::on_scroll(int dir) {
     }
 }
 
+TextField* SettingsWindow::editing() {
+    switch (edit_) {
+    case 0: return &f_url_;
+    case 1: return &f_chat_;
+    case 2: return &f_start_;
+    default: return nullptr;
+    }
+}
+
+void SettingsWindow::commit_fields() {
+    cfg.local_llm_url       = f_url_.text;
+    cfg.local_llm_chat_url  = f_chat_.text;
+    cfg.local_llm_start_cmd = f_start_.text;
+}
+
+void SettingsWindow::set_kb_on_demand(bool on) {
+    if (!ls_) return;
+    zwlr_layer_surface_v1_set_keyboard_interactivity(
+        ls_, on ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND
+                : 0);
+    if (surf_) wl_surface_commit(surf_);
+}
+
+void SettingsWindow::on_key(const Bar::KeyEvent& e) {
+    if (!e.pressed) return;
+    TextField* f = editing();
+    if (!f) return;
+    if (e.escape()) {
+        edit_ = -1;
+        f_url_.focused = f_chat_.focused = f_start_.focused = false;
+        set_kb_on_demand(false);
+        draw();
+        return;
+    }
+    if (e.enter() || e.tab()) {
+        commit_fields();
+        apply();
+        if (e.tab()) {
+            int next = (edit_ + (e.shift() ? 2 : 1)) % 3;
+            edit_    = next;
+            f_url_.focused   = edit_ == 0;
+            f_chat_.focused  = edit_ == 1;
+            f_start_.focused = edit_ == 2;
+            set_kb_on_demand(true);
+        }
+        draw();
+        return;
+    }
+    if (f->handle(e)) {
+        commit_fields();
+        apply();
+        draw();
+    }
+}
+
 void SettingsWindow::on_button(int button) {
     if (button != BTN_LEFT) return;
+    int  prev = edit_;
+    bool hit  = false;
     for (size_t i = 0; i < widgets_.size(); ++i) {
         Widget wgt = widgets_[i]; // copy: callbacks rebuild widgets_
         if (mx_ < wgt.x || mx_ >= wgt.x + wgt.w || my_ < wgt.y ||
             my_ >= wgt.y + wgt.h)
             continue;
+        hit = true;
+        if (!wgt.scroll && prev >= 0) {
+            edit_ = -1;
+            set_kb_on_demand(false);
+            commit_fields();
+        }
         if (wgt.set_frac) {
             double f = std::clamp((mx_ - wgt.x) / wgt.w, 0.0, 1.0);
             wgt.set_frac(f);
@@ -113,11 +246,20 @@ void SettingsWindow::on_button(int button) {
         }
         return;
     }
+    if (!hit && prev >= 0) {
+        edit_ = -1;
+        set_kb_on_demand(false);
+        commit_fields();
+        apply();
+        draw();
+    }
 }
 
 void SettingsWindow::apply() {
     bar_.apply_config();
-    cfg.save(); // settings persist automatically; no Save button needed
+    // Settings persist automatically (no Save button). Debounced: five
+    // stepper clicks or a typed URL used to be one config write each.
+    bar_.save_config_soon();
     draw();
 }
 
@@ -133,8 +275,11 @@ void SettingsWindow::draw() {
                        : 1;
     const int bw = frac_.active() ? frac_.px(w_) : w_ * sc;
     const int bh = frac_.active() ? frac_.px(h_) : h_ * sc;
-    wl_buffer* buffer = create_argb_buffer(bar_.shm(), bw, bh, &data);
-    if (!buffer) return;
+    // Frame-paced: slider drags and key repeat draw once per shown frame.
+    if (!gate_.ready()) return;
+    ShmBuf* buf = pool_.acquire(bar_.shm(), bw, bh);
+    if (!buf) return;
+    data = buf->data;
     widgets_.clear();
 
     cairo_surface_t* cs = cairo_image_surface_create_for_data(
@@ -207,10 +352,12 @@ void SettingsWindow::draw() {
     // outside the visible band are not clickable.
     auto add_widget = [&](double x, double y, double ww, double wh,
                           std::function<void()> click,
-                          std::function<void(double)> frac) {
+                          std::function<void(double)> frac,
+                          std::function<void(int)> scrl = nullptr) {
         double sy = y + woff_;
         if (sy + wh < hdr - 4 || sy > h_ - FOOTER_H + 4) return;
-        widgets_.push_back({x, sy, ww, wh, std::move(click), std::move(frac)});
+        widgets_.push_back({x, sy, ww, wh, std::move(click), std::move(frac),
+                            std::move(scrl)});
     };
 
     auto text = [&](double x, double y, const std::string& s, const Color& c) {
@@ -257,6 +404,37 @@ void SettingsWindow::draw() {
                        apply();
                    },
                    nullptr);
+    };
+    auto anchor_picker = [&](double y2, std::string* field) {
+        text(24, y2, "Anchor", cfg.c_fg);
+        struct {
+            const char* lbl;
+            const char* val;
+        } as[] = {{"Bar", "bar"},
+                  {"TL", "top-left"},
+                  {"TR", "top-right"},
+                  {"BL", "bottom-left"},
+                  {"BR", "bottom-right"},
+                  {"Mid", "center"}};
+        double px = 108;
+        for (auto& a : as) {
+            bool   on = *field == a.val;
+            double bw = 38, bh = 20;
+            if (on) col(cr, cfg.c_accent, 1.0);
+            else col(cr, cfg.c_ws_bg);
+            cairo_rectangle(cr, px, y2 - bh / 2, bw, bh);
+            cairo_fill(cr);
+            text(px + (bw - text_w(a.lbl)) / 2.0, y2, a.lbl,
+                 on ? contrast_on(cfg.c_accent) : cfg.c_dim);
+            std::string val = a.val;
+            add_widget(px, y2 - bh / 2, bw, bh,
+                       [field, val, this] {
+                           *field = val;
+                           apply();
+                       },
+                       nullptr);
+            px += bw + 5;
+        }
     };
     auto slider = [&](double y, const std::string& label, double v,
                       std::function<void(double)> set) {
@@ -435,10 +613,11 @@ void SettingsWindow::draw() {
                     cfg.shell_network_font_size =
                         std::clamp(cfg.shell_network_font_size + d, 9.0, 22.0);
                 });
+        y += 30;
+        checkbox(24, y, "Scan on open", &cfg.shell_wifi_scan_on_open);
         y += 24;
-        y = hint(y, "Scan is manual (button or R). Opening the panel does not rescan.");
-        y += 16;
-        y = hint(y, "Left-click connects; right-click forgets");
+        y = hint(y, "off by default: use Scan in the panel. Radio On/Off "
+                    "kills the Wi-Fi radio");
         y += 36;
 
         section(y, "Bluetooth");
@@ -449,10 +628,11 @@ void SettingsWindow::draw() {
                     cfg.shell_bluetooth_font_size =
                         std::clamp(cfg.shell_bluetooth_font_size + d, 9.0, 22.0);
                 });
+        y += 30;
+        checkbox(24, y, "Scan on open", &cfg.shell_bt_scan_on_open);
         y += 24;
-        y = hint(y, "Scan and Add are manual. Add walks through pairing a new device.");
-        y += 16;
-        y = hint(y, "Left-click connects; right-click forgets");
+        y = hint(y, "off by default: Scan in the panel is one-shot. Radio "
+                    "On/Off uses rfkill");
         y += 36;
 
         section(y, "Display");
@@ -603,8 +783,10 @@ void SettingsWindow::draw() {
                     cfg.set_agents_popup_pct(cfg.agents_popup_w_pct(),
                                              cfg.agents_popup_h_pct() + d * 2);
                 });
+        y += 30;
+        anchor_picker(y, &cfg.agents_popup_anchor);
         y += 24;
-        y = hint(y, "percent of the monitor; grok session hangs off the bar");
+        y = hint(y, "percent of the monitor; Bar hangs off the bar edge");
         y += 24;
         y = hint(y, "right-click the bar icon launches omarchy-agent --pick");
         y += 12;
@@ -841,6 +1023,23 @@ void SettingsWindow::draw() {
                     std::clamp(cfg.reveal_delay_ms + d * 50, 0, 1000);
             });
     y += 30;
+    {
+        auto fmt = [](int s) -> std::string {
+            if (s <= 0) return "same as lock";
+            if (s < 60) return std::to_string(s) + " s";
+            int m = s / 60, r = s % 60;
+            if (r == 0) return std::to_string(m) + " min";
+            return std::to_string(m) + " min " + std::to_string(r) + " s";
+        };
+        stepper(y, "Keep display on after wake",
+                fmt(cfg.lock_wake_blank_s), [](int d) {
+                    cfg.lock_wake_blank_s =
+                        std::clamp(cfg.lock_wake_blank_s + d * 5, 0, 120);
+                });
+        y += 24;
+        y = hint(y, "lock screen stays lit this long after suspend or hibernate");
+        y += 26;
+    }
     stepper(y, "Tray auto-collapse (ms)",
             cfg.tray_collapse_ms == 0 ? "off"
                                       : std::to_string(cfg.tray_collapse_ms),
@@ -1003,6 +1202,41 @@ void SettingsWindow::draw() {
             });
     y += 24;
     y = hint(y, "reveal target; also catches clicks at the top edge");
+    y += 12;
+
+    // Which build is running: after a rebuild + restart, the build id here
+    // should match `mattbar --version` for the binary on disk.
+    y += 24;
+    section(y, "About");
+    y += 30;
+    {
+        const BuildInfo& b = build_info();
+        text(24, y, "MattBar " + b.version, cfg.c_fg);
+        text(170, y, "build " + b.short_id, cfg.c_accent);
+        // The warning goes right under the id, so it is in view even when
+        // it appears while the tab is scrolled to the bottom.
+        std::string disk;
+        const ExeState es = exe_state(&disk);
+        exe_state_shown_  = static_cast<int>(es);
+        if (es == ExeState::Replaced) {
+            y += 24;
+            text(24, y, "A different build is on disk (built " + disk + ")",
+                 cfg.c_urgent);
+            y += 20;
+            y = hint(y, "restart MattBar to run it: "
+                        "systemctl --user restart mattbar");
+        } else if (es == ExeState::Gone) {
+            y += 24;
+            text(24, y, "The binary this instance started from is gone",
+                 cfg.c_urgent);
+        }
+        y += 24;
+        if (!b.linked.empty()) {
+            y = hint(y, "built " + b.linked);
+            y += 20;
+        }
+        y = hint(y, b.path);
+    }
     y += 12;
     } else if (tab_ == TabLook) {
     section(y, "Colors");
@@ -1271,6 +1505,150 @@ void SettingsWindow::draw() {
     preview();
     } // !follow_omarchy_theme
 
+    // ---- Background (MattBar's wallpaper engine) ------------------------
+    y += 40;
+    section(y, "Background");
+    y += 26;
+    if (!cfg.quickshell_shutdown) {
+        y = hint(y, "MattBar draws the background while \"Shut down the "
+                    "Quickshell instance\" (Notify tab) is on; until then "
+                    "Omarchy's shell draws it");
+        y += 20;
+    } else {
+        auto pill = [&](double x, double yc, const std::string& label,
+                        std::function<void()> cb) {
+            double bw = text_w(label) + 20, bh = 22;
+            col(cr, cfg.c_ws_bg);
+            cairo_rectangle(cr, x, yc - bh / 2, bw, bh);
+            cairo_fill(cr);
+            text(x + 10, yc, label, cfg.c_fg);
+            add_widget(x, yc - bh / 2, bw, bh, std::move(cb), nullptr);
+            return bw;
+        };
+        auto fit = [&](std::string s, double maxw) {
+            if (text_w(s) <= maxw) return s;
+            while (!s.empty() && text_w(s + "\u2026") > maxw) {
+                s.pop_back();
+                while (!s.empty() && (s.back() & 0xC0) == 0x80) s.pop_back();
+            }
+            return s + "\u2026";
+        };
+        auto base = [](const std::string& p) {
+            auto k = p.find_last_of('/');
+            return k == std::string::npos ? p : p.substr(k + 1);
+        };
+        // "" = the background itself; a monitor name = that monitor's pick
+        auto pick = [this](const std::string& out) {
+            std::string rows;
+            for (auto& p : wallpaper_candidates()) rows += p + "\n";
+            std::string sel = out.empty() ? wallpaper_current_path()
+                                          : cfg.wallpaper_for(out);
+            Bar* bar = &bar_;
+            bool ok  = image_picker_choose(
+                rows, sel,
+                [bar, out](const std::string& path) {
+                    if (out.empty()) {
+                        wallpaper_choose(path);
+                        return;
+                    }
+                    cfg.set_wallpaper_for(out, path);
+                    bar->apply_config();
+                    bar->save_config_soon();
+                },
+                [bar] { bar->open_settings(); });
+            if (ok) { // step aside; back where we were once it closes
+                g_resume = {true, tab_, shell_tab_, scroll_};
+                bar_.close_settings_later();
+            }
+        };
+
+        const double pw = 112, ph = 63, px0 = 24, py0 = y - 11;
+        col(cr, cfg.c_ws_bg);
+        cairo_rectangle(cr, px0, py0, pw, ph);
+        cairo_fill(cr);
+        if (cairo_surface_t* img = wallpaper_image()) {
+            int iw = cairo_image_surface_get_width(img);
+            int ih = cairo_image_surface_get_height(img);
+            if (iw > 0 && ih > 0) {
+                double s = std::max(pw / iw, ph / ih);
+                cairo_save(cr);
+                cairo_rectangle(cr, px0, py0, pw, ph);
+                cairo_clip(cr);
+                cairo_translate(cr, px0 + (pw - iw * s) / 2.0,
+                                py0 + (ph - ih * s) / 2.0);
+                cairo_scale(cr, s, s);
+                cairo_set_source_surface(cr, img, 0, 0);
+                cairo_paint(cr);
+                cairo_restore(cr);
+            }
+        }
+        const double tx  = px0 + pw + 14;
+        std::string  cur = wallpaper_current_path();
+        text(tx, y, fit(cur.empty() ? "(none)" : base(cur), w_ - tx - 24),
+             cfg.c_fg);
+        pill(tx, y + 30, "Choose\u2026", [pick] { pick(""); });
+        y += ph + 12;
+
+        text(24, y, "Monitors", cfg.c_fg);
+        struct { const char* lbl; const char* val; } ms[] = {
+            {"Same", "same"}, {"Main", "main"}, {"Mix", "mix"},
+            {"Each", "each"}};
+        std::string mode = cfg.wallpaper_monitors;
+        if (mode != "main" && mode != "mix" && mode != "each") mode = "same";
+        double mx = 170;
+        for (auto& m : ms) {
+            bool   active = mode == m.val;
+            double bw = 48, bh = 20;
+            if (active) col(cr, cfg.c_accent, 1.0);
+            else col(cr, cfg.c_ws_bg);
+            cairo_rectangle(cr, mx, y - bh / 2, bw, bh);
+            cairo_fill(cr);
+            text(mx + (bw - text_w(m.lbl)) / 2.0, y, m.lbl,
+                 active ? contrast_on(cfg.c_accent) : cfg.c_dim);
+            std::string val = m.val;
+            add_widget(mx, y - bh / 2, bw, bh,
+                       [val, this] {
+                           cfg.wallpaper_monitors = val;
+                           apply();
+                       },
+                       nullptr);
+            mx += bw + 6;
+        }
+        y += 26;
+        y = hint(y,
+                 mode == "main"
+                     ? "only the main monitor (the one the bar is pinned to "
+                       "on the Bar tab, else the first) shows it; the others "
+                       "show the background colour"
+                 : mode == "mix"
+                     ? "extra monitors get other images from the theme's "
+                       "backgrounds"
+                 : mode == "each"
+                     ? "pick an image per monitor below; a monitor without a "
+                       "pick, including one plugged in later, shows the "
+                       "background above"
+                     : "every monitor shows the background above, including "
+                       "monitors plugged in later");
+        y += 26;
+        if (mode == "each") {
+            for (auto& o : bar_.output_list()) {
+                if (o.name.empty()) continue;
+                std::string p = cfg.wallpaper_for(o.name);
+                text(24, y, fit(o.name, 104), cfg.c_fg);
+                text(136, y, fit(p.empty() ? "(background)" : base(p), 172),
+                     p.empty() ? cfg.c_dim : cfg.c_fg);
+                std::string on = o.name;
+                double      bw = pill(318, y, "Choose\u2026", [pick, on] { pick(on); });
+                if (!p.empty())
+                    small_button(318 + bw + 6, y, "x", [on, this] {
+                        cfg.set_wallpaper_for(on, "");
+                        apply();
+                    });
+                y += 28;
+            }
+        }
+    }
+
     } else if (tab_ == TabModules || tab_ == TabNotify) {
     if (tab_ == TabModules) {
     section(y, "Temperature");
@@ -1306,6 +1684,140 @@ void SettingsWindow::draw() {
             [](int d) {
                 cfg.media_len = std::clamp(cfg.media_len + d * 2, 8, 80);
             });
+    y += 36;
+    section(y, "Local LLM");
+    y += 26;
+    {
+        auto sync_field = [&](TextField& f, const std::string& v, int id) {
+            f.focused = (edit_ == id);
+            if (edit_ == id) return;
+            if (f.text != v) {
+                f.text   = v;
+                f.cursor = v.size();
+                f.pan    = 0;
+            }
+        };
+        sync_field(f_url_, cfg.local_llm_url, 0);
+        sync_field(f_chat_, cfg.local_llm_chat_url, 1);
+        sync_field(f_start_, cfg.local_llm_start_cmd, 2);
+
+        auto text_box = [&](double y2, const char* label, TextField& f, int id,
+                            const char* placeholder) {
+            text(24, y2, label, cfg.c_fg);
+            y2 += 18;
+            double bx = 24, by = y2 - 12, bw = w_ - 48, bh = 26;
+            f.draw(cr, bx, by, bw, bh, placeholder);
+            add_widget(
+                bx, by, bw, bh,
+                [this, id] {
+                    edit_            = id;
+                    f_url_.focused   = id == 0;
+                    f_chat_.focused  = id == 1;
+                    f_start_.focused = id == 2;
+                    set_kb_on_demand(true);
+                    draw();
+                },
+                nullptr,
+                [this, id](int dir) {
+                    edit_ = id;
+                    TextField* tf = id == 0   ? &f_url_
+                                    : id == 1 ? &f_chat_
+                                              : &f_start_;
+                    tf->scroll(dir);
+                    draw();
+                });
+            return y2 + 22;
+        };
+        y = text_box(y, "Server URL", f_url_, 0, "http://127.0.0.1:11434");
+        y = text_box(y, "Chat HTML path or URL", f_chat_, 1,
+                     "/home/.../structure-chat.html");
+        y = hint(y, "leave empty for structure-cpp");
+        y += 22;
+        y = text_box(y, "Start command", f_start_, 2,
+                     "structure_serve --model ...");
+        y = hint(y, "Stop command empty = POST /shutdown");
+        y += 22;
+        text(24, y, "Icon", cfg.c_fg);
+        y += 22;
+        {
+            // Click a chip to pick. First is the Structure Chat column
+            // glyph (the favicon in structure-chat.html).
+            struct IconPick {
+                const char* id;
+                const char* glyph; // empty = vector structure icon
+            } picks[] = {{"auto", ""},
+                         {"robot", "\U000F06A9"},
+                         {"chat", "\U000F0206"},
+                         {"spark", "\U000F135B"},
+                         {"brain", "\U000F0ECF"}};
+            double px = 24, cell = 36, gap = 8;
+            for (auto& p : picks) {
+                bool vec = p.glyph[0] == 0;
+                bool on  = vec ? local_llm_vector_icon()
+                               : cfg.local_llm_glyph == p.glyph;
+                col(cr, on ? cfg.c_accent : cfg.c_ws_bg, 1.0);
+                cairo_rectangle(cr, px, y - cell / 2, cell, cell);
+                cairo_fill(cr);
+                if (vec) {
+                    Color ink = on ? contrast_on(cfg.c_accent) : cfg.c_fg;
+                    draw_llm_icon(cr, px + cell / 2, y, 22, ink);
+                } else {
+                    cairo_font_extents_t ife;
+                    cairo_font_extents(cr, &ife);
+                    Color ink = on ? contrast_on(cfg.c_accent) : cfg.c_fg;
+                    col(cr, ink, 1.0);
+                    cairo_text_extents_t ext;
+                    cairo_text_extents(cr, p.glyph, &ext);
+                    cairo_move_to(cr,
+                                  px + (cell - ext.x_advance) / 2.0,
+                                  y + (ife.ascent - ife.descent) / 2.0);
+                    cairo_show_text(cr, p.glyph);
+                }
+                std::string val = vec ? "auto" : p.glyph;
+                add_widget(px, y - cell / 2, cell, cell,
+                           [val, this] {
+                               cfg.local_llm_glyph = val;
+                               apply();
+                           },
+                           nullptr);
+                px += cell + gap;
+            }
+        }
+        y += 28;
+        y = hint(y, "Structure columns (from structure-chat.html), then "
+                    "robot / chat / spark / brain");
+    }
+    y += 30;
+    stepper(y, "Popup width",
+            std::to_string(cfg.local_llm_popup_w_pct()) + "%", [](int d) {
+                cfg.set_local_llm_popup_pct(cfg.local_llm_popup_w_pct() + d * 2,
+                                            cfg.local_llm_popup_h_pct());
+            });
+    y += 30;
+    stepper(y, "Popup height",
+            std::to_string(cfg.local_llm_popup_h_pct()) + "%", [](int d) {
+                cfg.set_local_llm_popup_pct(cfg.local_llm_popup_w_pct(),
+                                            cfg.local_llm_popup_h_pct() + d * 2);
+            });
+    y += 30;
+    anchor_picker(y, &cfg.local_llm_popup_anchor);
+    y += 24;
+    y = hint(y, "percent of the monitor; Mid centers, Bar follows the bar");
+    y += 28;
+    {
+        const char* lbl = "Stop engine and client";
+        double      bw  = text_w(lbl) + 16, bh = 22;
+        col(cr, cfg.c_ws_bg);
+        cairo_rectangle(cr, 24, y - bh / 2, bw, bh);
+        cairo_fill(cr);
+        text(24 + 8, y, lbl, cfg.c_fg);
+        add_widget(24, y - bh / 2, bw, bh,
+                   [] {
+                       local_llm_shutdown();
+                   },
+                   nullptr);
+        y += 26;
+    }
     } // TabModules (bar chips, first half)
 
     if (tab_ == TabNotify) {
@@ -1489,8 +2001,10 @@ void SettingsWindow::draw() {
                 cfg.set_agents_popup_pct(cfg.agents_popup_w_pct(),
                                          cfg.agents_popup_h_pct() + d * 2);
             });
+    y += 30;
+    anchor_picker(y, &cfg.agents_popup_anchor);
     y += 24;
-    y = hint(y, "percent of the monitor; grok / terminal session at the bar edge");
+    y = hint(y, "percent of the monitor; Bar hangs the session off the bar edge");
 
     y += 36;
     section(y, "Power profile");
@@ -1576,6 +2090,7 @@ void SettingsWindow::draw() {
         {"tray", "Tray", &cfg.show_tray},
         {"update", "Update", &cfg.show_update},
         {"agents", "AI agents", &cfg.show_agents},
+        {"localllm", "Local LLM", &cfg.show_local_llm},
         {"screenrecord", "Rec light", &cfg.show_screenrecord},
         {"temp", "Temp", &cfg.show_temp},
         {"network", "Network", &cfg.show_network},
@@ -1730,6 +2245,8 @@ void SettingsWindow::draw() {
         };
         double ty = paint_tabs(tabs, ntabs, 42, tab_, [this](int id) {
             tab_    = id;
+            edit_   = -1;
+            set_kb_on_demand(false);
             scroll_ = 0;
             draw();
         });
@@ -1794,10 +2311,11 @@ void SettingsWindow::draw() {
     cairo_surface_destroy(cs);
 
     frac_.apply(surf_, w_, h_, sc);
-    wl_surface_attach(surf_, buffer, 0, 0);
+    wl_surface_attach(surf_, buf->wl, 0, 0);
     if (wl_surface_get_version(surf_) >= 4)
         wl_surface_damage_buffer(surf_, 0, 0, bw, bh);
     else
         wl_surface_damage(surf_, 0, 0, w_, h_);
+    gate_.arm(surf_);
     wl_surface_commit(surf_);
 }

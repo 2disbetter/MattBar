@@ -12,6 +12,7 @@ pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET wayland-client wayland-cursor
 pkg_check_modules(CAIRO   REQUIRED IMPORTED_TARGET cairo)
 pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 pkg_check_modules(XKB     REQUIRED IMPORTED_TARGET xkbcommon)
+find_package(Threads REQUIRED) # image decode worker
 # SVG tray icons need librsvg AT RUNTIME only (dlopen on first SVG icon);
 # there is no build-time dependency and no standing RAM cost without SVGs.
 
@@ -64,6 +65,9 @@ wayland_protocol(${WAYLAND_PROTOCOLS_DIR}/staging/ext-idle-notify/ext-idle-notif
 # --- executable -------------------------------------------------------------
 set(MATTBAR_SRC
   src/main.cpp
+  src/imgwork.cpp
+  src/hyprev.cpp
+  src/buildinfo.cpp
   src/bar.cpp
   src/config.cpp
   src/omarchy_theme.cpp
@@ -71,6 +75,7 @@ set(MATTBAR_SRC
   src/sensors.cpp
   src/settings.cpp
   src/modules.cpp
+  src/local_llm.cpp
   src/panels.cpp
   src/audio.cpp
   src/ctl.cpp
@@ -89,7 +94,8 @@ set(MATTBAR_SRC
   src/shell_panels.cpp
   src/shell_network.cpp
   src/shell_overlays.cpp
-  src/qs_plugins.cpp)
+  src/qs_plugins.cpp
+  src/spawn.cpp)
 foreach(_f IN LISTS MATTBAR_SRC)
   if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${_f})
     message(FATAL_ERROR
@@ -104,6 +110,11 @@ if(NOT PROTO_SRC)
 endif()
 
 add_executable(mattbar ${MATTBAR_SRC} ${PROTO_SRC})
+# A GNU build-id in every binary: settings > Bar > About, `mattbar
+# --version` and `mattbarctl version` show it to tell builds apart.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_options(mattbar PRIVATE "LINKER:--build-id=sha1")
+endif()
 
 target_include_directories(mattbar PRIVATE ${GEN})
 
@@ -114,7 +125,20 @@ target_link_libraries(mattbar PRIVATE
   PkgConfig::SYSTEMD
   PkgConfig::XKB
   ${PAM_LIBRARY}
+  Threads::Threads
   ${CMAKE_DL_LIBS})
+
+# Spawn/AsyncCmd harness (no compositor needed):
+#   cmake --build build --target test_spawn && build/test_spawn
+set(TEST_SPAWN_SRC ${MATTBAR_SRC})
+list(REMOVE_ITEM TEST_SPAWN_SRC src/main.cpp)
+add_executable(test_spawn EXCLUDE_FROM_ALL test_spawn.cpp ${TEST_SPAWN_SRC} ${PROTO_SRC})
+target_include_directories(test_spawn PRIVATE ${GEN} ${CMAKE_CURRENT_SOURCE_DIR})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_options(test_spawn PRIVATE "LINKER:--build-id=sha1")
+endif()
+target_link_libraries(test_spawn PRIVATE PkgConfig::WAYLAND PkgConfig::CAIRO
+  PkgConfig::SYSTEMD PkgConfig::XKB ${PAM_LIBRARY} Threads::Threads ${CMAKE_DL_LIBS})
 
 install(TARGETS mattbar RUNTIME DESTINATION bin)
 # mattbarctl is the same binary dispatching on argv[0]

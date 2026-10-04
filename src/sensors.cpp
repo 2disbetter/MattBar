@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
+#include <utility>
+#include <cstdio>
 
 static std::string hwmon_base() {
     const char* env = getenv("MATTBAR_HWMON");

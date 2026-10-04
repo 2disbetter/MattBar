@@ -1,6 +1,12 @@
 #pragma once
 #include <cairo/cairo.h>
 
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
 class Bar;
 
 // A bar widget. Bar calls width() then draw() each frame (cr already has the
@@ -40,7 +46,10 @@ Module* make_agents();
 // Same action as left-clicking the agents chip (grok session popup, not
 // the Claude/Codex usage dashboard). Used by `mattbarctl agents toggle`.
 void    agents_hotkey();
-void    agents_pick();
+Module* make_local_llm();
+void    local_llm_hotkey();
+void    local_llm_shutdown();
+bool    local_llm_vector_icon();
 Module* make_microphone();
 Module* make_screenrecord();
 Module* make_brightness();
@@ -54,10 +63,14 @@ void draw_brightness_slider(cairo_t* cr, int w, int h, double frac,
 void draw_sun_icon(cairo_t* cr, double cx, double cy, double size,
                    const Color& c);
 bool brightness_vector_icon();
+void draw_llm_icon(cairo_t* cr, double cx, double cy, double size,
+                   const Color& c);
 Module* make_media();
 Module* make_caffeine();
 Module* make_nightlight();
 Module* make_tray();
+// One status line for `mattbar ctl ipc-stats` (items, in-flight calls).
+std::string tray_debug_state();
 Module* make_pin();
 Module* make_more();
 void    more_close();
@@ -85,12 +98,19 @@ Module* make_dictation();
 Module* make_tailscale();
 Module* make_dropbox();
 void    media_source_switch();
+void    media_play_pause();
+void    media_next();
+void    media_previous();
 void    clock_cycle_format();
 // mattbarctl hooks into the power module (empty/false when PPD is absent)
-#include <string>
-#include <vector>
 // fire-and-forget process launch (double-fork; used by click commands)
-void spawn_detached(const std::string& cmd);
+void spawn_detached(const std::string& cmd); // user launch (spawn.cpp)
+void spawn_helper(const std::string& cmd);   // internal fire-and-forget
+// One bounded blocking request on Hyprland's command socket
+// ("j/monitors", ...); empty when Hyprland is not reachable or too slow.
+// Replaces forking hyprctl. Defined in hyprev.cpp (see hypr_request in
+// hyprev.hpp for the budget); prefer hypr_async where nothing waits.
+std::string hypr_query(const std::string& req);
 // Wrap a shell command so the current power-profiles-daemon profile is
 // saved for both AC and battery, then restored after the command. The
 // Omarchy shell reapplies ac/battery on start; a missing battery file
@@ -101,7 +121,6 @@ void persist_power_profile(const std::string& profile);
 // wrappers so bar clicks open MattBar's overlay instead of a dead qs.
 std::string live_panel_click(const std::string& stored, const char* overlay_id);
 
-#include <functional>
 class Bar;
 // Run a shell command WITHOUT blocking the event loop; the callback fires
 // with its stdout when it completes (or with what it produced when the
@@ -127,9 +146,15 @@ private:
     void start(const std::string& cmd);
     void finish(int status);
     void drain_lines();
+    void drain_pipe();  // read what is available; closes the pipe on EOF
+    void close_pipe();
     Bar*        bar_ = nullptr;
     int         fd_ = -1, timer_fd_ = -1;
     pid_t       pid_ = -1;
+    uint64_t    gen_ = 0; // which run an exit notification belongs to
+    // Exit notifications arrive via watch_child(); they check this token so
+    // a callback for a destroyed AsyncCmd (or a superseded run) is a no-op.
+    std::shared_ptr<char> alive_ = std::make_shared<char>(0);
     std::string buf_, pending_cmd_;
     bool        pending_ = false;
     Done        cb_;

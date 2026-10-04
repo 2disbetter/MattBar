@@ -5,6 +5,7 @@
 #include "config.hpp"
 #include "shell.hpp"
 #include "util.hpp"
+#include "hyprev.hpp"
 
 #include <cairo/cairo.h>
 #include <linux/input-event-codes.h>
@@ -19,6 +20,10 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <string_view>
+#include <utility>
+#include <algorithm>
+#include <cstdlib>
 
 namespace {
 
@@ -56,30 +61,6 @@ protected:
 
 namespace {
 
-std::string hypr_dir() {
-    const char* sig = getenv("HYPRLAND_INSTANCE_SIGNATURE");
-    const char* rt  = getenv("XDG_RUNTIME_DIR");
-    if (!sig) return {};
-    if (rt) {
-        std::string p = std::string(rt) + "/hypr/" + sig;
-        if (access((p + "/.socket2.sock").c_str(), F_OK) == 0) return p;
-    }
-    return {};
-}
-
-int unix_nb(const std::string& path) {
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (fd < 0) return -1;
-    sockaddr_un a{};
-    a.sun_family = AF_UNIX;
-    strncpy(a.sun_path, path.c_str(), sizeof a.sun_path - 1);
-    if (connect(fd, (sockaddr*)&a, sizeof a) < 0 && errno != EINPROGRESS) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
 std::string utf8_clip(std::string s, size_t maxc) {
     size_t chars = 0, i = 0;
     while (i < s.size() && chars < maxc) {
@@ -103,46 +84,42 @@ class ActiveWindowModule : public MiniText {
 public:
     bool enabled() const override { return cfg.show_active_window; }
     bool primary_only() const override { return true; }
+    ~ActiveWindowModule() override { hyprev::unsubscribe(sub_); }
     void init(Bar& bar) override {
         bar_ = &bar;
-        std::string d = hypr_dir();
-        if (d.empty()) return;
-        fd_ = unix_nb(d + "/.socket2.sock");
-        if (fd_ < 0) return;
-        bar.add_fd(fd_, [this](uint32_t) {
-            char b[2048];
-            ssize_t n;
-            while ((n = read(fd_, b, sizeof b)) > 0) buf_.append(b, n);
-            size_t p;
-            while ((p = buf_.find('\n')) != std::string::npos) {
-                on_line(buf_.substr(0, p));
-                buf_.erase(0, p + 1);
-            }
-        }, "activewindow");
+        // Shared event stream (hyprev.hpp). The private connection this
+        // replaces never handled end-of-stream: a closed socket stays
+        // readable, so a Hyprland restart would have spun the loop.
+        sub_ = hyprev::subscribe(bar, {"activewindow"},
+                                 [this](const HyprEvent& ev) {
+                                     on_event(ev.data);
+                                 });
     }
     bool on_click(double, int button) override {
         if (title_.empty()) return false;
         if (button == BTN_MIDDLE || button == BTN_RIGHT) {
-            spawn_detached("hyprctl dispatch killactive");
+            spawn_helper("hyprctl dispatch killactive");
             return true;
         }
-        spawn_detached("hyprctl dispatch focuscurrentorlast");
+        spawn_helper("hyprctl dispatch focuscurrentorlast");
         return true;
     }
 
 private:
-    void on_line(const std::string& l) {
-        if (l.rfind("activewindow>>", 0) != 0) return;
-        std::string rest = l.substr(15);
-        auto c = rest.find(',');
-        title_ = c == std::string::npos ? rest : rest.substr(c + 1);
+    // activewindow>>CLASS,TITLE. The old parser started one character too
+    // late: harmless with a class, but for a window with an empty class it
+    // skipped the separating comma and cut the title at its first comma.
+    void on_event(std::string_view data) {
+        auto c = data.find(',');
+        title_ = std::string(c == std::string_view::npos ? std::string_view()
+                                                         : data.substr(c + 1));
         if (!bar_) return;
         set_text(*bar_, utf8_clip(title_, (size_t)cfg.active_window_max),
                  cfg.c_dim);
     }
     Bar*        bar_ = nullptr;
-    int         fd_  = -1;
-    std::string buf_, title_;
+    int         sub_ = 0;
+    std::string title_;
 };
 
 class KbLayoutModule : public MiniText {
@@ -160,7 +137,7 @@ public:
     }
     bool on_click(double, int) override {
         if (kb_.empty()) return false;
-        spawn_detached("hyprctl switchxkblayout " + shell_q(kb_) + " next");
+        spawn_helper("hyprctl switchxkblayout " + shell_q(kb_) + " next");
         refresh();
         return true;
     }
@@ -359,7 +336,7 @@ public:
     bool on_click(double, int button) override {
         auto* sh = mattbar_shell();
         if (button == BTN_RIGHT) {
-            spawn_detached("tailscale status >/dev/null && tailscale down || "
+            spawn_helper("tailscale status >/dev/null && tailscale down || "
                            "tailscale up");
             refresh();
             return true;

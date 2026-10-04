@@ -1,4 +1,6 @@
 #include "bar.hpp"
+#include "imgwork.hpp"
+#include "spawn.hpp"
 #include <systemd/sd-daemon.h>
 #include "cursor-shape-v1-client-protocol.h"
 #include "ext-idle-notify-v1-client-protocol.h"
@@ -33,6 +35,11 @@
 #include <cstring>
 
 #include <cstdlib>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <utility>
+#include <functional>
 static bool dbg() {
     static bool v = getenv("MATTBAR_DEBUG") != nullptr;
     return v;
@@ -607,15 +614,13 @@ void BarSurface::create(Bar& b, wl_output* o, const std::string& n) {
         .closed    = on_closed,
     };
     zwlr_layer_surface_v1_add_listener(ls, &lst, this);
-    zwlr_layer_surface_v1_set_anchor(ls, anchors_for_position());
+    sent_anchor = anchors_for_position();
+    zwlr_layer_surface_v1_set_anchor(ls, sent_anchor);
     // THE auto-hide core: zero exclusive zone -> windows keep full height
     // and never move; the bar simply overlays them when revealed.
     zwlr_layer_surface_v1_set_exclusive_zone(ls, 0);
     zwlr_layer_surface_v1_set_keyboard_interactivity(ls, 0);
-    if (cfg_vertical())
-        zwlr_layer_surface_v1_set_size(ls, hidden_thickness(), 0);
-    else
-        zwlr_layer_surface_v1_set_size(ls, 0, hidden_thickness());
+    send_size(hidden_thickness());
 
     hide_fd   = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     reveal_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
@@ -645,14 +650,12 @@ void BarSurface::create(Bar& b, wl_output* o, const std::string& n) {
 }
 
 void BarSurface::destroy() {
-    if (owner) {
-        if (reveal_fd >= 0) owner->remove_fd(reveal_fd);
-        if (hide_fd >= 0) owner->remove_fd(hide_fd);
-    }
-    if (reveal_fd >= 0) { close(reveal_fd); reveal_fd = -1; }
-    if (hide_fd >= 0) { close(hide_fd); hide_fd = -1; }
+    Bar::close_fd(reveal_fd);
+    Bar::close_fd(hide_fd);
     if (ls) { zwlr_layer_surface_v1_destroy(ls); ls = nullptr; }
     frac.destroy();
+    gate.drop();
+    pool.clear();
     if (surf) { wl_surface_destroy(surf); surf = nullptr; }
     configured = false;
 }
@@ -692,25 +695,37 @@ void BarSurface::set_expanded(bool on) {
     const uint32_t req =
         on ? static_cast<uint32_t>(cfg_thickness()) : hidden_thickness();
     if (req != (cfg_vertical() ? w : h)) awaiting_configure = true;
-    if (cfg_vertical())
-        zwlr_layer_surface_v1_set_size(ls, req, 0);
-    else
-        zwlr_layer_surface_v1_set_size(ls, 0, req);
+    send_size(req);
     wl_surface_commit(surf); // compositor answers with configure -> draw
 }
 
-void BarSurface::apply_geometry() {
-    if (!ls) return;
-    hidden_frame_valid = false; // strip color/height may have changed
-    zwlr_layer_surface_v1_set_anchor(ls, anchors_for_position());
-    const uint32_t req =
-        expanded ? static_cast<uint32_t>(cfg_thickness()) : hidden_thickness();
-    if (req != (cfg_vertical() ? w : h)) awaiting_configure = true;
-    if (cfg_vertical())
+void BarSurface::send_size(uint32_t req) {
+    sent_size     = req;
+    sent_vertical = cfg_vertical();
+    if (sent_vertical)
         zwlr_layer_surface_v1_set_size(ls, req, 0);
     else
         zwlr_layer_surface_v1_set_size(ls, 0, req);
+}
+
+bool BarSurface::apply_geometry() {
+    if (!ls) return false;
+    // Strip colour or height may have changed: repaint the hidden frame
+    // either way. That is one tiny buffer, not a configure round-trip.
+    hidden_frame_valid = false;
+    dirty              = true;
+    const uint32_t anchor = anchors_for_position();
+    const uint32_t req =
+        expanded ? static_cast<uint32_t>(cfg_thickness()) : hidden_thickness();
+    if (anchor == sent_anchor && req == sent_size &&
+        cfg_vertical() == sent_vertical)
+        return false;
+    sent_anchor = anchor;
+    zwlr_layer_surface_v1_set_anchor(ls, anchor);
+    if (req != (cfg_vertical() ? w : h)) awaiting_configure = true;
+    send_size(req);
     wl_surface_commit(surf);
+    return true;
 }
 
 Module* BarSurface::hit(double along_px, double* relx) {
@@ -762,6 +777,7 @@ bool Bar::init() {
 
     // event loop plumbing
     epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+    spawn_init(*this); // child reaping via the loop (pidfd)
     tick_fd_  = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     // NOTE: tick timer starts DISARMED; the bars begin hidden and an idle
     // hidden bar schedules zero wakeups. It is armed on the first reveal.
@@ -770,6 +786,26 @@ bool Bar::init() {
         while (read(tick_fd_, &n, sizeof n) > 0) {}
         if (any_expanded()) tick_modules();
     }, "tick-timer");
+
+    apply_tick_fd_ =
+        timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (apply_tick_fd_ >= 0)
+        add_fd(apply_tick_fd_, [this](uint32_t) {
+            uint64_t n;
+            while (read(apply_tick_fd_, &n, sizeof n) > 0) {}
+            apply_tick_armed_ = false;
+            if (!apply_tick_again_) return;
+            apply_tick_again_ = false;
+            tick_modules(); // trailing edge: text under the final settings
+            request_draw();
+        }, "apply-tick");
+    save_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (save_fd_ >= 0)
+        add_fd(save_fd_, [this](uint32_t) {
+            uint64_t n;
+            while (read(save_fd_, &n, sizeof n) > 0) {}
+            flush_config_save();
+        }, "config-save");
 
     // One bar per wanted output (or exactly one, wherever the compositor
     // puts it, when multi-monitor is off).
@@ -822,6 +858,24 @@ void Bar::rebuild_layout() {
     }
 }
 
+Bar* Bar::live_ = nullptr;
+
+Bar::Bar() { live_ = this; }
+Bar::~Bar() {
+    if (live_ == this) live_ = nullptr;
+}
+
+void Bar::close_fd(int& fd) {
+    if (fd < 0) return;
+    unwatch_fd(fd);
+    close(fd);
+    fd = -1;
+}
+
+void Bar::unwatch_fd(int fd) {
+    if (fd >= 0 && live_) live_->remove_fd(fd);
+}
+
 void Bar::add_fd(int fd, std::function<void(uint32_t)> cb,
                  const char* label) {
     epoll_event ev{};
@@ -840,8 +894,9 @@ void Bar::mod_fd(int fd, uint32_t events) {
 }
 
 void Bar::remove_fd(int fd) {
-    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-    fd_cbs_.erase(fd);
+    if (fd < 0) return;
+    if (epoll_fd_ >= 0) epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    if (fd_cbs_.erase(fd) && dispatching_) removed_in_batch_.push_back(fd);
     fd_labels_.erase(fd);
 }
 
@@ -1052,7 +1107,15 @@ std::vector<Bar::OutputRef> Bar::output_list() const {
 // single entry point for startup, monitor hotplug, and settings changes, so
 // there is only ever one rule deciding which monitors carry a bar.
 // ---------------------------------------------------------------------------
+// Bars, then the wallpaper. The wallpaper used to be reconciled only at
+// the end of the bar pass, which returns early in one-bar mode (the
+// default): a monitor plugged in later never got a background.
 void Bar::sync_surfaces() {
+    sync_bar_surfaces();
+    wallpaper_apply();
+}
+
+void Bar::sync_bar_surfaces() {
     if (!compositor_ || !layer_shell_) return;
 
     // A surface the compositor closed under us (output going away mid-frame)
@@ -1160,7 +1223,6 @@ void Bar::sync_surfaces() {
         for (auto* bs : surfaces_) bs->hidden_frame_valid = false;
         request_draw();
     }
-    wallpaper_apply();
 }
 
 // The tick timer runs while ANY bar is revealed, and is fully disarmed once
@@ -1222,23 +1284,96 @@ void Bar::refresh_settings() {
     if (settings_) settings_->refresh();
 }
 
+// Every settings control, the Omarchy theme watch and the plugin
+// installer land here, so it must be cheap when little has changed. Each
+// step decides for itself whether there is anything to do:
+//   - sidecar: restarts only when the shell.json it runs with changes
+//     (debounced), and publishes the plugin-row state only on a change;
+//   - notifyd: acquire/release and OSD sources are already idempotent;
+//   - takeover: shim, keybinds, idle, polkit and lock reclaim run only
+//     when quickshell_shutdown flips; the wallpaper redoes work only when
+//     its outputs, placement or fill colour change;
+//   - bars: geometry is re-sent only when anchor or size differ, and the
+//     More popup closes only when the layout lists actually changed.
+// What stays unconditional is cheap: list rebuild, surface reconcile,
+// one module tick (text under the new settings; the agents popup resizes
+// from it) and a redraw.
 void Bar::apply_config() {
+    timespec t0{};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     // Sidecar first: restore user shell.json before notifyd relaunches
     // a full Omarchy shell, and skip notifyd's kill while plugins run.
     qs_plugins_apply(*this);
-    qs_plugin_bar_watch(*this);
     qs_plugin_bar_publish(*this);
     if (notify_daemon()) notify_daemon()->apply_enabled();
     if (mattbar_shell()) mattbar_shell()->apply_takeover();
-    more_close();
+    const auto was_left = left, was_center = center, was_right = right,
+               was_more = more;
     rebuild_layout();
+    const bool layout_changed = left != was_left || center != was_center ||
+                                right != was_right || more != was_more;
+    if (layout_changed) more_close();
     // A settings change may have switched multi-monitor on/off, edited the
     // monitor list, or moved the primary: reconcile before re-geometry.
     sync_surfaces();
-    for (auto* bs : surfaces_) bs->apply_geometry();
-    update_tick();  // pick up a changed tick interval / revealed state
-    tick_modules(); // recompose module text under the new settings now
+    int resent = 0;
+    for (auto* bs : surfaces_) resent += bs->apply_geometry() ? 1 : 0;
+    update_tick();      // pick up a changed tick interval / revealed state
+    tick_after_apply(); // recompose module text under the new settings
     request_draw();
+    if (dbg()) {
+        timespec t1{};
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec - t0.tv_sec) * 1e3 +
+                    (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        DBG("apply_config: %.1f ms (layout %s, geometry re-sent on %d/%zu)",
+            ms, layout_changed ? "changed" : "same", resent,
+            surfaces_.size());
+    }
+}
+
+// A module tick is not free: several modules spawn a helper per tick
+// (wpctl for the mic, the dictation status script, ...). A hidden bar
+// normally schedules no ticks at all, yet every settings click ticked
+// every module. Leading + trailing edge: the first apply of a burst ticks
+// immediately (instant feedback), later ones only re-arm a short timer,
+// and one final tick runs once the clicks stop.
+void Bar::tick_after_apply() {
+    if (apply_tick_fd_ < 0) {
+        tick_modules();
+        return;
+    }
+    if (!apply_tick_armed_) {
+        tick_modules();
+        apply_tick_armed_ = true;
+        apply_tick_again_ = false;
+    } else {
+        apply_tick_again_ = true;
+    }
+    itimerspec ts{};
+    ts.it_value.tv_nsec = 250 * 1000000L;
+    timerfd_settime(apply_tick_fd_, 0, &ts, nullptr);
+}
+
+void Bar::save_config_soon() {
+    if (save_fd_ < 0) { // no timer: never lose a setting over it
+        cfg.save();
+        return;
+    }
+    save_pending_ = true;
+    itimerspec ts{};
+    ts.it_value.tv_nsec = 500 * 1000000L; // re-armed by every call
+    timerfd_settime(save_fd_, 0, &ts, nullptr);
+}
+
+void Bar::flush_config_save() {
+    if (!save_pending_) return;
+    save_pending_ = false;
+    if (save_fd_ >= 0) {
+        itimerspec off{};
+        timerfd_settime(save_fd_, 0, &off, nullptr);
+    }
+    cfg.save();
 }
 
 void Bar::setup_omarchy_theme_watch() {
@@ -1255,8 +1390,7 @@ void Bar::setup_omarchy_theme_watch() {
     if (inotify_add_watch(omarchy_inotify_fd_, dir.c_str(),
                           IN_CREATE | IN_MOVED_TO | IN_DELETE |
                               IN_CLOSE_WRITE) < 0) {
-        close(omarchy_inotify_fd_);
-        omarchy_inotify_fd_ = -1;
+        close_fd(omarchy_inotify_fd_);
         return;
     }
     add_fd(omarchy_inotify_fd_, [this](uint32_t) {
@@ -1331,7 +1465,7 @@ void Bar::route_click(int button) {
     // Observer sees every bar click (m may be null for dead space) so a
     // module can react to interaction elsewhere on the bar — e.g. the
     // agents dropdown dismissing itself.
-    if (click_observer_) click_observer_(m);
+    for (auto& f : click_observers_) f(m);
     auto mit = modules_.find("more");
     if (mit != modules_.end() && m != mit->second && more_is_open())
         more_close();
@@ -1381,12 +1515,11 @@ void BarSurface::draw() {
     // so no module code changes either way.
     const int bw = frac.active() ? frac.px(wi) : wi * sc;
     const int bh = frac.active() ? frac.px(hi) : hi * sc;
-    void* data = nullptr;
-    wl_buffer* buffer = create_argb_buffer(owner->shm(), bw, bh, &data);
-    if (!buffer) return;
+    ShmBuf* buf = pool.acquire(owner->shm(), bw, bh);
+    if (!buf) return;
 
     cairo_surface_t* cs = cairo_image_surface_create_for_data(
-        static_cast<unsigned char*>(data), CAIRO_FORMAT_ARGB32, bw, bh,
+        static_cast<unsigned char*>(buf->data), CAIRO_FORMAT_ARGB32, bw, bh,
         bw * 4);
     cairo_t* cr = cairo_create(cs);
     cairo_scale(cr, (double)bw / wi, (double)bh / hi);
@@ -1469,11 +1602,12 @@ void BarSurface::draw() {
     cairo_surface_destroy(cs);
 
     frac.apply(surf, w_, h_, sc); // viewport dest (fractional) or buffer scale
-    wl_surface_attach(surf, buffer, 0, 0);
+    wl_surface_attach(surf, buf->wl, 0, 0);
     if (wl_surface_get_version(surf) >= 4)
         wl_surface_damage_buffer(surf, 0, 0, bw, bh);
     else
         wl_surface_damage(surf, 0, 0, w_, h_);
+    gate.arm(surf);
     wl_surface_commit(surf);
 }
 
@@ -1490,6 +1624,23 @@ void Bar::request_stop() {
     }
 }
 
+namespace {
+uint64_t mono_ms() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+} // namespace
+
+void Bar::set_wl_want_out(bool on) {
+    if (on == wl_want_out_ || wl_fd_ < 0) return;
+    wl_want_out_ = on;
+    epoll_event ev{};
+    ev.events  = on ? (EPOLLIN | EPOLLOUT) : EPOLLIN;
+    ev.data.fd = wl_fd_;
+    epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, wl_fd_, &ev);
+}
+
 void Bar::flush_wayland() {
     while (wl_display_prepare_read(display_) != 0) {
         if (wl_display_dispatch_pending(display_) < 0) {
@@ -1499,11 +1650,39 @@ void Bar::flush_wayland() {
             return;
         }
     }
-    wl_display_flush(display_);
+    // A full socket (compositor busy or stopped) fails the flush with
+    // EAGAIN and leaves the rest queued. Wait for EPOLLOUT until it goes
+    // out, or it only leaves at the next unrelated wakeup — up to the
+    // 2 s watchdog slice, or never without a watchdog. Any other error is
+    // a dead connection, which the next read reports and handles.
+    if (wl_display_flush(display_) >= 0) {
+        if (wl_want_out_) {
+            const uint64_t d = mono_ms() - wl_stall_since_ms_;
+            wl_flush_stats_.last_stall_ms  = d;
+            wl_flush_stats_.worst_stall_ms =
+                std::max(wl_flush_stats_.worst_stall_ms, d);
+            wl_flush_stats_.stalled_now = false;
+            if (dbg())
+                fprintf(stderr, "mattbar: wayland: socket drained after "
+                        "%llu ms\n", (unsigned long long)d);
+            set_wl_want_out(false);
+        }
+    } else if (errno == EAGAIN) {
+        if (!wl_want_out_) {
+            ++wl_flush_stats_.stalls;
+            wl_flush_stats_.stalled_now = true;
+            wl_stall_since_ms_ = mono_ms();
+            if (dbg())
+                fprintf(stderr, "mattbar: wayland: socket full, waiting "
+                        "for it to drain\n");
+            set_wl_want_out(true);
+        }
+    }
 }
 
 void Bar::run() {
     const int wl_fd = wl_display_get_fd(display_);
+    wl_fd_          = wl_fd;
     epoll_event ev{};
     ev.events  = EPOLLIN;
     ev.data.fd = wl_fd;
@@ -1568,7 +1747,10 @@ void Bar::run() {
         }
         lock_flush();
         for (auto* bs : surfaces_) {
-            if (bs->dirty && bs->configured && !bs->awaiting_configure) {
+            // Frame-paced: while the last commit hasn't been shown yet the
+            // surface stays dirty and draws when its frame is done.
+            if (bs->dirty && bs->configured && !bs->awaiting_configure &&
+                bs->gate.ready()) {
                 bs->dirty = false;
                 bs->draw();
             }
@@ -1581,7 +1763,12 @@ void Bar::run() {
         // its very first iteration instead of waiting for a timer slot,
         // and a callback storm can never starve the ping for a full
         // budget.
-        int n = epoll_wait(epoll_fd_, evs, 16, wd_usec_ ? 2000 : -1);
+        int timeout = wd_usec_ ? 2000 : -1;
+        // A deferred draw whose frame callback never comes (monitor off,
+        // session locked) still runs once it goes stale.
+        const int ft = frame_gates_timeout_ms();
+        if (ft >= 0 && (timeout < 0 || ft < timeout)) timeout = ft;
+        int n = epoll_wait(epoll_fd_, evs, 16, timeout);
         // Capture errno before ping_watchdog()/clock_gettime. After
         // hibernate thaw, sd_notify can fail with EPERM and clobber a
         // real EINTR — we then exited, Hyprland kept the session lock,
@@ -1610,9 +1797,13 @@ void Bar::run() {
             break;
         }
 
+        // Writable alone is not readable: that wake only exists so the
+        // flush at the top of the loop runs now.
         bool wl_ready = false;
         for (int i = 0; i < n; ++i) {
-            if (evs[i].data.fd == wl_fd) wl_ready = true;
+            if (evs[i].data.fd == wl_fd &&
+                (evs[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)))
+                wl_ready = true;
             profiler_note_wake(evs[i].data.fd, wl_fd);
         }
 
@@ -1639,24 +1830,43 @@ void Bar::run() {
         lock_flush();
         profiler_report();
 
-        for (int i = 0; i < n; ++i) {
-            if (evs[i].data.fd == wl_fd) continue;
-            auto it = fd_cbs_.find(evs[i].data.fd);
-            if (it != fd_cbs_.end()) {
-                // Copy before invoking: a callback may remove_fd(itself)
-                // (e.g. a stream hitting EOF); calling through the map
-                // reference would destroy the std::function mid-execution.
-                auto cb = it->second;
-                cb(evs[i].events);
-            }
+        dispatch_fds(evs, n, wl_fd);
+        frame_gates_service();
+    }
+}
+
+void Bar::dispatch_fds(const epoll_event* evs, int n, int skip_fd) {
+    dispatching_ = true;
+    removed_in_batch_.clear();
+    for (int i = 0; i < n; ++i) {
+        const int fd = evs[i].data.fd;
+        if (fd == skip_fd) continue;
+        // Removed by an earlier callback in this batch: the event is for
+        // the old file, even if the number was re-registered since.
+        if (!removed_in_batch_.empty() &&
+            std::find(removed_in_batch_.begin(), removed_in_batch_.end(),
+                      fd) != removed_in_batch_.end())
+            continue;
+        auto it = fd_cbs_.find(fd);
+        if (it != fd_cbs_.end()) {
+            // Copy before invoking: a callback may remove_fd(itself) (e.g.
+            // a stream hitting EOF); calling through the map reference
+            // would destroy the std::function mid-execution.
+            auto cb = it->second;
+            cb(evs[i].events);
         }
     }
+    dispatching_ = false;
+    removed_in_batch_.clear();
 }
 
 void Bar::shutdown() {
     running_ = 0;
+    flush_config_save(); // a settings click in the last 500 ms still lands
+    local_llm_shutdown();
     idle_shutdown();
     qs_plugins_stop();
+    img_shutdown(); // join the decode worker before anything it feeds dies
     delete settings_;
     settings_ = nullptr;
     for (auto& [id, m] : modules_) delete m;
@@ -1694,6 +1904,9 @@ void Bar::shutdown() {
     if (cursor_shape_dev_) wp_cursor_shape_device_v1_destroy(cursor_shape_dev_);
     if (cursor_shape_mgr_) wp_cursor_shape_manager_v1_destroy(cursor_shape_mgr_);
     if (cursor_theme_) wl_cursor_theme_destroy(cursor_theme_);
+    // Pools and gates that outlive this point (file-scope popups) must
+    // not touch a proxy of a disconnected display.
+    g_wl_alive = false;
     if (display_) wl_display_disconnect(display_);
 }
 

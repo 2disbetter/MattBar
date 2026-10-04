@@ -1,13 +1,17 @@
 #include "shell.hpp"
 #include "bar.hpp"
 #include "config.hpp"
+#include "imgwork.hpp"
 #include "modules.hpp"
 #include "overlay.hpp"
 #include "popup.hpp"
+#include "spawn.hpp"
 #include "ui.hpp"
+#include "util.hpp"
 
 #include <dirent.h>
 #include <linux/input-event-codes.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -17,7 +21,12 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <unordered_set>
+#include <utility>
 #include <vector>
+#include <cstdint>
+#include <string>
+#include <cstdlib>
 
 namespace {
 
@@ -297,6 +306,29 @@ std::string parent_of(const std::string& id) {
     return d == std::string::npos ? std::string() : id.substr(0, d);
 }
 
+std::string expand_when_path(std::string p) {
+    p = trim(p);
+    if (p.size() >= 2 && ((p.front() == '"' && p.back() == '"') ||
+                          (p.front() == '\'' && p.back() == '\'')))
+        p = p.substr(1, p.size() - 2);
+    const char* home = getenv("HOME");
+    if (!home || !*home) return p;
+    if (p == "~" || p == "$HOME") return home;
+    if (p.rfind("~/", 0) == 0) return std::string(home) + p.substr(1);
+    if (p.rfind("$HOME", 0) == 0) return std::string(home) + p.substr(5);
+    return p;
+}
+
+bool when_ident(const std::string& s) {
+    if (s.empty()) return false;
+    for (unsigned char c : s) {
+        if (!(std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '+' ||
+              c == '@'))
+            return false;
+    }
+    return true;
+}
+
 struct DesktopApp {
     std::string name, exec, icon;
 };
@@ -367,9 +399,9 @@ std::string find_icon_png(const std::string& name) {
 }
 
 std::vector<Row> load_apps() {
-    std::vector<Row> rows;
-    const char* dirs[] = {"/usr/share/applications",
-                          "/usr/local/share/applications"};
+    // Desktop-file-id (filename) is unique. Walk low-precedence dirs
+    // first so ~/.local/share/applications overrides /usr/share.
+    std::map<std::string, Row> by_id;
     auto add_dir = [&](const std::string& dir) {
         DIR* d = opendir(dir.c_str());
         if (!d) return;
@@ -383,13 +415,18 @@ std::vector<Row> load_apps() {
             r.action   = a.exec;
             r.app_icon = a.icon;
             r.is_app   = true;
-            rows.push_back(std::move(r));
+            by_id[n]   = std::move(r);
         }
         closedir(d);
     };
+    const char* dirs[] = {"/usr/share/applications",
+                          "/usr/local/share/applications"};
     for (auto* d : dirs) add_dir(d);
     if (const char* h = getenv("HOME"))
         add_dir(std::string(h) + "/.local/share/applications");
+    std::vector<Row> rows;
+    rows.reserve(by_id.size());
+    for (auto& kv : by_id) rows.push_back(std::move(kv.second));
     std::sort(rows.begin(), rows.end(),
               [](const Row& a, const Row& b) { return a.label < b.label; });
     return rows;
@@ -435,6 +472,7 @@ public:
     void hide() override { close(); }
     bool is_open() const override { return host_.is_open(); }
     ~MenuOverlay() override {
+        for (uint64_t t : icon_jobs_) img_cancel(t);
         for (auto& [_, s] : icon_surfs_)
             if (s) cairo_surface_destroy(s);
     }
@@ -447,37 +485,167 @@ private:
     int row_h() const { return std::max(32, font_px() + 20); }
     int hdr_h() const { return std::max(40, font_px() + 28); }
 
+    // Icons are decoded on the image worker and kept at 3x the drawn size
+    // (HiDPI headroom), not at file size: /usr/share/pixmaps is searched
+    // first and is full of 256-512 px PNGs, a 1 MB surface each, kept for
+    // the life of the bar. A row draws without its icon for the few ms
+    // until the decode lands.
     cairo_surface_t* icon_surf(const std::string& name) {
         if (name.empty()) return nullptr;
         auto it = icon_surfs_.find(name);
         if (it != icon_surfs_.end()) return it->second;
         std::string path = find_icon_png(name);
-        cairo_surface_t* s = nullptr;
-        if (!path.empty()) {
-            s = cairo_image_surface_create_from_png(path.c_str());
-            if (cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
-                cairo_surface_destroy(s);
-                s = nullptr;
-            }
+        const int   edge = icon_px() * 3;
+        auto*       sh   = mattbar_shell();
+        if (path.empty() || !sh || !sh->bar()) {
+            return icon_surfs_[name] =
+                       path.empty() ? nullptr
+                                    : img_decode_now(path, {edge, edge, ImgTarget::Fit});
         }
-        icon_surfs_[name] = s;
-        return s;
+        icon_surfs_[name] = nullptr; // placeholder until the decode lands
+        icon_jobs_.push_back(img_submit(
+            *sh->bar(), {{path, {{edge, edge, ImgTarget::Fit}}}},
+            [this, name](ImgResult& r) {
+                cairo_surface_t*& slot = icon_surfs_[name];
+                if (slot) cairo_surface_destroy(slot);
+                slot = std::exchange(r.surfs[0][0], nullptr);
+                if (host_.is_open()) host_.redraw();
+            }));
+        return nullptr;
     }
+    std::vector<uint64_t> icon_jobs_;
     std::map<std::string, cairo_surface_t*> icon_surfs_;
     ov::Host  host_;
     TextField search_;
     std::vector<std::pair<std::string, MenuDef>> defs_order_;
     std::map<std::string, MenuDef> defs_;
     std::vector<Row> apps_;
+    std::unordered_set<std::string> pkgs_;
+    std::map<std::string, bool> cmd_ok_;
+    std::map<std::string, bool> when_ok_;
     std::string parent_;
     std::string filter_;
     std::vector<Row> rows_;
     int sel_ = 0, scroll_ = 0;
     bool holding_ = false;
 
+    bool cmd_present(const std::string& name) {
+        auto it = cmd_ok_.find(name);
+        if (it != cmd_ok_.end()) return it->second;
+        bool ok = false;
+        const char* path = getenv("PATH");
+        if (path && !name.empty() && name.find('/') == std::string::npos) {
+            std::string p = path;
+            size_t      i = 0;
+            for (;;) {
+                size_t      j   = p.find(':', i);
+                std::string dir = p.substr(
+                    i, j == std::string::npos ? std::string::npos : j - i);
+                if (!dir.empty() &&
+                    access((dir + "/" + name).c_str(), X_OK) == 0) {
+                    ok = true;
+                    break;
+                }
+                if (j == std::string::npos) break;
+                i = j + 1;
+            }
+        }
+        cmd_ok_[name] = ok;
+        return ok;
+    }
+
+    void refresh_pkgs() {
+        pkgs_.clear();
+        int         st  = -1;
+        std::string out = cmd_output("pacman -Qq 2>/dev/null", &st, 1000);
+        std::istringstream iss(out);
+        std::string        line;
+        while (std::getline(iss, line)) {
+            line = trim(line);
+            if (!line.empty()) pkgs_.insert(std::move(line));
+        }
+    }
+
+    bool eval_when_fast(std::string w, bool* ok) {
+        w = trim(w);
+        if (w.empty()) return false;
+        if (w[0] == '!') {
+            bool inner = false;
+            if (!eval_when_fast(trim(w.substr(1)), &inner)) return false;
+            *ok = !inner;
+            return true;
+        }
+        auto amp = w.find(" && ");
+        if (amp != std::string::npos) {
+            bool a = false, b = false;
+            if (!eval_when_fast(w.substr(0, amp), &a) ||
+                !eval_when_fast(w.substr(amp + 4), &b))
+                return false;
+            *ok = a && b;
+            return true;
+        }
+        if (w.rfind("omarchy-pkg-present ", 0) == 0) {
+            std::string name = trim(w.substr(20));
+            if (!when_ident(name)) return false;
+            *ok = pkgs_.count(name) != 0;
+            return true;
+        }
+        if (w.rfind("omarchy-cmd-present ", 0) == 0) {
+            std::string name = trim(w.substr(20));
+            if (!when_ident(name)) return false;
+            *ok = cmd_present(name);
+            return true;
+        }
+        if (w.size() >= 4 && w.rfind("[[", 0) == 0 &&
+            w.compare(w.size() - 2, 2, "]]") == 0) {
+            std::string inner = trim(w.substr(2, w.size() - 4));
+            bool        neg   = false;
+            if (!inner.empty() && inner[0] == '!') {
+                neg   = true;
+                inner = trim(inner.substr(1));
+            }
+            int kind = 0;
+            if (inner.rfind("-f ", 0) == 0) kind = 1;
+            else if (inner.rfind("-d ", 0) == 0) kind = 2;
+            else if (inner.rfind("-x ", 0) == 0) kind = 3;
+            else return false;
+            std::string path = expand_when_path(inner.substr(3));
+            if (path.empty()) return false;
+            struct stat st {};
+            bool        hit = false;
+            if (kind == 1)
+                hit = ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+            else if (kind == 2)
+                hit = ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+            else
+                hit = access(path.c_str(), X_OK) == 0;
+            *ok = neg ? !hit : hit;
+            return true;
+        }
+        return false;
+    }
+
+    bool when_passes(const std::string& when) {
+        if (when.empty()) return true;
+        auto it = when_ok_.find(when);
+        if (it != when_ok_.end()) return it->second;
+        bool ok = false;
+        if (!eval_when_fast(when, &ok)) {
+            int st = -1;
+            cmd_output("bash -c " + sh_quote(when) + " >/dev/null 2>&1", &st,
+                       150);
+            ok = st == 0;
+        }
+        when_ok_[when] = ok;
+        return ok;
+    }
+
     void load() {
         defs_.clear();
         defs_order_.clear();
+        when_ok_.clear();
+        cmd_ok_.clear();
+        refresh_pkgs();
         auto stock = omarchy_path() + "/default/omarchy/omarchy-menu.jsonc";
         auto user  = omarchy_path() + "/config/omarchy/omarchy-menu.jsonc";
         if (access((std::string(getenv("HOME") ? getenv("HOME") : "") +
@@ -521,10 +689,11 @@ private:
         for (auto& a : apps_) a.is_app = true;
     }
 
-    std::vector<Row> children_of(const std::string& parent) const {
+    std::vector<Row> children_of(const std::string& parent) {
         std::vector<Row> rows;
         for (auto& [id, d] : defs_order_) {
             if (parent_of(id) != parent) continue;
+            if (!when_passes(d.when)) continue;
             Row r;
             r.id        = id;
             r.icon      = d.icon;
@@ -600,7 +769,10 @@ private:
                 r.provider  = d.provider;
                 r.submenu   = r.action.empty() || !d.provider.empty();
                 r.detail    = parent_of(id);
-                consider(std::move(r));
+                if (!matches(r, q)) continue;
+                if (!when_passes(d.when)) continue;
+                r.score = search_score(r, q);
+                rows_.push_back(std::move(r));
             }
             if (active.empty() || active == "apps") {
                 for (auto& a : apps_) consider(a);

@@ -35,7 +35,7 @@ void apply_temp(int temp) {
              "grep -oE '[0-9]+' | head -n1); "
              "[ \"$t\" = \"%d\" ] && break; sleep 0.2; done",
              temp, temp);
-    spawn_detached(cmd);
+    spawn_helper(cmd);
 }
 
 void ingest(const std::string& out) {

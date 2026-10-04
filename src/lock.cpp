@@ -1,3 +1,4 @@
+#include "spawn.hpp"
 #include "lock.hpp"
 #include "bar.hpp"
 #include "config.hpp"
@@ -15,6 +16,7 @@
 #include <cairo/cairo.h>
 #include <pwd.h>
 #include <security/pam_appl.h>
+#include <fcntl.h>
 #include <csignal>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
@@ -31,6 +33,7 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <cstdint>
 
 namespace {
 
@@ -41,6 +44,7 @@ int  g_blank_fd   = -1;
 bool g_display_off = false;
 bool g_blank_reassert = false;
 uint64_t g_blank_armed_ms = 0;
+int      g_blank_delay_s  = 5;
 uint64_t g_wake_grace_until = 0;
 bool g_locked = false;
 bool g_busy   = false;
@@ -53,6 +57,8 @@ void redraw_lock();
 void drain_blank();
 void wake_display();
 void arm_blank();
+void arm_blank_in(int s);
+uint64_t now_ms_lock();
 
 int on_prepare_for_sleep(sd_bus_message* m, void*, sd_bus_error*) {
     int entering = 0;
@@ -74,17 +80,22 @@ int on_prepare_for_sleep(sd_bus_message* m, void*, sd_bus_error*) {
     }
     // Hibernate restore and suspend thaw: firmware may leave DPMS off
     // and a pending blank timer may already be readable. Wake first,
-    // then paint, then start a fresh blank countdown.
-    g_sleeping         = false;
-    g_blank_reassert   = false;
-    g_wake_grace_until = 0;
+    // then paint, then hold the panel lit (lock_wake_blank_s) so DPMS
+    // pointer noise does not immediately blank again.
+    g_sleeping       = false;
+    g_blank_reassert = false;
     drain_blank();
     g_display_off = true;
     wake_display();
     lock_sync_outputs();
     redraw_lock();
     lock_reclaim();
-    if (g_locked && !g_busy) arm_blank();
+    {
+        int hold = cfg.lock_wake_blank_s > 0 ? cfg.lock_wake_blank_s
+                                             : cfg.idle_blank_s;
+        g_wake_grace_until = now_ms_lock() + (uint64_t)std::max(1, hold) * 1000ull;
+        if (g_locked && !g_busy) arm_blank_in(hold);
+    }
     idle_apply();
     if (g_bar) g_bar->ping_watchdog();
     return 0;
@@ -133,23 +144,26 @@ void drain_blank() {
     while (read(g_blank_fd, &x, sizeof x) > 0) {}
 }
 
-void arm_blank() {
+void arm_blank_in(int s) {
     if (g_blank_fd < 0 || !g_locked) return;
-    if (cfg.idle_blank_s <= 0) {
+    if (s <= 0) {
         disarm_blank();
         return;
     }
     g_blank_reassert = false;
+    g_blank_delay_s  = s;
     g_blank_armed_ms = now_ms_lock();
     itimerspec ts{};
-    ts.it_value.tv_sec = cfg.idle_blank_s;
+    ts.it_value.tv_sec = s;
     timerfd_settime(g_blank_fd, 0, &ts, nullptr);
 }
+
+void arm_blank() { arm_blank_in(cfg.idle_blank_s); }
 
 void do_blank(bool reassert) {
     fprintf(stderr, "mattbar: lock: blanking display%s\n",
             reassert ? " (settle)" : "");
-    spawn_detached("omarchy-brightness-keyboard off; "
+    spawn_helper("omarchy-brightness-keyboard off; "
                    "omarchy-brightness-display off");
     g_display_off       = true;
     if (auto* nd = notify_daemon()) nd->refresh_popups();
@@ -171,21 +185,31 @@ void do_blank(bool reassert) {
 
 void wake_display() {
     if (g_display_off) {
-        spawn_detached("omarchy-system-wake");
+        spawn_helper("omarchy-system-wake");
         g_display_off = false;
     }
 }
 
 void note_activity(NoteSrc src) {
     uint64_t now = now_ms_lock();
+    // Modeset / DPMS-on synthesizes pointer motion. Swallow it for the
+    // post-wake hold so the lock screen does not blank immediately.
     if (src == NoteMotion && now < g_wake_grace_until) return;
-    g_wake_grace_until = 0;
-    g_blank_reassert   = false;
+    g_blank_reassert = false;
     bool was_off = g_display_off;
     wake_display();
     if (was_off)
         if (auto* nd = notify_daemon()) nd->refresh_popups();
-    if (g_locked && !g_busy) arm_blank();
+    if (g_locked && !g_busy) {
+        if (now < g_wake_grace_until) {
+            int left = (int)((g_wake_grace_until - now + 999) / 1000);
+            if (left < 1) left = 1;
+            arm_blank_in(left);
+        } else {
+            g_wake_grace_until = 0;
+            arm_blank();
+        }
+    }
 }
 
 void disarm_reclaim() {
@@ -273,6 +297,7 @@ void unlock();
 void start_fingerprint();
 void stop_fingerprint();
 void ensure_waiter();
+void arm_waiter(bool on);
 
 bool fingerprint_pam_present() {
     return access("/etc/pam.d/omarchy-lock-fingerprint", R_OK) == 0;
@@ -371,6 +396,7 @@ void start_fingerprint() {
     }
     pid_t pid = fork();
     if (pid == 0) {
+        child_reset_signals(); // never run MattBar's SIGTERM handler here
         pam_handle_t* pamh = nullptr;
         pam_conv conv{fp_conv_cb, nullptr};
         int rc = pam_start("omarchy-lock-fingerprint", user.c_str(), &conv, &pamh);
@@ -382,10 +408,28 @@ void start_fingerprint() {
     if (pid < 0) return;
     g_fp_killed = false;
     g_fp_pid    = pid;
+    ensure_waiter(); // (re)arm the reaper for this child
+}
+
+// The 50 ms reaper only runs while a PAM or fingerprint child is pending.
+// It used to be armed at startup and tick forever: 20 wakeups a second
+// for the whole session, locked or not.
+void arm_waiter(bool on) {
+    if (g_wait_fd < 0) return;
+    itimerspec ts{};
+    if (on) {
+        ts.it_interval.tv_nsec = 50 * 1000000L;
+        ts.it_value.tv_nsec    = 50 * 1000000L;
+    }
+    timerfd_settime(g_wait_fd, 0, &ts, nullptr);
 }
 
 void ensure_waiter() {
-    if (g_wait_fd >= 0 || !g_bar) return;
+    if (!g_bar) return;
+    if (g_wait_fd >= 0) {
+        if (g_pam_pid > 0 || g_fp_pid > 0) arm_waiter(true);
+        return;
+    }
     g_wait_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     if (g_wait_fd < 0) return;
     g_bar->add_fd(
@@ -421,12 +465,10 @@ void ensure_waiter() {
                     }
                 }
             }
+            if (g_pam_pid <= 0 && g_fp_pid <= 0) arm_waiter(false);
         },
         "lock-pam");
-    itimerspec ts{};
-    ts.it_interval.tv_nsec = 50 * 1000000L;
-    ts.it_value.tv_nsec    = 50 * 1000000L;
-    timerfd_settime(g_wait_fd, 0, &ts, nullptr);
+    arm_waiter(g_pam_pid > 0 || g_fp_pid > 0);
 }
 
 void start_pam() {
@@ -439,9 +481,10 @@ void start_pam() {
         return;
     }
     int p[2];
-    if (pipe(p) != 0) return;
+    if (pipe2(p, O_CLOEXEC) != 0) return;
     pid_t pid = fork();
     if (pid == 0) {
+        child_reset_signals(); // never run MattBar's SIGTERM handler here
         close(p[1]);
         std::string pw;
         char buf[256];
@@ -1012,7 +1055,7 @@ void lock_init(Bar& bar) {
                     // (Date.now() - armedAt > interval + 2000) → re-arm.
                     uint64_t age = now_ms_lock() - g_blank_armed_ms;
                     uint64_t lim =
-                        (uint64_t)std::max(1, cfg.idle_blank_s) * 1000ull +
+                        (uint64_t)std::max(1, g_blank_delay_s) * 1000ull +
                         2000ull;
                     if (age > lim) {
                         arm_blank();
@@ -1142,7 +1185,9 @@ static bool compositor_holds_lock() {
     // logind LockedHint drops when our lock client dies. Hyprland keeps
     // the session locked (solitaryBlockedBy contains LOCK) until a new
     // client takes over — same signal omarchy-hyprland-session-locked uses.
-    std::string j = cmd_output("hyprctl -j monitors 2>/dev/null");
+    // Bounded socket request instead of popen(hyprctl): this runs from the
+    // resume handler, exactly when Hyprland is slowest to answer.
+    std::string j = hypr_query("j/monitors");
     size_t p = 0;
     while ((p = j.find("solitaryBlockedBy", p)) != std::string::npos) {
         size_t e = j.find(']', p);
@@ -1158,6 +1203,9 @@ static bool session_locked_hint() {
     if (!sid || !*sid) return false;
     sd_bus* b = nullptr;
     if (sd_bus_open_system(&b) < 0) return false;
+    // sd-bus defaults to 25 s. This runs in the post-resume window, when
+    // logind is slowest, before the resume handler pings the watchdog.
+    sd_bus_set_method_call_timeout(b, 1000 * 1000ULL);
     char* path = nullptr;
     if (sd_bus_path_encode("/org/freedesktop/login1/session", sid, &path) < 0) {
         sd_bus_unref(b);
@@ -1184,7 +1232,13 @@ void lock_reclaim() {
         disarm_reclaim();
         return;
     }
-    if (!g_lock && (session_locked_hint() || compositor_holds_lock())) {
+    bool held = !g_lock && session_locked_hint();
+    if (g_bar) g_bar->ping_watchdog();
+    if (!g_lock && !held) {
+        held = compositor_holds_lock();
+        if (g_bar) g_bar->ping_watchdog();
+    }
+    if (held) {
         fprintf(stderr,
                 "mattbar: lock: session already locked; reclaiming surfaces\n");
         lock_now();

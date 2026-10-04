@@ -25,6 +25,9 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <cstdint>
+#include <cstdlib>
+#include <cmath>
 
 namespace {
 
@@ -669,7 +672,7 @@ constexpr int N_ACTS = 4;
 class PowerModule : public Module {
 public:
     ~PowerModule() override {
-        if (retry_fd_ >= 0) close(retry_fd_);
+        Bar::close_fd(retry_fd_);
     }
 
     // Without power-profiles-daemon the module either hides (actions off:
@@ -694,8 +697,11 @@ public:
         bar.add_fd(retry_fd_, [this](uint32_t) {
             uint64_t n;
             while (read(retry_fd_, &n, sizeof n) > 0) {}
-            if (!bus_ && setup_bus()) attempts_ = 0;
-            else if (!bus_) schedule_retry("system bus still unavailable");
+            if (bus_) {
+                if (!ep_) start_probe(); // daemon was slow; ask again
+            } else if (!setup_bus()) {
+                schedule_retry("system bus still unavailable");
+            }
         }, "ppd-retry");
         if (!setup_bus()) schedule_retry(nullptr);
     }
@@ -761,6 +767,10 @@ public:
 
 private:
     // ---- D-Bus -----------------------------------------------------------
+    // Everything here is asynchronous. The old synchronous probe had a
+    // 500 ms cap; at login power-profiles-daemon is often still being
+    // D-Bus-activated, the probe timed out, and the module stayed hidden
+    // for the whole session. Replies now get 5 s and never block the loop.
     bool setup_bus() {
         sd_bus* b = nullptr;
         if (sd_bus_open_system(&b) < 0) {
@@ -768,112 +778,193 @@ private:
             return false;
         }
         bus_ = b;
-        sd_bus_set_method_call_timeout(bus_, 500 * 1000ULL);
+        sd_bus_set_method_call_timeout(bus_, 5 * 1000 * 1000ULL);
         pump_.attach(*bar_, bus_, "ppd");
-        // Probe the two interface generations; whichever answers wins.
-        for (auto& e : PPD) {
-            if (read_active(e)) {
-                ep_ = &e;
-                break;
+        start_probe();
+        return true;
+    }
+
+    void start_probe() {
+        ep_              = nullptr;
+        probe_           = 0;
+        probe_timed_out_ = false;
+        probe_next();
+        pump_.process();
+    }
+
+    // Try the two interface generations in order; whichever answers wins.
+    void probe_next() {
+        if (!bus_) return;
+        if (probe_ >= (int)(sizeof PPD / sizeof PPD[0])) {
+            if (probe_timed_out_) { // daemon slow (activation), not absent
+                schedule_retry("power-profiles-daemon did not answer");
+                return;
             }
-        }
-        if (!ep_) {
             fprintf(stderr,
                     "mattbar: power: power-profiles-daemon not present; "
                     "module hidden\n");
-            return true; // bus is fine; the daemon just isn't there
+            return;
         }
-        read_profiles();
+        const PpdEndpoint& e = PPD[probe_];
+        sd_bus_call_method_async(bus_, nullptr, e.dest, e.path,
+                                 "org.freedesktop.DBus.Properties", "Get",
+                                 on_probe, this, "ss", e.iface,
+                                 "ActiveProfile");
+    }
+
+    static bool is_timeout(sd_bus_message* m) {
+        const sd_bus_error* err = sd_bus_message_get_error(m);
+        return err && sd_bus_error_has_name(err, SD_BUS_ERROR_NO_REPLY);
+    }
+
+    static int on_probe(sd_bus_message* m, void* ud, sd_bus_error*) {
+        auto*       self = static_cast<PowerModule*>(ud);
+        const char* v    = nullptr;
+        if (sd_bus_message_is_method_error(m, nullptr) ||
+            sd_bus_message_read(m, "v", "s", &v) < 0 || !v) {
+            if (is_timeout(m)) self->probe_timed_out_ = true;
+            ++self->probe_;
+            self->probe_next();
+            return 0;
+        }
+        self->ep_      = &PPD[self->probe_];
+        self->attempts_ = 0;
+        self->set_active(v);
         std::string match =
-            std::string("type='signal',sender='") + ep_->dest + "',path='" +
-            ep_->path +
+            std::string("type='signal',sender='") + self->ep_->dest +
+            "',path='" + self->ep_->path +
             "',interface='org.freedesktop.DBus.Properties',member='"
             "PropertiesChanged'";
-        sd_bus_add_match(bus_, nullptr, match.c_str(), on_props, this);
-        pump_.process();
-        PDBG("power: %s, active=%s", ep_->iface, active_.c_str());
-        return true;
+        sd_bus_add_match(self->bus_, nullptr, match.c_str(), on_props, self);
+        self->read_profiles();
+        PDBG("power: %s, active=%s", self->ep_->iface, self->active_.c_str());
+        return 0;
     }
 
-    bool read_active(const PpdEndpoint& e) {
-        if (!bus_) return false;
-        sd_bus_error err = SD_BUS_ERROR_NULL;
-        char*        v   = nullptr;
-        int r = sd_bus_get_property_string(bus_, e.dest, e.path, e.iface,
-                                           "ActiveProfile", &err, &v);
-        sd_bus_error_free(&err);
-        if (r < 0 || !v) return false;
-        std::string s = v;
-        free(v);
-        if (s != active_) {
-            active_ = s;
-            if (bar_) bar_->request_draw();
-        }
-        return true;
+    void set_active(const std::string& s) {
+        if (s == active_) return;
+        active_ = s;
+        if (bar_) bar_->request_draw();
+        if (panel_.open()) redraw();
     }
 
-    void read_profiles() {
-        profiles_.clear();
+    void read_active_async() {
         if (!bus_ || !ep_) return;
-        sd_bus_error    err = SD_BUS_ERROR_NULL;
-        sd_bus_message* m   = nullptr;
-        if (sd_bus_get_property(bus_, ep_->dest, ep_->path, ep_->iface,
-                                "Profiles", &err, &m, "aa{sv}") >= 0 &&
-            m) {
-            if (sd_bus_message_enter_container(m, 'a', "a{sv}") > 0) {
-                while (sd_bus_message_enter_container(m, 'a', "{sv}") > 0) {
-                    while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
-                        const char* k = nullptr;
-                        sd_bus_message_read(m, "s", &k);
-                        if (k && !strcmp(k, "Profile")) {
-                            const char* v = nullptr;
-                            if (sd_bus_message_enter_container(m, 'v', "s") >
-                                0) {
-                                sd_bus_message_read(m, "s", &v);
-                                sd_bus_message_exit_container(m);
-                                if (v) profiles_.push_back(v);
-                            } else {
-                                sd_bus_message_skip(m, "v");
-                            }
-                        } else {
-                            sd_bus_message_skip(m, "v");
-                        }
-                        sd_bus_message_exit_container(m);
+        sd_bus_call_method_async(bus_, nullptr, ep_->dest, ep_->path,
+                                 "org.freedesktop.DBus.Properties", "Get",
+                                 on_active, this, "ss", ep_->iface,
+                                 "ActiveProfile");
+    }
+    static int on_active(sd_bus_message* m, void* ud, sd_bus_error*) {
+        auto*       self = static_cast<PowerModule*>(ud);
+        const char* v    = nullptr;
+        if (!sd_bus_message_is_method_error(m, nullptr) &&
+            sd_bus_message_read(m, "v", "s", &v) >= 0 && v)
+            self->set_active(v);
+        return 0;
+    }
+
+    // Parses an aa{sv} (positioned at the outer array) into profiles_.
+    void parse_profiles(sd_bus_message* m) {
+        profiles_.clear();
+        if (sd_bus_message_enter_container(m, 'a', "a{sv}") > 0) {
+            while (sd_bus_message_enter_container(m, 'a', "{sv}") > 0) {
+                while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
+                    const char* k = nullptr;
+                    sd_bus_message_read(m, "s", &k);
+                    const char* v = nullptr;
+                    if (k && !strcmp(k, "Profile") &&
+                        sd_bus_message_read(m, "v", "s", &v) >= 0) {
+                        if (v) profiles_.push_back(v);
+                    } else {
+                        sd_bus_message_skip(m, "v");
                     }
                     sd_bus_message_exit_container(m);
                 }
                 sd_bus_message_exit_container(m);
             }
-            sd_bus_message_unref(m);
+            sd_bus_message_exit_container(m);
         }
-        sd_bus_error_free(&err);
         if (profiles_.empty()) // daemon answered but told us nothing useful
             profiles_ = {"power-saver", "balanced", "performance"};
+        if (panel_.open()) redraw();
+    }
+
+    void read_profiles() {
+        if (!bus_ || !ep_) return;
+        sd_bus_call_method_async(bus_, nullptr, ep_->dest, ep_->path,
+                                 "org.freedesktop.DBus.Properties", "Get",
+                                 on_profiles, this, "ss", ep_->iface,
+                                 "Profiles");
+    }
+    static int on_profiles(sd_bus_message* m, void* ud, sd_bus_error*) {
+        auto* self = static_cast<PowerModule*>(ud);
+        if (sd_bus_message_is_method_error(m, nullptr)) {
+            if (self->profiles_.empty())
+                self->profiles_ = {"power-saver", "balanced", "performance"};
+            return 0;
+        }
+        if (sd_bus_message_enter_container(m, 'v', "aa{sv}") > 0) {
+            self->parse_profiles(m);
+            sd_bus_message_exit_container(m);
+        }
+        return 0;
     }
 
     void set_profile(const std::string& p) {
         if (!bus_ || !ep_ || p == active_) return;
-        sd_bus_error err = SD_BUS_ERROR_NULL;
-        int r = sd_bus_set_property(bus_, ep_->dest, ep_->path, ep_->iface,
-                                    "ActiveProfile", &err, "s", p.c_str());
-        if (r < 0)
-            fprintf(stderr, "mattbar: power: cannot set %s (%s)\n", p.c_str(),
-                    err.message ? err.message : "no detail");
-        sd_bus_error_free(&err);
+        sd_bus_call_method_async(bus_, nullptr, ep_->dest, ep_->path,
+                                 "org.freedesktop.DBus.Properties", "Set",
+                                 on_set, this, "ssv", ep_->iface,
+                                 "ActiveProfile", "s", p.c_str());
         pump_.process();
-        // Optimistic update; PropertiesChanged confirms (or corrects) it.
-        if (r >= 0) {
-            active_ = p;
-            persist_power_profile(p);
-            bar_->request_draw();
-            if (panel_.open()) redraw();
+        // Optimistic update; PropertiesChanged confirms it, and a failed
+        // Set re-reads the real value (on_set).
+        active_ = p;
+        persist_power_profile(p);
+        bar_->request_draw();
+        if (panel_.open()) redraw();
+    }
+    static int on_set(sd_bus_message* m, void* ud, sd_bus_error*) {
+        auto* self = static_cast<PowerModule*>(ud);
+        if (sd_bus_message_is_method_error(m, nullptr)) {
+            const sd_bus_error* e = sd_bus_message_get_error(m);
+            fprintf(stderr, "mattbar: power: cannot set profile (%s)\n",
+                    e && e->message ? e->message : "no detail");
+            self->read_active_async();
         }
+        return 0;
     }
 
-    static int on_props(sd_bus_message*, void* ud, sd_bus_error*) {
-        auto* self = static_cast<PowerModule*>(ud);
-        if (self->ep_) self->read_active(*self->ep_);
-        if (self->panel_.open()) self->redraw();
+    // PropertiesChanged carries the new values; no round-trip needed unless
+    // the property was only invalidated.
+    static int on_props(sd_bus_message* m, void* ud, sd_bus_error*) {
+        auto*       self  = static_cast<PowerModule*>(ud);
+        const char* iface = nullptr;
+        bool        got   = false;
+        if (sd_bus_message_read(m, "s", &iface) >= 0 &&
+            sd_bus_message_enter_container(m, 'a', "{sv}") > 0) {
+            while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
+                const char* k = nullptr;
+                sd_bus_message_read(m, "s", &k);
+                const char* v = nullptr;
+                if (k && !strcmp(k, "ActiveProfile") &&
+                    sd_bus_message_read(m, "v", "s", &v) >= 0 && v) {
+                    self->set_active(v);
+                    got = true;
+                } else if (k && !strcmp(k, "Profiles") &&
+                           sd_bus_message_enter_container(m, 'v', "aa{sv}") >
+                               0) {
+                    self->parse_profiles(m);
+                    sd_bus_message_exit_container(m);
+                } else {
+                    sd_bus_message_skip(m, "v");
+                }
+                sd_bus_message_exit_container(m);
+            }
+            sd_bus_message_exit_container(m);
+        }
+        if (!got) self->read_active_async();
         return 0;
     }
 
@@ -1063,6 +1154,8 @@ private:
     std::string              active_;
     std::vector<std::string> profiles_;
     int                      retry_fd_ = -1, attempts_ = 0;
+    int                      probe_ = 0;
+    bool                     probe_timed_out_ = false;
     PopupPlace               place_{};
     wl_output*               out_ = nullptr;
     int                      pending_ = -1; // armed confirm row, or -1

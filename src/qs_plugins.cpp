@@ -1,3 +1,4 @@
+#include "spawn.hpp"
 #include "qs_plugins.hpp"
 #include "config.hpp"
 #include "modules.hpp"
@@ -28,6 +29,9 @@
 #include <cstring>
 #include <fstream>
 #include <vector>
+#include <cstdint>
+#include <string>
+#include <utility>
 
 #ifndef DBG
 #define DBG(...)                                                              \
@@ -45,6 +49,10 @@ std::vector<QsPlugin> g_catalog;
 pid_t                 g_pid       = -1;
 Bar*                  g_bar       = nullptr;
 bool                  g_json_ours = false;
+// shell.json as the running sidecar read it at startup. Omarchy's shell
+// disables its file watcher, so a changed shell.json needs a restart —
+// and an unchanged one must not get one (every settings click used to).
+std::string           g_running_json;
 uint64_t              g_restart_ms = 0;
 int                   g_fail_streak = 0;
 // Lazy chip session: sidecar is up because the user summoned a plugin
@@ -569,6 +577,9 @@ static bool write_atomic(const std::string& path, const std::string& body) {
 static int  g_hover_ifd = -1;
 static int  g_hover_wd  = -1;
 static bool g_hover_on  = false;
+// Last plugin-row state written; the QML side reloads on every write, and
+// publish runs on each reveal/hide and settings apply.
+static std::string g_published;
 
 static void read_hover_and_apply() {
     if (!g_bar) return;
@@ -584,6 +595,7 @@ void qs_plugin_bar_publish(Bar& bar) {
     std::string path = plugin_bar_state_path();
     if (path.empty()) return;
     if (!qs_plugin_bar_want()) {
+        g_published.clear();
         unlink(path.c_str());
         unlink(plugin_bar_hover_path().c_str());
         if (g_hover_on) {
@@ -603,7 +615,8 @@ void qs_plugin_bar_publish(Bar& bar) {
              cfg.c_fg.r, cfg.c_fg.g, cfg.c_fg.b, cfg.c_fg.a,
              cfg.c_bg.r, cfg.c_bg.g, cfg.c_bg.b, cfg.c_bg.a,
              cfg.c_urgent.r, cfg.c_urgent.g, cfg.c_urgent.b, cfg.c_urgent.a);
-    write_atomic(path, buf);
+    if (g_published == buf && access(path.c_str(), F_OK) == 0) return;
+    if (write_atomic(path, buf)) g_published = buf;
 }
 
 void qs_plugin_bar_watch(Bar& bar) {
@@ -657,6 +670,7 @@ void qs_plugin_bar_watch(Bar& bar) {
 void qs_plugin_bar_clear() {
     if (g_hover_on && g_bar) g_bar->set_plugin_row_hover(false);
     g_hover_on = false;
+    g_published.clear();
     g_hover_wd = -1;
     unlink(plugin_bar_state_path().c_str());
     unlink(plugin_bar_hover_path().c_str());
@@ -769,7 +783,9 @@ static bool install_sidecar_json() {
                 "missing; refusing to overwrite shell.json\n");
         return false;
     }
-    if (!write_file(shell_json_path(), sidecar_json())) return false;
+    const std::string js = sidecar_json();
+    if (!g_json_ours || slurp(shell_json_path()) != js)
+        if (!write_file(shell_json_path(), js)) return false;
     g_json_ours = true;
     return true;
 }
@@ -805,7 +821,32 @@ static void kill_any_qs() {
                                      omarchy_shell_path() +
                                      "' --any-display >/dev/null 2>&1 || true");
     int st = 0;
-    cmd_output(cmd, &st);
+    // Stop path (plugins turned off, shutdown): kept synchronous so the kill
+    // lands before notifyd may relaunch the full Omarchy shell, but bounded.
+    cmd_output(cmd, &st, 5000);
+}
+
+// Apply path: every settings change with plugins on landed here, and the
+// power-profile wrapper's `sleep 1` froze the whole bar for over a second
+// each time. Async now; the sidecar is spawned when the kill has finished
+// (spawning first would let `quickshell kill --any-display` hit it).
+static AsyncCmd g_qs_kill;
+static bool     g_spawn_after_kill = false;
+static bool spawn_sidecar();
+static void kill_any_qs_then_spawn() {
+    kill_pid();
+    g_spawn_after_kill = true;
+    if (!g_bar) return;
+    if (g_qs_kill.running()) return; // its completion spawns (coalesced)
+    std::string cmd =
+        with_preserved_power_profile("quickshell kill -p '" +
+                                     omarchy_shell_path() +
+                                     "' --any-display >/dev/null 2>&1 || true");
+    g_qs_kill.run(*g_bar, cmd, [](const std::string&, int) {
+        if (!g_spawn_after_kill) return;
+        g_spawn_after_kill = false;
+        if (qs_plugins_want_runtime() && g_pid <= 0) spawn_sidecar();
+    }, 10000);
 }
 
 static bool spawn_sidecar() {
@@ -815,6 +856,7 @@ static bool spawn_sidecar() {
     pid_t pid = fork();
     if (pid < 0) return false;
     if (pid == 0) {
+        child_reset_signals(); // Qt must not start with SIGPIPE ignored
         prctl(PR_SET_PDEATHSIG, SIGTERM);
         if (getppid() == 1) _exit(1);
         const char* om = getenv("OMARCHY_PATH");
@@ -825,7 +867,8 @@ static bool spawn_sidecar() {
                omarchy_shell_path().c_str(), (char*)nullptr);
         _exit(127);
     }
-    g_pid = pid;
+    g_pid          = pid;
+    g_running_json = slurp(shell_json_path());
     fprintf(stderr,
             "mattbar: qs-plugins: sidecar started pid=%d bar=%s\n",
             (int)pid,
@@ -836,9 +879,10 @@ static bool spawn_sidecar() {
 }
 
 static bool lazy_plugin_layer_up() {
-    int st = 0;
-    std::string j = cmd_output("hyprctl -j layers 2>/dev/null", &st);
-    if (st != 0 || j.empty()) return false;
+    // Runs every tick during a lazy session: a bounded socket request,
+    // not a hyprctl fork+exec per second.
+    std::string j = hypr_query("j/layers");
+    if (j.empty()) return false;
     // Any layer-shell namespace that isn't MattBar / our plugin-row /
     // compositor chrome is treated as a live plugin overlay.
     size_t p = 0;
@@ -910,7 +954,53 @@ void qs_plugins_reap() {
     if (install_sidecar_json()) spawn_sidecar();
 }
 
+// A running sidecar whose shell.json changed is restarted once the
+// settings have been still for a moment: reordering plugins or ticking
+// several checkboxes used to restart Quickshell (a Qt start-up) per click.
+static int g_restart_fd = -1;
+
+static void cancel_sidecar_restart() {
+    if (g_restart_fd < 0) return;
+    itimerspec off{};
+    timerfd_settime(g_restart_fd, 0, &off, nullptr);
+}
+
+static void restart_sidecar_if_stale() {
+    if (g_pid <= 0 || !qs_plugins_want_runtime()) return;
+    if (slurp(shell_json_path()) == g_running_json) {
+        DBG("qs-plugins: shell.json back to the running config; no restart");
+        return;
+    }
+    fprintf(stderr, "mattbar: qs-plugins: sidecar config changed; restarting\n");
+    g_fail_streak = 0;
+    kill_pid();
+    spawn_sidecar();
+}
+
+static void schedule_sidecar_restart() {
+    if (!g_bar) return;
+    if (g_restart_fd < 0) {
+        g_restart_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        if (g_restart_fd < 0) { // no timer: restart now, as before
+            restart_sidecar_if_stale();
+            return;
+        }
+        g_bar->add_fd(g_restart_fd, [](uint32_t) {
+            uint64_t x;
+            while (read(g_restart_fd, &x, sizeof x) > 0) {}
+            restart_sidecar_if_stale();
+        }, "qs-sidecar-restart");
+    }
+    itimerspec ts{};
+    ts.it_value.tv_nsec = 350 * 1000000L; // re-armed by every change
+    timerfd_settime(g_restart_fd, 0, &ts, nullptr);
+}
+
+void qs_plugins_invalidate_running() { g_running_json.clear(); }
+
 void qs_plugins_stop() {
+    g_spawn_after_kill = false; // an in-flight apply must not respawn
+    cancel_sidecar_restart();
     kill_any_qs();
     restore_user_json();
     qs_plugin_bar_clear();
@@ -972,14 +1062,19 @@ void qs_plugins_apply(Bar& bar) {
     qs_plugin_bar_watch(bar);
     qs_plugin_bar_publish(bar);
     if (g_pid > 0) {
-        // Already ours; rewrite of shell.json is picked up if qs watches
-        // the file. Omarchy disables the file watcher, so restart.
-        kill_pid();
-    } else {
-        kill_any_qs();
+        // Already ours. Omarchy disables the shell's file watcher, so a
+        // changed shell.json needs a restart; an unchanged one (any
+        // setting the sidecar doesn't read) needs nothing at all. The
+        // plugin-row state file above is watched live by the QML side.
+        if (g_running_json == slurp(shell_json_path())) {
+            cancel_sidecar_restart();
+            return;
+        }
+        schedule_sidecar_restart();
+        return;
     }
     g_fail_streak = 0;
-    spawn_sidecar();
+    kill_any_qs_then_spawn();
 }
 
 static std::string qs_ipc_cmd(const std::string& target,
@@ -1074,7 +1169,7 @@ public:
     PluginsModule() { g = this; }
     ~PluginsModule() override {
         if (g == this) g = nullptr;
-        if (close_fd_ >= 0) close(close_fd_);
+        Bar::close_fd(close_fd_);
     }
     bool enabled() const override {
         return cfg.quickshell_shutdown && cfg.show_plugins;
@@ -1305,7 +1400,7 @@ private:
                 close_now();
                 if (id.empty()) qs_plugins_shutdown();
                 else if (b == BTN_RIGHT) {
-                    qs_plugins_ipc(id, "hide", "");
+                    qs_plugins_ipc_async(id, "hide", "");
                     if (!cfg.qs_plugin_bar) {
                         g_lazy_hold = false;
                         g_lazy_saw_layer = false;
@@ -1401,6 +1496,9 @@ bool looks_git_url(const std::string& u) {
 
 void after_plugin_disk_change() {
     qs_plugins_scan();
+    // An updated plugin can leave shell.json byte-identical; its code
+    // still needs a fresh sidecar to load.
+    qs_plugins_invalidate_running();
     auto* sh = mattbar_shell();
     if (!sh || !sh->bar()) return;
     sh->bar()->apply_config();
@@ -1664,3 +1762,9 @@ private:
 
 Overlay* make_plugin_add_overlay() { return new PluginAddOverlay; }
 Overlay* make_plugin_remove_overlay() { return new PluginRemoveOverlay; }
+
+void qs_plugins_ipc_async(const std::string& target, const std::string& method,
+                          const std::string& arg) {
+    if (g_pid <= 0) return;
+    spawn_helper(qs_ipc_cmd(target, method, arg)); // output unused: no wait
+}

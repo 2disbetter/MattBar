@@ -15,6 +15,10 @@
 #include <cstring>
 #include <ctime>
 #include <vector>
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <algorithm>
 
 using ov::Host;
 using ov::col;
@@ -381,16 +385,16 @@ void start_wttr() {
 
 void persist_loc() {
     if (g_loc.name.empty()) {
-        spawn_detached("omarchy-weather-location --clear");
+        spawn_helper("omarchy-weather-location --clear");
         return;
     }
     if (g_loc.has_coords()) {
         char cmd[512];
         snprintf(cmd, sizeof cmd, "omarchy-weather-location --set %s %.5f,%.5f",
                  shell_quote(g_loc.name).c_str(), g_loc.lat, g_loc.lon);
-        spawn_detached(cmd);
+        spawn_helper(cmd);
     } else {
-        spawn_detached(std::string("omarchy-weather-location --set ") +
+        spawn_helper(std::string("omarchy-weather-location --set ") +
                        shell_quote(g_loc.name));
     }
 }

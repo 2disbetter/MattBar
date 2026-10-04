@@ -19,6 +19,7 @@
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <string>
 
 namespace {
 
@@ -129,20 +130,16 @@ std::string handle_osd(const std::string& method, const std::string& arg) {
 }
 
 std::string handle_media(const std::string& method) {
-    const char* cmd = nullptr;
-    if (method == "playPause") cmd = "playerctl play-pause";
-    else if (method == "next") cmd = "playerctl next";
-    else if (method == "previous") cmd = "playerctl previous";
-    else if (method == "play") cmd = "playerctl play";
-    else if (method == "pause") cmd = "playerctl pause";
-    else if (method == "sourceSwitch") {
-        media_source_switch();
-        return "ok";
-    }
-    else if (method == "ping") return "ok";
-    else if (method == "status") return "ok";
+    // playerctl is not installed on this system; the media module already
+    // talks MPRIS over D-Bus. Route the keys through that so Fn transport
+    // keys actually reach Brave/Strawberry/etc.
+    if (method == "playPause" || method == "play" || method == "pause")
+        media_play_pause();
+    else if (method == "next") media_next();
+    else if (method == "previous") media_previous();
+    else if (method == "sourceSwitch") media_source_switch();
+    else if (method == "ping" || method == "status") return "ok";
     else return "unhandled";
-    spawn_detached(cmd);
     return "ok";
 }
 
@@ -249,7 +246,7 @@ static void hypr_dofile(const std::string& path) {
         if (c == '"' || c == '\'' || c == '\n') return;
     // Fire-and-forget: a blocking popen here stalled the event loop
     // (pointer, lock painting, watchdog) for the full hyprctl round-trip.
-    spawn_detached(std::string("hyprctl eval 'dofile(\"") + path + "\")'");
+    spawn_helper(std::string("hyprctl eval 'dofile(\"") + path + "\")'");
 }
 
 // Super+Space and Super+Ctrl+A/B/W/D/… are Lua binds (hl.bind). A PATH
@@ -303,11 +300,38 @@ static void rebind_shell_keys(bool ours, const std::string& hypr_path) {
 }
 
 void Shell::apply_takeover() {
+    // Settings applies used to run all of this on every click. With the
+    // takeover off (the default) that meant a Lua keybind rebind through
+    // hyprctl and an idle reset whose screensaver stop spawns a shell and
+    // four pkills; with it on, a synchronous logind + Hyprland lock query
+    // and repeated full-screen wallpaper repaints. None of it depends on
+    // anything but the on/off state, so only a flip re-runs it.
+    const int want = cfg.quickshell_shutdown ? 1 : 0;
+    if (want == takeover_applied_) {
+        wallpaper_apply(); // outputs/placement/colour may still have moved
+        return;
+    }
+    takeover_applied_ = want;
     std::string dir = shim_dir();
     static std::string orig_path;
     if (orig_path.empty()) {
         const char* p = getenv("PATH");
         orig_path = path_without_dir(p && *p ? p : "/usr/bin", dir);
+        auto has = [&](const std::string& d) {
+            return orig_path == d || orig_path.rfind(d + ":", 0) == 0 ||
+                   orig_path.find(":" + d + ":") != std::string::npos ||
+                   (orig_path.size() > d.size() &&
+                    orig_path.compare(orig_path.size() - d.size(), d.size(),
+                                      d) == 0 &&
+                    orig_path[orig_path.size() - d.size() - 1] == ':');
+        };
+        auto prepend = [&](const std::string& d) {
+            if (!d.empty() && !has(d)) orig_path = d + ":" + orig_path;
+        };
+        if (const char* home = getenv("HOME")) {
+            prepend(std::string(home) + "/.local/bin");
+            prepend(std::string(home) + "/.local/share/mise/shims");
+        }
     }
     std::string exe = self_exe();
     auto link_one = [&](const char* name) {
@@ -333,7 +357,7 @@ void Shell::apply_takeover() {
         // omarchy-sleep-lock.service does not inherit Hyprland PATH, so
         // it was still calling /usr/bin/omarchy-shell (qs ipc) and
         // timing out: "Screen did not lock before suspend".
-        spawn_detached("systemctl --user import-environment PATH; "
+        spawn_helper("systemctl --user import-environment PATH; "
                        "systemctl --user try-restart omarchy-sleep-lock.service");
     };
     if (cfg.quickshell_shutdown) {
@@ -419,7 +443,7 @@ std::string Shell::hide(const std::string& id) {
     Overlay* o = find(id);
     if (!o) {
         if (qs_plugins_running() && qs_plugin_known(id)) {
-            qs_plugins_ipc(id, "hide", "");
+            qs_plugins_ipc_async(id, "hide", "");
             return "ok";
         }
         return "unknown";
@@ -484,17 +508,9 @@ std::string Shell::handle(const std::string& target, const std::string& rest) {
         return "unknown";
     }
     if (target == "background") {
+        // In-process now (was mkdir + ln -sfn via a shell per call).
         auto point_link = [](const std::string& path) {
-            if (path.empty()) return;
-            const char* h = getenv("HOME");
-            const char* xdg = getenv("XDG_STATE_HOME");
-            std::string link = xdg && *xdg
-                                   ? std::string(xdg) + "/omarchy/current/background"
-                                   : std::string(h ? h : ".") +
-                                         "/.local/state/omarchy/current/background";
-            spawn_detached("mkdir -p \"$(dirname " + ov::shell_quote(link) +
-                           ")\" && ln -sfn " + ov::shell_quote(path) + " " +
-                           ov::shell_quote(link));
+            wallpaper_point_link(path);
         };
         if (method == "refresh" || method.empty()) {
             wallpaper_refresh();
@@ -547,6 +563,10 @@ std::string Shell::handle(const std::string& target, const std::string& rest) {
             bool on = idle_status_json().find("\"enabled\":true") !=
                       std::string::npos;
             return idle_set_enabled(!on);
+        }
+        if (method == "screensaver-key") {
+            idle_screensaver_key();
+            return "ok";
         }
         return "ok";
     }

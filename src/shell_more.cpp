@@ -17,6 +17,7 @@
 #include <map>
 #include <sstream>
 #include <vector>
+#include <string>
 
 using ov::Host;
 using ov::col;
@@ -581,7 +582,7 @@ private:
         return out;
     }
     void toggle() {
-        spawn_detached(running_ ? "tailscale down" : "tailscale up");
+        spawn_helper(running_ ? "tailscale down" : "tailscale up");
         running_ = !running_;
         host_.redraw();
         reload();
@@ -596,7 +597,7 @@ private:
         }
         std::string target;
         if (!n.active) target = !n.ip.empty() ? n.ip : n.host;
-        spawn_detached("tailscale set --exit-node=" +
+        spawn_helper("tailscale set --exit-node=" +
                        (target.empty() ? std::string() : ov::shell_quote(target)));
         picker_ = false;
         err_    = n.active ? "Exit node cleared" : "Using " + n.display;
@@ -610,7 +611,7 @@ private:
             if (x < h.x || y < h.y || x >= h.x + h.w || y >= h.y + h.h) continue;
             if (h.kind == 0) toggle();
             if (h.kind == 1 && h.idx >= 0 && h.idx < (int)peers_.size()) {
-                spawn_detached("wl-copy " + ov::shell_quote(peers_[h.idx].ip));
+                spawn_helper("wl-copy " + ov::shell_quote(peers_[h.idx].ip));
                 err_ = "Copied " + peers_[h.idx].ip;
                 host_.redraw();
             }
@@ -824,14 +825,14 @@ private:
             spawn_detached("omarchy-pkg add dropbox 2>/dev/null || true");
             return;
         }
-        spawn_detached(running_ ? "dropbox-cli stop 2>/dev/null || dropbox stop"
+        spawn_helper(running_ ? "dropbox-cli stop 2>/dev/null || dropbox stop"
                                 : "dropbox-cli start 2>/dev/null || dropbox start");
         running_ = !running_;
         host_.redraw();
         reload();
     }
     void login() {
-        spawn_detached("dropbox-cli start 2>/dev/null || dropbox start");
+        spawn_helper("dropbox-cli start 2>/dev/null || dropbox start");
         reload();
     }
     void open_file(const File& f) {

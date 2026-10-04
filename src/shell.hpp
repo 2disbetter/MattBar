@@ -27,9 +27,11 @@ public:
     void init(Bar&);
     ~Shell();
     Bar* bar() const { return bar_; }
-    // Install or remove the omarchy-shell / omarchy-menu PATH shim
-    // according to cfg.quickshell_shutdown. Safe to call on every
-    // settings apply.
+    // Install or remove the omarchy-shell / omarchy-menu PATH shim (and
+    // the keybinds, idle, polkit and lock pieces that go with it)
+    // according to cfg.quickshell_shutdown. The first call always runs;
+    // after that only a real on/off change does anything beyond the
+    // (idempotent) wallpaper reconcile, so it is cheap on every apply.
     void apply_takeover();
 
     void add(Overlay*); // takes ownership
@@ -51,9 +53,17 @@ private:
     Overlay* find(const std::string& id) const;
     Bar* bar_ = nullptr;
     std::map<std::string, Overlay*> overlays_;
+    int  takeover_applied_ = -1; // last applied quickshell_shutdown; -1 = never
 };
 
 Shell* mattbar_shell();
+// Open the image picker over `rows` (one path per line) with `selected`
+// highlighted; the chosen path goes to `cb` (never called on cancel).
+// Settings' background chooser. false if the picker is unavailable.
+// `on_close` runs after the picker closes either way (settings reopens).
+bool image_picker_choose(const std::string& rows, const std::string& selected,
+                         std::function<void(const std::string&)> cb,
+                         std::function<void()> on_close = nullptr);
 
 // Overlays implemented in their own TUs and registered from Shell::init.
 Overlay* make_menu_overlay();

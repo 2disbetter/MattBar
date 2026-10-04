@@ -1,3 +1,4 @@
+#include "buildinfo.hpp"
 #include "bar.hpp"
 #include "config.hpp"
 #include "ctl.hpp"
@@ -10,14 +11,17 @@
 #include "polkit.hpp"
 #include "qs_plugins.hpp"
 #include "shell.hpp"
+#include "util.hpp"
 #include "wallpaper.hpp"
 
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unistd.h>
 
-static Bar* g_bar = nullptr;
+static Bar*  g_bar      = nullptr;
+static pid_t g_main_pid = 0;
 
 int main(int argc, char** argv) {
     // mattbarctl mode: as the `mattbarctl` symlink, or `mattbar ctl ...`
@@ -34,16 +38,26 @@ int main(int argc, char** argv) {
             return ctl_client(argc - 2, argv + 2);
     }
     if (argc > 1 && std::string(argv[1]) == "--version") {
-        printf("mattbar %s (built %s %s)\n", MATTBAR_VERSION, __DATE__,
-               __TIME__);
+        // This binary on disk; compare with `mattbarctl version` (the
+        // running instance) or settings > Bar > About.
+        const BuildInfo& b = build_info();
+        printf("mattbar %s build %s (built %s)\n", b.version.c_str(),
+               b.short_id.c_str(), b.linked.c_str());
         return 0;
     }
     if (getenv("MATTBAR_DEBUG"))
-        fprintf(stderr, "mattbar %s (built %s %s) — debug on\n",
-                MATTBAR_VERSION, __DATE__, __TIME__);
+        fprintf(stderr, "mattbar %s — debug on\n", build_line().c_str());
     // Graceful stop: `_exit` skipped destructors, left pactl orphans, and
     // if we were the lock client the session stayed locked with no UI.
-    auto on_stop = [](int) { if (g_bar) g_bar->request_stop(); };
+    // A fork()ed child that never exec'd (PAM workers) inherits this
+    // handler AND the stop eventfd: SIGTERM to such a child used to stop
+    // the whole bar. Such children now reset their signals, and this
+    // guard makes any other copy simply exit.
+    g_main_pid   = getpid();
+    auto on_stop = [](int) {
+        if (getpid() != g_main_pid) _exit(1);
+        if (g_bar) g_bar->request_stop();
+    };
     struct sigaction sa {};
     sa.sa_handler = on_stop;
     sigemptyset(&sa.sa_mask);
@@ -52,6 +66,7 @@ int main(int argc, char** argv) {
     sigaction(SIGTERM, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);
 
+    apply_enriched_path();
     cfg.load();
 
     Bar bar;
@@ -67,6 +82,7 @@ int main(int argc, char** argv) {
     bar.add_module("tray",       make_tray());
     bar.add_module("update",     make_update_button());
     bar.add_module("agents",     make_agents());
+    bar.add_module("localllm",   make_local_llm());
     bar.add_module("microphone", make_microphone());
     bar.add_module("screenrecord", make_screenrecord());
     bar.add_module("temp",       make_temp());
