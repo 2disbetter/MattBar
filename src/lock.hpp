@@ -25,3 +25,14 @@ void        lock_flush();
 // True after the post-lock blank (brightness/DPMS off). Toast popups
 // must not map a layer surface while this is set — that wakes the panel.
 bool        lock_display_asleep();
+// Same DPMS/brightness off the lock screen uses. Idle calls this when
+// the post-lock-due blank fires, then takes the lock in the dark so a
+// later wake shows the password field instead of the screensaver.
+void        lock_blank_now();
+// Undo lock_blank_now / post-lock blank. Cancels a pending reassert so
+// a screensaver dismiss cannot be blanked again a beat later.
+void        lock_wake_now();
+// Stay lit for lock_wake_blank_s (Keep display on after wake). Idle
+// calls this after a screensaver dismiss so the 5s post-lock dim does
+// not black the panel under someone who just came back.
+void        lock_hold_after_wake();

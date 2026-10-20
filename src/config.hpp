@@ -256,6 +256,10 @@ struct Config {
     int  local_llm_popup_w_pct() const;
     int  local_llm_popup_h_pct() const;
     void set_local_llm_popup_pct(int w, int h);
+    // Bandwidth chip: per-process traffic popup. Tool is mattnhogs or nethogs
+    // on PATH (/usr/local/bin, then /usr/bin). No path is stored.
+    bool        show_bandwidth = true;
+    std::string bandwidth_tool = "mattnhogs";
     // Microphone module (default-source mute/volume; bluez rune = real mic)
     bool        show_microphone = true;
     bool        mic_show_pct    = false;

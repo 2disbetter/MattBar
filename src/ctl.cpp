@@ -376,13 +376,21 @@ std::string CtlServer::handle(const std::string& line) {
         }
         return "usage: localllm [toggle|stop]";
     }
+    if (cmd == "bandwidth" || cmd == "nethogs") {
+        if (arg == "toggle" || arg == "click" || arg.empty()) {
+            nethogs_hotkey();
+            if (bar_) bar_->request_draw();
+            return "ok";
+        }
+        return "usage: bandwidth [toggle]";
+    }
     if (cmd == "help" || cmd.empty())
         return "commands: dnd [on|off|toggle|status], dismiss, dismiss-all,\n"
                "invoke, restore, profile [name], pin [on|off|toggle|status],\n"
                "reveal, hide, hold [on|off|status], settings [open|toggle|close|status], status,\n"
                "version, render-stats, ipc-stats,\n"
                "plugins [status|stop],\n"
-               "agents [toggle|pick], localllm [toggle|stop],\n"
+               "agents [toggle|pick], localllm [toggle|stop], bandwidth [toggle],\n"
                "shell ping|toggle|summon|hide <id> [payload],\n"
                "notifications dismissOne|dismissAll|invokeLast|toggleDnd,\n"
                "osd show <json>, media playPause|next|previous,\n"

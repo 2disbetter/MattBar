@@ -1326,6 +1326,440 @@ private:
     }
 };
 
+// ---------------------------------------------------------------------------
+// Update preview. The bar chip opens this instead of starting omarchy-update.
+// The lookup is read-only: checkupdates, yay -Qua, mise outdated, and the
+// Omarchy release notes. Update at the bottom is what launches the updater.
+// ---------------------------------------------------------------------------
+struct UpPkg {
+    std::string name, from, to;
+};
+
+bool split_arrow(const std::string& line, UpPkg& p) {
+    auto arrow = line.find(" -> ");
+    if (arrow == std::string::npos) return false;
+    std::string left = trim(line.substr(0, arrow));
+    p.to = trim(line.substr(arrow + 4));
+    auto sp = left.find_last_of(' ');
+    if (sp == std::string::npos || p.to.empty()) return false;
+    p.name = trim(left.substr(0, sp));
+    p.from = trim(left.substr(sp + 1));
+    return !p.name.empty() && !p.from.empty();
+}
+
+class UpdatePreviewOverlay : public Overlay {
+public:
+    const char* id() const override { return "mattbar.update"; }
+    void summon(const std::string&) override { open(); }
+    void hide() override { close(); }
+    bool is_open() const override { return host_.is_open(); }
+
+private:
+    Host host_;
+    AsyncCmd cmd_;
+    std::vector<UpPkg> pkgs_, aur_, mise_;
+    std::vector<std::string> notes_, commits_, orphans_;
+    UpPkg omarchy_{};
+    bool have_omarchy_ = false;
+    bool loading_ = false;
+    int gen_ = 0, scroll_ = 0, nlines_ = 0, max_scroll_ = 0;
+    double btn_x_ = 0, btn_y_ = 0, btn_w_ = 0, btn_h_ = 0;
+
+    int W() const { return std::max(cfg.shell_panel_width, 420); }
+    int H() const { return std::max(cfg.shell_panel_height, 560); }
+    double fs() const { return std::max(11.0, cfg.shell_network_font_size); }
+
+    void close() {
+        ++gen_;
+        cmd_.cancel();
+        host_.close();
+    }
+
+    void open() {
+        scroll_ = 0;
+        loading_ = true;
+        have_omarchy_ = false;
+        omarchy_ = {};
+        pkgs_.clear();
+        aur_.clear();
+        mise_.clear();
+        notes_.clear();
+        commits_.clear();
+        orphans_.clear();
+        host_.win.paint = [this](cairo_t* cr) { paint(cr); };
+        host_.win.click = [this](double x, double y, int b) { on_click(x, y, b); };
+        host_.win.pscroll = [this](int d) {
+            scroll_ = std::clamp(scroll_ + d, 0, max_scroll_);
+            host_.redraw();
+        };
+        host_.win.pkey = [this](const Bar::KeyEvent& e) { on_key(e); };
+        host_.open(W(), H(), "mattbar-update", id(), true, Host::Place::BarEnd);
+        load();
+    }
+
+    void load() {
+        auto* sh = mattbar_shell();
+        if (!sh || !sh->bar()) return;
+        int g = ++gen_;
+        cmd_.run(*sh->bar(), preview_script(),
+                 [this, g](const std::string& out, int) {
+                     if (g != gen_) return;
+                     parse(out);
+                     loading_ = false;
+                     if (host_.is_open()) host_.redraw();
+                 },
+                 45000);
+    }
+
+    static const char* preview_script() {
+        return R"UPD(exec 2>/dev/null
+set +e
+tmp=$(mktemp)
+checkupdates --nocolor >"$tmp" 2>/dev/null
+printf '\036PACKAGES\n'
+cat "$tmp"
+printf '\036OMARCHY\n'
+pkg=
+if pacman -Qq omarchy-dev >/dev/null 2>&1; then pkg=omarchy-dev
+elif pacman -Qq omarchy >/dev/null 2>&1; then pkg=omarchy
+fi
+line=
+if [[ -n $pkg ]]; then
+  line=$(awk -v p="$pkg" '$1 == p { print; exit }' "$tmp")
+fi
+printf '%s\n' "$line"
+printf '\036NOTES\n'
+ver=$(printf '%s\n' "$line" | awk '{ print $NF }')
+ver=${ver#*:}
+ver=${ver%-*}
+OMARCHY_REL=$ver python3 - <<'PY'
+import json, os, re, urllib.request
+ver = os.environ.get("OMARCHY_REL", "").strip()
+if not ver:
+    raise SystemExit(0)
+link = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+def flatten(body):
+    out = []
+    fence = False
+    for raw in body.splitlines():
+        s = raw.strip()
+        if s.startswith("```"):
+            fence = not fence
+            continue
+        if s.startswith("![") or s.startswith("<img"):
+            continue
+        s = link.sub(r"\1", s)
+        s = s.replace("**", "").replace("__", "")
+        s = re.sub(r"^#{1,6}\s*", "", s)
+        out.append(s)
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    print("\n".join(out))
+for repo in ("basecamp/omarchy", "omacom/omarchy"):
+    for tag in ("v" + ver, ver):
+        url = "https://api.github.com/repos/%s/releases/tags/%s" % (repo, tag)
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "mattbar",
+            "Accept": "application/vnd.github+json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                body = json.load(r).get("body") or ""
+        except Exception:
+            continue
+        if body.strip():
+            flatten(body)
+            raise SystemExit(0)
+PY
+printf '\036GIT\n'
+path=${OMARCHY_PATH:-/usr/share/omarchy}
+if [[ $path != /usr/share/omarchy ]] && git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  upstream=$(git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+  if [[ -n $upstream ]]; then
+    timeout 8 git -C "$path" fetch --quiet >/dev/null 2>&1 || true
+    git -C "$path" log --pretty='%s' "HEAD..$upstream" 2>/dev/null | head -30
+  fi
+fi
+printf '\036AUR\n'
+if command -v yay >/dev/null 2>&1; then
+  timeout 20 yay -Qua 2>/dev/null | sed -E 's/\x1b\[[0-9;]*[mK]//g'
+fi
+printf '\036MISE\n'
+if command -v mise >/dev/null 2>&1; then
+  MISE_MINIMUM_RELEASE_AGE=0 timeout 20 mise outdated --json 2>/dev/null | python3 -c '
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw:
+    raise SystemExit(0)
+data=json.loads(raw)
+items=data.values() if isinstance(data, dict) else data
+for t in items:
+    if not isinstance(t, dict):
+        continue
+    name=t.get("name") or ""
+    cur=str(t.get("current") or "")
+    lat=str(t.get("latest") or "")
+    if name and lat and lat != cur:
+        print("%s %s -> %s" % (name, cur, lat))
+'
+fi
+printf '\036ORPHANS\n'
+pacman -Qtdq 2>/dev/null || true
+printf '\036END\n'
+rm -f "$tmp"
+)UPD";
+    }
+
+    void parse(const std::string& out) {
+        pkgs_.clear();
+        aur_.clear();
+        mise_.clear();
+        notes_.clear();
+        commits_.clear();
+        orphans_.clear();
+        have_omarchy_ = false;
+        omarchy_ = {};
+        std::string sec;
+        int blanks = 0;
+        std::istringstream ss(out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty() && line[0] == '\036') {
+                sec = line.substr(1);
+                blanks = 0;
+                continue;
+            }
+            if (sec == "PACKAGES" || sec == "AUR" || sec == "MISE") {
+                UpPkg p;
+                if (!split_arrow(line, p)) continue;
+                if (sec == "PACKAGES") pkgs_.push_back(std::move(p));
+                else if (sec == "AUR") aur_.push_back(std::move(p));
+                else mise_.push_back(std::move(p));
+            } else if (sec == "OMARCHY") {
+                if (!have_omarchy_) {
+                    have_omarchy_ = split_arrow(line, omarchy_);
+                }
+            } else if (sec == "NOTES") {
+                if (notes_.size() >= 80) continue;
+                if (trim(line).empty()) {
+                    if (blanks++) continue;
+                    notes_.push_back({});
+                } else {
+                    blanks = 0;
+                    notes_.push_back(line);
+                }
+            } else if (sec == "GIT") {
+                if (commits_.size() < 30 && !trim(line).empty())
+                    commits_.push_back(trim(line));
+            } else if (sec == "ORPHANS") {
+                std::string n = trim(line);
+                if (!n.empty() && n.find(' ') == std::string::npos)
+                    orphans_.push_back(n);
+            }
+        }
+        if (notes_.size() >= 80) notes_.push_back("…");
+    }
+
+    struct VRow {
+        int kind; // 0 section, 1 package, 2 note, 3 gap
+        std::string a, b;
+        double h = 0;
+    };
+
+    static void add_note(std::vector<VRow>& rows, cairo_t* cr,
+                         const std::string& text, double maxw, double nh) {
+        if (trim(text).empty()) {
+            if (!rows.empty() && rows.back().kind != 3)
+                rows.push_back({3, {}, {}, 8});
+            return;
+        }
+        std::string cur, word;
+        auto emit = [&](const std::string& s) {
+            rows.push_back({2, s, {}, nh});
+        };
+        for (size_t i = 0; i <= text.size(); ++i) {
+            char c = i == text.size() ? ' ' : text[i];
+            if (c == ' ' || c == '\t') {
+                if (word.empty()) continue;
+                std::string trial = cur.empty() ? word : cur + " " + word;
+                if (tw(cr, trial) <= maxw) cur = std::move(trial);
+                else {
+                    if (!cur.empty()) emit(cur);
+                    if (tw(cr, word) <= maxw) cur = word;
+                    else {
+                        emit(utf8_trunc(word, 48));
+                        cur.clear();
+                    }
+                }
+                word.clear();
+            } else word.push_back(c);
+        }
+        if (!cur.empty()) emit(cur);
+    }
+
+    std::vector<VRow> layout(cairo_t* cr) const {
+        std::vector<VRow> rows;
+        const double nh = std::max(16.0, fs() + 4);
+        const double ih = (double)ov::row_h(fs());
+        const double maxw = W() - 36;
+        auto section = [&](const char* t) {
+            rows.push_back({0, t, {}, 22});
+        };
+        auto item = [&](const std::string& name, const std::string& ver) {
+            rows.push_back({1, name, ver, ih});
+        };
+        if (have_omarchy_ || !notes_.empty()) {
+            section("OMARCHY");
+            if (have_omarchy_)
+                item(omarchy_.name, omarchy_.from + "  →  " + omarchy_.to);
+            if (notes_.empty())
+                add_note(rows, cr, "Release notes were not available.", maxw, nh);
+            else
+                for (const auto& n : notes_) add_note(rows, cr, n, maxw, nh);
+        }
+        if (!commits_.empty()) {
+            section("DEV CHECKOUT");
+            for (const auto& c : commits_) add_note(rows, cr, c, maxw, nh);
+        }
+        std::vector<UpPkg> sys;
+        for (const auto& p : pkgs_) {
+            if (have_omarchy_ && p.name == omarchy_.name) continue;
+            sys.push_back(p);
+        }
+        if (!sys.empty()) {
+            section("SYSTEM PACKAGES");
+            for (const auto& p : sys)
+                item(p.name, p.from + "  →  " + p.to);
+        }
+        if (!aur_.empty()) {
+            section("AUR");
+            for (const auto& p : aur_)
+                item(p.name, p.from + "  →  " + p.to);
+        }
+        if (!mise_.empty()) {
+            section("MISE TOOLS");
+            for (const auto& p : mise_)
+                item(p.name, p.from + "  →  " + p.to);
+        }
+        if (!orphans_.empty()) {
+            section("ORPHANS");
+            add_note(rows, cr,
+                     "You will be asked about these after the update. "
+                     "Nothing is removed unless you say yes.",
+                     maxw, nh);
+            for (const auto& n : orphans_) item(n, {});
+        }
+        if (!loading_ && rows.empty())
+            add_note(rows, cr, "Nothing is waiting.", maxw, nh);
+        return rows;
+    }
+
+    void on_click(double x, double y, int btn) {
+        if (btn != BTN_LEFT) return;
+        if (x < btn_x_ || y < btn_y_ || x >= btn_x_ + btn_w_ || y >= btn_y_ + btn_h_)
+            return;
+        close();
+        update_launch();
+    }
+
+    void on_key(const Bar::KeyEvent& e) {
+        if (!e.pressed) return;
+        if (e.escape()) {
+            close();
+            return;
+        }
+        if (e.up()) {
+            if (scroll_ > 0) --scroll_;
+            host_.redraw();
+        } else if (e.down()) {
+            if (scroll_ < max_scroll_) ++scroll_;
+            host_.redraw();
+        }
+    }
+
+    void paint(cairo_t* cr) {
+        panel_bg(cr, W(), H());
+        select_shell_font(cr, fs());
+        btn_x_ = btn_y_ = btn_w_ = btn_h_ = 0;
+        cairo_set_font_size(cr, fs() + 1);
+        say(cr, 18, 20, "Updates", cfg.c_fg);
+        cairo_set_font_size(cr, std::max(10.0, fs() - 2));
+        std::string sub = loading_ ? "Looking up updates\u2026"
+                                   : "Nothing is installed until you press Update";
+        say(cr, 18, 38, sub, cfg.c_dim);
+        cairo_set_font_size(cr, fs());
+
+        const double top = 56;
+        const double foot = 52;
+        const double bottom = H() - foot;
+        auto rows = layout(cr);
+        nlines_ = (int)rows.size();
+        {
+            double view = bottom - top;
+            double acc = 0;
+            max_scroll_ = 0;
+            for (int i = nlines_ - 1; i >= 0; --i) {
+                if (acc + rows[i].h > view && acc > 0) {
+                    max_scroll_ = i + 1;
+                    break;
+                }
+                acc += rows[i].h;
+            }
+            if (max_scroll_ >= nlines_) max_scroll_ = std::max(0, nlines_ - 1);
+        }
+        if (scroll_ > max_scroll_) scroll_ = max_scroll_;
+        if (scroll_ < 0) scroll_ = 0;
+
+        double y = top;
+        if (loading_ && rows.empty()) {
+            say(cr, 18, top + 16, "Looking up updates\u2026", cfg.c_dim);
+        }
+        for (int i = scroll_; i < nlines_ && y < bottom; ++i) {
+            const VRow& r = rows[i];
+            if (y + r.h > bottom && i > scroll_) break;
+            if (r.kind == 0) {
+                cairo_set_font_size(cr, std::max(10.0, fs() - 2));
+                say(cr, 18, y + r.h / 2.0, r.a, cfg.c_accent);
+                cairo_set_font_size(cr, fs());
+            } else if (r.kind == 1) {
+                say(cr, 18, y + r.h / 2.0, utf8_trunc(r.a, 28), cfg.c_fg);
+                if (!r.b.empty()) {
+                    cairo_set_font_size(cr, std::max(10.0, fs() - 1));
+                    std::string ver = utf8_trunc(r.b, 32);
+                    say(cr, W() - 18 - tw(cr, ver), y + r.h / 2.0, ver, cfg.c_dim);
+                    cairo_set_font_size(cr, fs());
+                }
+            } else if (r.kind == 2) {
+                cairo_set_font_size(cr, std::max(10.0, fs() - 2));
+                say(cr, 18, y + r.h / 2.0, r.a, cfg.c_dim);
+                cairo_set_font_size(cr, fs());
+            }
+            y += r.h;
+        }
+
+        col(cr, cfg.c_ws_bg, 1);
+        cairo_rectangle(cr, 16, H() - foot + 4, W() - 32, 1);
+        cairo_fill(cr);
+        const char* lab = "Update";
+        btn_h_ = 26;
+        btn_w_ = tw(cr, lab) + 22;
+        btn_x_ = W() - 16 - btn_w_;
+        btn_y_ = H() - 16 - btn_h_;
+        col(cr, cfg.c_accent, 1);
+        rrect(cr, btn_x_, btn_y_, btn_w_, btn_h_, 6);
+        cairo_fill(cr);
+        say(cr, btn_x_ + 11, btn_y_ + btn_h_ / 2.0, lab, contrast_on(cfg.c_accent));
+        cairo_set_font_size(cr, std::max(10.0, fs() - 2));
+        const char* hint = "Confirms in the terminal";
+        if (tw(cr, hint) < btn_x_ - 28)
+            say(cr, 18, btn_y_ + btn_h_ / 2.0, hint, cfg.c_dim);
+        cairo_set_font_size(cr, fs());
+    }
+};
+
 } // namespace
 
 void register_shell_overlays(Shell& sh) {
@@ -1335,6 +1769,7 @@ void register_shell_overlays(Shell& sh) {
     sh.add(new WifiQrOverlay);
     sh.add(new SpeedTestOverlay);
     sh.add(new DiskSpeedTestOverlay);
+    sh.add(new UpdatePreviewOverlay);
 }
 
 bool image_picker_choose(const std::string& rows, const std::string& selected,

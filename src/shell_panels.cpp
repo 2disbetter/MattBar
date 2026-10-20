@@ -587,7 +587,9 @@ private:
     std::map<std::string, BtDev> by_path_;
     std::vector<BtDev> devs_;
     std::vector<Hit> hits_;
-    int sel_ = 0, scroll_ = 0, scan_fd_ = -1;
+    int sel_ = 0, scroll_ = 0, scan_fd_ = -1, phrase_fd_ = -1;
+    double hx_ = -1, hy_ = -1;
+    std::string hover_tip_;
     bool powered_ = false, discovering_ = false, scan_on_open_ = false;
     std::string pending_path_, pending_act_;
     static constexpr int kScanMs = 10000;
@@ -597,6 +599,8 @@ private:
     double fs() const { return cfg.shell_bluetooth_font_size; }
 
     void close() {
+        hx_ = hy_ = -1;
+        hover_tip_.clear();
         disarm_scan();
         stop_bus();
         host_.close();
@@ -606,14 +610,19 @@ private:
         sel_ = scroll_ = 0;
         host_.win.paint = [this](cairo_t* cr) { paint(cr); };
         host_.win.click = [this](double x, double y, int b) { on_click(x, y, b); };
+        host_.win.pmotion = [this](double x, double y) { on_hover(x, y); };
+        host_.win.pleave = [this] { on_hover(-1, -1); };
         host_.win.pscroll = [this](int d) {
             sel_ = ov::clamp_sel(sel_ + d, (int)devs_.size());
             host_.redraw();
         };
         host_.win.pkey = [this](const Bar::KeyEvent& e) { on_key(e); };
         host_.open(W(), H(), "mattbar-bluetooth", id(), true, Host::Place::BarEnd);
-        scan_on_open_ = cfg.shell_bt_scan_on_open;
+        // Decide after the device list arrives: scan only when nothing
+        // is connected. The Scan button scans any time.
+        scan_on_open_ = true;
         start_bus();
+        arm_phrase();
     }
 
     void rebuild() {
@@ -735,7 +744,10 @@ private:
         self->rebuild();
         if (self->scan_on_open_) {
             self->scan_on_open_ = false;
-            self->start_scan();
+            bool any = false;
+            for (const BtDev& d : self->devs_)
+                if (d.connected) any = true;
+            if (!any && self->powered_) self->start_scan();
         }
         return 0;
     }
@@ -844,6 +856,25 @@ private:
         start_discovery();
         arm_scan();
     }
+    // The status line steps every 3s. Wi-Fi gets the same motion from its
+    // stats poll; Bluetooth has no poll, so redraw on that cadence.
+    void arm_phrase() {
+        auto* sh = mattbar_shell();
+        if (!sh || !sh->bar()) return;
+        if (phrase_fd_ < 0) {
+            phrase_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+            if (phrase_fd_ < 0) return;
+            sh->bar()->add_fd(phrase_fd_, [this](uint32_t) {
+                uint64_t n;
+                while (read(phrase_fd_, &n, sizeof n) > 0) {}
+                if (host_.is_open()) host_.redraw();
+            }, "bt-phrase");
+        }
+        itimerspec ts{};
+        ts.it_interval.tv_sec = 3;
+        ts.it_value.tv_sec    = 3;
+        timerfd_settime(phrase_fd_, 0, &ts, nullptr);
+    }
 
     void start_bus() {
         auto* sh = mattbar_shell();
@@ -883,6 +914,7 @@ private:
         disarm_scan();
         stop_discovery();
         Bar::close_fd(scan_fd_);
+        Bar::close_fd(phrase_fd_);
         if (pump_.bus) {
             // Fire-and-forget. This used to be a synchronous call on a bus
             // with a 30 s method timeout (sized for Pair/Connect), run on
@@ -963,6 +995,26 @@ private:
                        5000);
     }
 
+    std::string button_tip(const Hit& h) const {
+        if (h.kind == 4)
+            return powered_ ? "Turn Bluetooth off" : "Turn Bluetooth on";
+        if (h.kind == 5) return "Scan for devices";
+        if (h.kind == 6) return "Forget";
+        return {};
+    }
+    void on_hover(double x, double y) {
+        hx_ = x;
+        hy_ = y;
+        std::string tip;
+        if (x >= 0) {
+            int hi = hit_at(hits_, x, y);
+            if (hi >= 0) tip = button_tip(hits_[hi]);
+        }
+        if (tip == hover_tip_) return;
+        hover_tip_ = std::move(tip);
+        host_.redraw();
+    }
+
     void on_click(double x, double y, int btn) {
         int hi = hit_at(hits_, x, y);
         if (hi < 0) return;
@@ -973,6 +1025,11 @@ private:
         }
         if (h.kind == 5) {
             start_scan();
+            return;
+        }
+        if (h.kind == 6) {
+            if (h.row >= 0) sel_ = h.row;
+            forget();
             return;
         }
         if (h.row < 0 || h.row >= (int)devs_.size()) return;
@@ -999,6 +1056,10 @@ private:
             return;
         }
         if (e.enter()) activate();
+        if (e.keysym == 0x72 || e.keysym == 0x52) {
+            start_scan();
+            return;
+        }
         if (e.keysym == 0xffff) forget();
     }
 
@@ -1006,8 +1067,17 @@ private:
         panel_bg(cr, W(), H());
         select_shell_font(cr, fs());
         hits_.clear();
-        const int hh = ov::hdr_h(fs()), rh = ov::row_h(fs());
-        say(cr, 18, hh / 2.0 - 6, "Bluetooth", cfg.c_fg);
+        const int rh = ov::row_h(fs());
+        bool any_connected = false;
+        for (const BtDev& d : devs_)
+            if (d.connected) any_connected = true;
+        const char* ic = !powered_ ? "\U000F00F2"
+                                   : (any_connected ? "\U000F00F1" : "\U000F00EF");
+        double y = 14;
+        cairo_set_font_size(cr, fs() + 10);
+        say(cr, 16, y + 18, ic, powered_ ? cfg.c_fg : cfg.c_dim);
+        cairo_set_font_size(cr, fs() + 1);
+        say(cr, 52, y + 12, "Bluetooth", cfg.c_fg);
         {
             const char* phrase = "No adapter";
             if (adapter_.empty()) phrase = "No adapter";
@@ -1023,45 +1093,42 @@ private:
             std::transform(meta.begin(), meta.end(), meta.begin(),
                            [](unsigned char c) { return (char)std::toupper(c); });
             cairo_set_font_size(cr, std::max(10.0, fs() - 3));
-            const char* sub = discovering_ ? "SCANNING\u2026" : meta.c_str();
-            if (!pending_act_.empty()) {
-                if (pending_act_ == "pair") sub = "PAIRING\u2026";
-                else if (pending_act_ == "connect") sub = "CONNECTING\u2026";
-                else if (pending_act_ == "disconnect") sub = "DISCONNECTING\u2026";
-                else if (pending_act_ == "forget") sub = "FORGETTING\u2026";
-            }
-            say(cr, 18, hh / 2.0 + 10, sub, cfg.c_dim);
+            say(cr, 52, y + 30, meta, cfg.c_dim);
             cairo_set_font_size(cr, fs());
         }
-        double ax = W() - 18;
+        double ax = W() - 16;
+        {
+            const double bw = 40, bh = 22;
+            ax -= bw;
+            col(cr, powered_ ? cfg.c_accent : cfg.c_ws_bg, 1);
+            rrect(cr, ax, y + 8, bw, bh, bh / 2);
+            cairo_fill(cr);
+            col(cr, cfg.c_bg, 1);
+            double kx = powered_ ? ax + bw - bh + 2 : ax + 2;
+            cairo_arc(cr, kx + (bh - 4) / 2.0, y + 8 + bh / 2.0, (bh - 6) / 2.0,
+                      0, 6.28318530718);
+            cairo_fill(cr);
+            hits_.push_back({ax, y + 8, bw, bh, -1, 4});
+            ax -= 8;
+        }
         {
             const char* scan_lbl = discovering_ ? "Scanning\u2026" : "Scan";
             double sbw = tw(cr, scan_lbl) + 16;
             ax -= sbw;
             col(cr, discovering_ ? cfg.c_accent : cfg.c_ws_bg, 1);
-            rrect(cr, ax, (hh - 22) / 2.0, sbw, 22, 6);
+            rrect(cr, ax, y + 6, sbw, 24, 6);
             cairo_fill(cr);
-            say(cr, ax + 8, hh / 2.0, scan_lbl,
+            say(cr, ax + 8, y + 18, scan_lbl,
                 discovering_ ? contrast_on(cfg.c_accent)
                              : (powered_ ? cfg.c_fg : cfg.c_dim));
             if (powered_ && !discovering_)
-                hits_.push_back({ax, 8, sbw, 24, -1, 5});
-            ax -= 8;
-        }
-        {
-            std::string tog = powered_ ? "BT On" : "BT Off";
-            double twid = tw(cr, tog) + 16;
-            ax -= twid;
-            col(cr, powered_ ? cfg.c_accent : cfg.c_ws_bg, 1);
-            rrect(cr, ax, (hh - 22) / 2.0, twid, 22, 6);
-            cairo_fill(cr);
-            say(cr, ax + 8, hh / 2.0, tog,
-                powered_ ? contrast_on(cfg.c_accent) : cfg.c_dim);
-            hits_.push_back({ax, 8, twid, 24, -1, 4});
+                hits_.push_back({ax, y + 6, sbw, 24, -1, 5});
         }
 
-        int y0 = hh + 4;
-        int vis = std::max(1, (H() - y0 - 8) / rh);
+        int y0 = (int)(y + 52);
+        // Two-line rows are taller than rh. Size the window for that so the
+        // last row stays inside the panel.
+        int vis = std::max(1, (H() - y0 - 8) / (rh + 12));
         ov::keep_visible(sel_, scroll_, vis, (int)devs_.size());
         if (devs_.empty())
             say(cr, 18, y0 + rh / 2.0,
@@ -1073,6 +1140,7 @@ private:
         for (int i = 0; i < vis; ++i) {
             int idx = scroll_ + i;
             if (idx >= (int)devs_.size()) break;
+            if (y0 > H() - 12) break;
             const BtDev& d = devs_[idx];
             if ((int)d.sect != last_sect) {
                 last_sect = d.sect;
@@ -1084,25 +1152,50 @@ private:
                 cairo_set_font_size(cr, fs());
                 y0 += 22;
             }
-            double y = y0, mid = y + rh / 2.0;
-            if (idx == sel_) {
-                col(cr, cfg.c_accent, 0.28);
-                rrect(cr, 10, y + 2, W() - 20, rh - 4, 6);
+            bool pend = !pending_path_.empty() && pending_path_ == d.path;
+            std::string st;
+            if (pend) {
+                if (pending_act_ == "forget") st = "Forgetting\u2026";
+                else if (pending_act_ == "disconnect") st = "Disconnecting\u2026";
+                else st = "Connecting\u2026";
+            } else if (d.connected && d.battery >= 0) {
+                st = std::to_string(d.battery) + "%";
+            }
+            bool two = !st.empty();
+            double row_h = rh + (two ? 12 : 0);
+            double y = y0;
+            double mid = y + (two ? rh * 0.42 : rh / 2.0);
+            bool can_forget = d.paired || d.trusted || d.connected;
+            bool show_forget = can_forget && idx == sel_;
+            if (idx == sel_ || d.connected) {
+                col(cr, d.connected ? cfg.c_accent : cfg.c_ws_bg,
+                    d.connected ? 0.35 : 1);
+                rrect(cr, 10, y + 1, W() - 20, row_h - 2, 6);
                 cairo_fill(cr);
             }
-            Color fg = idx == sel_ ? contrast_on(cfg.c_accent) : cfg.c_fg;
-            say(cr, 18, mid, utf8_trunc(d.name.empty() ? d.addr : d.name, 24),
-                d.connected ? cfg.c_accent : fg);
-            std::string st;
-            bool pend = !pending_path_.empty() && pending_path_ == d.path;
-            if (pend) st = pending_act_;
-            else if (d.battery >= 0) st = std::to_string(d.battery) + "%";
-            else if (d.connected) st = "connected";
-            else if (d.paired) st = "paired";
-            else st = "new";
-            say(cr, W() - 18 - tw(cr, st), mid, st, cfg.c_dim);
-            hits_.push_back({10, y, W() - 20.0, (double)rh, idx, 0});
-            y0 += rh;
+            const char* dic = d.connected ? "\U000F00F1" : "\U000F00EF";
+            say(cr, 18, mid, dic, d.connected || pend ? cfg.c_accent : cfg.c_fg);
+            say(cr, 44, mid, utf8_trunc(d.name.empty() ? d.addr : d.name, 24),
+                cfg.c_fg);
+            if (two) {
+                cairo_set_font_size(cr, std::max(10.0, fs() - 3));
+                say(cr, 44, y + row_h - 8, st, cfg.c_dim);
+                cairo_set_font_size(cr, fs());
+            }
+            if (show_forget) {
+                say(cr, W() - 34, mid, "\U000F0159", cfg.c_urgent);
+                hits_.push_back({W() - 48.0, y, 36, row_h, idx, 6});
+            }
+            hits_.push_back({10, y, W() - 56.0, row_h, idx, 0});
+            y0 += (int)row_h;
+        }
+        if (hx_ >= 0) {
+            int hi = hit_at(hits_, hx_, hy_);
+            if (hi >= 0) {
+                const Hit& h = hits_[hi];
+                ov::draw_button_tip(cr, W(), H(), fs(), button_tip(h), h.x, h.y,
+                                    h.w, h.h);
+            }
         }
     }
 };

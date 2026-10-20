@@ -48,6 +48,8 @@ Module* make_agents();
 void    agents_hotkey();
 Module* make_local_llm();
 void    local_llm_hotkey();
+Module* make_nethogs();
+void    nethogs_hotkey();
 void    local_llm_shutdown();
 bool    local_llm_vector_icon();
 Module* make_microphone();
@@ -65,6 +67,8 @@ void draw_sun_icon(cairo_t* cr, double cx, double cy, double size,
 bool brightness_vector_icon();
 void draw_llm_icon(cairo_t* cr, double cx, double cy, double size,
                    const Color& c);
+void draw_bandwidth_icon(cairo_t* cr, double cx, double cy, double size,
+                         const Color& c);
 Module* make_media();
 Module* make_caffeine();
 Module* make_nightlight();
@@ -80,6 +84,8 @@ Module* make_update_button();
 // `omarchy-shell omarchy.system-update refresh|clear` (omarchy-update-status).
 void    update_refresh();
 void    update_clear();
+// Start the configured updater (the preview panel's Update button).
+void    update_launch();
 Module* make_temp();
 // Notification centre: bell + history popup (last cfg.history_max entries,
 // clear-all, per-app mute). Deliberately quiet — see cfg.bell_show_count.

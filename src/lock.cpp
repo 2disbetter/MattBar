@@ -3,6 +3,7 @@
 #include "bar.hpp"
 #include "config.hpp"
 #include "idle.hpp"
+#include "hyprev.hpp"
 #include "modules.hpp"
 #include "notify.hpp"
 #include "sdpump.hpp"
@@ -43,6 +44,7 @@ int  g_reclaim_n  = 0;
 int  g_blank_fd   = -1;
 bool g_display_off = false;
 bool g_blank_reassert = false;
+bool g_woke_from_input = false;
 uint64_t g_blank_armed_ms = 0;
 int      g_blank_delay_s  = 5;
 uint64_t g_wake_grace_until = 0;
@@ -58,6 +60,11 @@ void drain_blank();
 void wake_display();
 void arm_blank();
 void arm_blank_in(int s);
+void dpms_enable_now();
+void arm_lock_input();
+void arm_thaw_reassert();
+void disarm_thaw_retry();
+void apply_wake_hold();
 uint64_t now_ms_lock();
 
 int on_prepare_for_sleep(sd_bus_message* m, void*, sd_bus_error*) {
@@ -73,6 +80,7 @@ int on_prepare_for_sleep(sd_bus_message* m, void*, sd_bus_error*) {
         // panel before the lock surface is visible.
         g_sleeping = true;
         drain_blank();
+        disarm_thaw_retry();
         lock_now();
         drain_blank();
         if (g_bar) g_bar->ping_watchdog();
@@ -86,16 +94,21 @@ int on_prepare_for_sleep(sd_bus_message* m, void*, sd_bus_error*) {
     g_blank_reassert = false;
     drain_blank();
     g_display_off = true;
+    // DPMS on before omarchy-system-wake's DDC/clamshell chain so the
+    // first password keys are not eaten as display-wake.
     wake_display();
+    // Always re-send key_press_enables_dpms=false. The pre-sleep async
+    // keyword often never lands before a hibernate snapshot, and Hyprland
+    // comes back with the config default (true). arm_lock_input used to
+    // skip the re-send once g_key_dpms_suppressed was already set.
+    if (g_locked) {
+        arm_lock_input();
+        arm_thaw_reassert();
+    }
     lock_sync_outputs();
     redraw_lock();
     lock_reclaim();
-    {
-        int hold = cfg.lock_wake_blank_s > 0 ? cfg.lock_wake_blank_s
-                                             : cfg.idle_blank_s;
-        g_wake_grace_until = now_ms_lock() + (uint64_t)std::max(1, hold) * 1000ull;
-        if (g_locked && !g_busy) arm_blank_in(hold);
-    }
+    apply_wake_hold();
     idle_apply();
     if (g_bar) g_bar->ping_watchdog();
     return 0;
@@ -160,6 +173,17 @@ void arm_blank_in(int s) {
 
 void arm_blank() { arm_blank_in(cfg.idle_blank_s); }
 
+int wake_hold_s() {
+    if (cfg.lock_wake_blank_s > 0) return cfg.lock_wake_blank_s;
+    return std::max(1, cfg.idle_blank_s);
+}
+
+void apply_wake_hold() {
+    int hold = wake_hold_s();
+    g_wake_grace_until = now_ms_lock() + (uint64_t)hold * 1000ull;
+    if (g_locked && !g_busy) arm_blank_in(hold);
+}
+
 void do_blank(bool reassert) {
     fprintf(stderr, "mattbar: lock: blanking display%s\n",
             reassert ? " (settle)" : "");
@@ -167,7 +191,9 @@ void do_blank(bool reassert) {
                    "omarchy-brightness-display off");
     g_display_off       = true;
     if (auto* nd = notify_daemon()) nd->refresh_popups();
-    g_wake_grace_until  = now_ms_lock() + 2000;
+    // Waveshare modeset pointer has shown up about 3s after the blank.
+    // Two seconds was not enough, so the lock screen lit with nobody there.
+    g_wake_grace_until  = now_ms_lock() + 6000;
     // hyprland misc.mouse_move_enables_dpms turns the panel back on from
     // the pointer event the modeset itself generates. Ignore that burst,
     // then DPMS-off once more so the dim sticks.
@@ -185,6 +211,7 @@ void do_blank(bool reassert) {
 
 void wake_display() {
     if (g_display_off) {
+        dpms_enable_now();
         spawn_helper("omarchy-system-wake");
         g_display_off = false;
     }
@@ -192,16 +219,26 @@ void wake_display() {
 
 void note_activity(NoteSrc src) {
     uint64_t now = now_ms_lock();
-    // Modeset / DPMS-on synthesizes pointer motion. Swallow it for the
-    // post-wake hold so the lock screen does not blank immediately.
+    // DPMS-off modeset invents pointer motion. Swallow that for the
+    // short post-blank grace whether the panel is lit or dark. A key,
+    // a click, or a touch, and any pointer move after the grace, is
+    // real input and wakes immediately.
     if (src == NoteMotion && now < g_wake_grace_until) return;
     g_blank_reassert = false;
     bool was_off = g_display_off;
     wake_display();
-    if (was_off)
+    if (was_off) {
+        g_woke_from_input = true;
+        fprintf(stderr, "mattbar: lock: wake (%s)\n",
+                src == NoteKey ? "key" : src == NoteButton ? "button" : "pointer");
         if (auto* nd = notify_daemon()) nd->refresh_popups();
+    }
     if (g_locked && !g_busy) {
-        if (now < g_wake_grace_until) {
+        if (was_off) {
+            // Real wake: stay lit for lock_wake_blank_s (30s), not the
+            // 5s post-lock dim.
+            apply_wake_hold();
+        } else if (now < g_wake_grace_until) {
             int left = (int)((g_wake_grace_until - now + 999) / 1000);
             if (left < 1) left = 1;
             arm_blank_in(left);
@@ -285,7 +322,100 @@ bool session_username(std::string& out) {
 }
 
 void draw_one(LSurf& s);
+void on_key(const Bar::KeyEvent& e);
 void request_lock_draw() { g_lock_dirty = true; }
+
+bool g_key_dpms_suppressed = false;
+int  g_thaw_fd = -1;
+int  g_thaw_n  = 0;
+
+void dpms_enable_now() {
+    if (!g_bar) return;
+    hypr_dispatch2_async(*g_bar, "dispatch dpms on",
+                         "dispatch hl.dsp.dpms({ action = \"enable\" })");
+}
+
+void set_input_enables_dpms(bool on) {
+    if (!g_bar) return;
+    const char* v = on ? "true" : "false";
+    hypr_fire(*g_bar,
+              std::string("keyword misc:key_press_enables_dpms ") + v,
+              "lock-key-dpms");
+    hypr_fire(*g_bar,
+              std::string("keyword misc:mouse_move_enables_dpms ") + v,
+              "lock-mouse-dpms");
+    hypr_fire(*g_bar,
+              std::string("eval hl.config({ misc = { key_press_enables_dpms = ") +
+                  v + ", mouse_move_enables_dpms = " + v + " } })",
+              "lock-input-dpms-lua");
+}
+
+void arm_lock_input() {
+    if (g_bar)
+        g_bar->set_seat_key_fallback([](const Bar::KeyEvent& e) { on_key(e); });
+    // Always push the keyword. Hibernate restore and a wedged Hyprland
+    // IPC drop the first send; skipping once g_key_dpms_suppressed is
+    // set is what left thaw keys eaten as display-wake.
+    // mouse_move_enables_dpms must go off too: Hyprland DPMS-on from the
+    // wake jiggle, then our wake_display DPMS-on again, modesets the
+    // Waveshare and the panel goes dark under the user.
+    set_input_enables_dpms(false);
+    if (!g_key_dpms_suppressed) {
+        g_key_dpms_suppressed = true;
+        fprintf(stderr, "mattbar: lock: Hyprland input-enables-dpms off "
+                        "(lock owns display wake)\n");
+    }
+}
+
+void disarm_thaw_retry() {
+    g_thaw_n = 0;
+    if (g_thaw_fd < 0) return;
+    itimerspec off{};
+    timerfd_settime(g_thaw_fd, 0, &off, nullptr);
+}
+
+void schedule_thaw_retry() {
+    if (g_thaw_fd < 0 || !g_locked || g_sleeping) return;
+    // Cover Waveshare modeset after S4: a few seconds of Hyprland
+    // ignoring IPC, then USB HID re-enum. Stop once the window is past.
+    static const int kMs[] = {200, 500, 1000, 2000, 4000};
+    constexpr int kN = (int)(sizeof kMs / sizeof kMs[0]);
+    if (g_thaw_n >= kN) return;
+    int ms = kMs[g_thaw_n];
+    itimerspec ts{};
+    ts.it_value.tv_sec  = ms / 1000;
+    ts.it_value.tv_nsec = (ms % 1000) * 1000000L;
+    timerfd_settime(g_thaw_fd, 0, &ts, nullptr);
+}
+
+void arm_thaw_reassert() {
+    if (!g_locked) return;
+    g_thaw_n = 0;
+    schedule_thaw_retry();
+}
+
+void on_thaw_retry() {
+    if (!g_locked || g_sleeping) {
+        disarm_thaw_retry();
+        return;
+    }
+    fprintf(stderr, "mattbar: lock: thaw reassert dpms/keys (%d)\n",
+            g_thaw_n + 1);
+    dpms_enable_now();
+    arm_lock_input();
+    ++g_thaw_n;
+    schedule_thaw_retry();
+}
+
+void disarm_lock_input() {
+    if (g_bar) g_bar->set_seat_key_fallback(nullptr);
+    disarm_thaw_retry();
+    if (g_key_dpms_suppressed) {
+        g_key_dpms_suppressed = false;
+        set_input_enables_dpms(true);
+        fprintf(stderr, "mattbar: lock: Hyprland input-enables-dpms restored\n");
+    }
+}
 
 void set_error(const std::string& e) {
     g_error = e;
@@ -977,15 +1107,28 @@ void destroy_surfs() {
 void on_locked(void*, ext_session_lock_v1*) {
     g_locked = true;
     disarm_reclaim();
+    arm_lock_input();
     fprintf(stderr, "mattbar: lock: session locked\n");
     start_fingerprint();
-    if (!g_sleeping) arm_blank();
+    if (g_sleeping) return;
+    // A real key, click, or pointer move already asked for the panel.
+    // Hold it for lock_wake_blank_s instead of the 5s dim.
+    if (g_woke_from_input) {
+        g_woke_from_input = false;
+        apply_wake_hold();
+        return;
+    }
+    // Idle blanked before the lock was confirmed. Stay dark. The 1.5s
+    // DPMS reassert is what keeps the modeset from lighting the panel.
+    if (g_display_off) return;
+    arm_blank();
 }
 
 void on_finished(void*, ext_session_lock_v1*) {
     g_finished = true;
     fprintf(stderr, "mattbar: lock: compositor finished the lock object\n");
     if (!g_locked) {
+        disarm_lock_input();
         destroy_surfs();
         if (g_lock) {
             ext_session_lock_v1_destroy(g_lock);
@@ -1003,6 +1146,7 @@ void redraw_lock() {
 
 void unlock() {
     disarm_blank();
+    disarm_lock_input();
     idle_reset_session();
     wake_display();
     stop_fingerprint();
@@ -1041,16 +1185,20 @@ void lock_init(Bar& bar) {
                 [](uint32_t) {
                     uint64_t x;
                     while (read(g_blank_fd, &x, sizeof x) > 0) {}
-                    if (!g_locked || g_busy || cfg.idle_blank_s <= 0) return;
+                    if (g_busy || cfg.idle_blank_s <= 0) return;
                     if (g_sleeping) {
                         drain_blank();
                         return;
                     }
                     if (g_blank_reassert) {
                         g_blank_reassert = false;
+                        // Real input already woke the panel. Do not
+                        // settle-blank it back off.
+                        if (g_woke_from_input) return;
                         do_blank(true);
                         return;
                     }
+                    if (!g_locked) return;
                     // Suspend/resume can fire a stale timer; match QS
                     // (Date.now() - armedAt > interval + 2000) → re-arm.
                     uint64_t age = now_ms_lock() - g_blank_armed_ms;
@@ -1064,6 +1212,18 @@ void lock_init(Bar& bar) {
                     do_blank(false);
                 },
                 "lock-blank");
+    }
+    if (g_thaw_fd < 0) {
+        g_thaw_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+        if (g_thaw_fd >= 0)
+            bar.add_fd(
+                g_thaw_fd,
+                [](uint32_t) {
+                    uint64_t x;
+                    while (read(g_thaw_fd, &x, sizeof x) > 0) {}
+                    on_thaw_retry();
+                },
+                "lock-thaw");
     }
     if (g_fp_retry < 0) {
         g_fp_retry = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
@@ -1104,6 +1264,22 @@ bool lock_is_locked() { return g_locked; }
 
 bool lock_display_asleep() { return g_display_off; }
 
+void lock_blank_now() {
+    if (g_sleeping) return;
+    do_blank(false);
+}
+
+void lock_wake_now() {
+    bool was = g_display_off;
+    g_blank_reassert = false;
+    drain_blank();
+    wake_display();
+    if (was)
+        if (auto* nd = notify_daemon()) nd->refresh_popups();
+}
+
+void lock_hold_after_wake() { apply_wake_hold(); }
+
 std::string lock_status_json() {
     char buf[256];
     snprintf(buf, sizeof buf,
@@ -1133,6 +1309,7 @@ std::string lock_now() {
     };
     ext_session_lock_v1_add_listener(g_lock, &lst, nullptr);
     for (auto& o : g_bar->output_list()) make_surf(o.wl);
+    arm_lock_input();
     ensure_waiter();
     // Sleep-lock polls `lock status` for secure=true and only gives the
     // lock IPC 1s. Put the protocol objects on the wire now; wallpaper

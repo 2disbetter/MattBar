@@ -269,6 +269,9 @@ public:
     };
     void register_surface(wl_surface*, SurfaceHooks);
     void unregister_surface(wl_surface*);
+    // Session lock: password keys while the lock surface does not yet
+    // have wl_keyboard.enter (suspend thaw, DPMS, output reconfigure).
+    void set_seat_key_fallback(std::function<void(const KeyEvent&)> f);
     // 0=none, 1=exclusive, 2=on_demand (falls back to exclusive if the
     // compositor's layer-shell is older than v4).
     uint32_t popup_kb_mode() const;
@@ -348,6 +351,9 @@ private:
     volatile sig_atomic_t running_ = 1;
     wl_surface* ptr_surface_ = nullptr; // which of our surfaces has pointer
     wl_surface* kb_surface_  = nullptr; // which of our surfaces has keyboard
+    std::function<void(const KeyEvent&)> seat_key_fallback_;
+    bool kb_nosurf_logged_   = false;
+    bool kb_nokeymap_logged_ = false;
     uint32_t last_button_serial_ = 0;
 
     struct xkb_context* xkb_ctx_    = nullptr;

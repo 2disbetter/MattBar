@@ -88,15 +88,22 @@ public:
 
 private:
     Host host_;
-    AsyncCmd list_cmd_, details_cmd_, radio_cmd_;
+    AsyncCmd list_cmd_, details_cmd_, radio_cmd_, connect_cmd_;
     TextField psk_;
     std::vector<NetRow> all_, nets_;
     std::vector<Hit> hits_;
     std::map<std::string, std::string> info_;
     std::string filter_, psk_ssid_, dns_, band_current_, band_selected_ = "auto";
+    std::string connecting_;
+    std::string failure_ssid_;
+    std::string failure_reason_;
     std::vector<std::string> bands_;
-    int sel_ = 0, scroll_ = 0, poll_fd_ = -1;
+    int sel_ = 0, scroll_ = 0, poll_fd_ = -1, spin_fd_ = -1;
+    double hx_ = -1, hy_ = -1;
+    std::string hover_tip_;
+    int connect_spin_ = 0;
     bool wifi_on_ = true, loading_ = false, scanning_ = false;
+    bool auto_scan_pending_ = false;
     double prev_rx_ = 0, prev_tx_ = 0, prev_t_ = 0;
     double down_rate_ = 0, up_rate_ = 0;
     double inet_ping_ = -1;
@@ -111,6 +118,8 @@ private:
     double fs() const { return cfg.shell_network_font_size; }
 
     void close() {
+        hx_ = hy_ = -1;
+        hover_tip_.clear();
         disarm_poll();
         psk_.clear();
         psk_ssid_.clear();
@@ -126,7 +135,8 @@ private:
             sh->bar()->add_fd(poll_fd_, [this](uint32_t) {
                 uint64_t n;
                 while (read(poll_fd_, &n, sizeof n) > 0) {}
-                if (host_.is_open()) refresh_details();
+                if (!host_.is_open()) return;
+        refresh_details();
             }, "net-panel-poll");
         }
         itimerspec ts{};
@@ -140,6 +150,27 @@ private:
         itimerspec off{};
         timerfd_settime(poll_fd_, 0, &off, nullptr);
     }
+    void arm_spin(bool on) {
+        auto* sh = mattbar_shell();
+        if (!sh || !sh->bar()) return;
+        if (spin_fd_ < 0) {
+            spin_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+            if (spin_fd_ < 0) return;
+            sh->bar()->add_fd(spin_fd_, [this](uint32_t) {
+                uint64_t n;
+                while (read(spin_fd_, &n, sizeof n) > 0) {}
+                if (connecting_.empty() || !host_.is_open()) return;
+                ++connect_spin_;
+                host_.redraw();
+            }, "net-connect-spin");
+        }
+        itimerspec ts{};
+        if (on) {
+            ts.it_value.tv_nsec    = 180 * 1000000L;
+            ts.it_interval.tv_nsec = 180 * 1000000L;
+        }
+        timerfd_settime(spin_fd_, 0, &ts, nullptr);
+    }
 
     void open() {
         sel_ = scroll_ = 0;
@@ -148,14 +179,16 @@ private:
         have_xfer_ = have_ping_ = false;
         host_.win.paint = [this](cairo_t* cr) { paint(cr); };
         host_.win.click = [this](double x, double y, int b) { on_click(x, y, b); };
+        host_.win.pmotion = [this](double x, double y) { on_hover(x, y); };
+        host_.win.pleave = [this] { on_hover(-1, -1); };
         host_.win.pscroll = [this](int d) {
             sel_ = ov::clamp_sel(sel_ + d, (int)nets_.size());
             host_.redraw();
         };
         host_.win.pkey = [this](const Bar::KeyEvent& e) { on_key(e); };
         host_.open(W(), H(), "mattbar-network", id(), true, Host::Place::BarEnd);
-        reload_list(false); // cached list only; Scan is a one-shot
-        if (cfg.shell_wifi_scan_on_open) reload_list(true);
+        auto_scan_pending_ = true;
+        reload_list(false); // cached list; a scan waits until we know the link
         refresh_details();
         arm_poll();
     }
@@ -310,6 +343,13 @@ private:
             dns_ = trim(out.substr(dn + 9));
             if (dns_.empty()) dns_ = "DHCP";
         }
+        // A live link already has a network list. Scan on open only when
+        // nothing is connected; the Scan button covers the other case.
+        if (auto_scan_pending_) {
+            auto_scan_pending_ = false;
+            if (inf("iface").empty() && wifi_on_ && !scanning_)
+                reload_list(true);
+        }
     }
 
     std::string inf(const char* k) const {
@@ -345,7 +385,7 @@ private:
         return wifi_on_ ? "No connection" : "Disconnected";
     }
     std::string hero_meta() const {
-        if (inf("type") == "wifi" || inf("type") == "ethernet") {
+        if (inf("type") == "ethernet" || wifi_connected()) {
             static const char* phrases[] = {
                 "Wiring bits", "Handling packets", "Sorting frames",
                 "Hauling bytes", "Routing crumbs", "Counting collisions",
@@ -372,6 +412,54 @@ private:
         return sec.empty() || sec == "--" || sec == "none";
     }
 
+    static std::string last_line(const std::string& s) {
+        std::string last, line;
+        for (char c : s) {
+            if (c == '\n' || c == '\r') {
+                if (!line.empty()) last = line;
+                line.clear();
+            } else {
+                line.push_back(c);
+            }
+        }
+        if (!line.empty()) last = line;
+        const std::string pfx = "Error: ";
+        if (last.rfind(pfx, 0) == 0) last = last.substr(pfx.size());
+        return last;
+    }
+
+    void begin_connect(const std::string& ssid, const std::string& cmd) {
+        auto* sh = mattbar_shell();
+        if (!sh || !sh->bar() || ssid.empty()) return;
+        if (!connecting_.empty()) return;
+        connecting_     = ssid;
+        failure_ssid_.clear();
+        failure_reason_.clear();
+        connect_spin_  = 0;
+        arm_spin(true);
+        host_.redraw();
+        connect_cmd_.run(
+            *sh->bar(), cmd,
+            [this, ssid](const std::string& out, int status) {
+                if (connecting_ == ssid) {
+                    connecting_.clear();
+                    arm_spin(false);
+                }
+                if (status == 0) {
+                    failure_ssid_.clear();
+                    failure_reason_.clear();
+                } else {
+                    failure_ssid_   = ssid;
+                    std::string why = last_line(out);
+                    failure_reason_ = why.empty() ? "Failed" : why;
+                }
+                reload_list(false);
+                refresh_details();
+                host_.redraw();
+            },
+            30000);
+    }
+
     void connect_sel() {
         if (sel_ < 0 || sel_ >= (int)nets_.size()) return;
         const NetRow& n = nets_[sel_];
@@ -381,10 +469,10 @@ private:
             return;
         }
         if (n.saved || is_open_sec(n.security)) {
-            spawn_helper(n.saved ? "nmcli connection up id " + shell_quote(n.ssid)
-                                   : "nmcli device wifi connect " +
-                                         shell_quote(n.ssid));
-            reload_list(false);
+            begin_connect(n.ssid,
+                          n.saved ? "nmcli connection up id " + shell_quote(n.ssid)
+                                  : "nmcli device wifi connect " +
+                                        shell_quote(n.ssid));
             return;
         }
         psk_ssid_ = n.ssid;
@@ -394,11 +482,12 @@ private:
     }
     void submit_psk() {
         if (psk_ssid_.empty()) return;
-        spawn_helper("nmcli device wifi connect " + shell_quote(psk_ssid_) +
-                       " password " + shell_quote(psk_.text));
+        std::string ssid = psk_ssid_;
+        std::string cmd  = "nmcli device wifi connect " + shell_quote(ssid) +
+                          " password " + shell_quote(psk_.text);
         psk_ssid_.clear();
         psk_.clear();
-        reload_list(false);
+        begin_connect(ssid, cmd);
     }
     void forget_sel() {
         if (sel_ < 0 || sel_ >= (int)nets_.size()) return;
@@ -440,6 +529,44 @@ private:
                        4000);
     }
 
+    std::string button_tip(const Hit& h) const {
+        switch (h.kind) {
+        case 4: return wifi_on_ ? "Turn Wi-Fi off" : "Turn Wi-Fi on";
+        case 5: return "Show QR code";
+        case 6: return "Run a speed test";
+        case 7:
+            if (band_selected_ == "auto" && !band_current_.empty())
+                return "Stay on " + band_label(band_current_);
+            return "Let Wi-Fi pick the band";
+        case 8: {
+            std::string l = band_label(h.tag);
+            return l.empty() ? std::string() : "Stay on " + l;
+        }
+        case 9:
+            if (h.tag == "DHCP") return "Use DNS from DHCP";
+            if (h.tag == "Cloudflare") return "Set DNS to Cloudflare";
+            if (h.tag == "Google") return "Set DNS to Google";
+            if (h.tag == "Custom") return "Set custom DNS servers";
+            return {};
+        case 10: return "Forget network";
+        case 11: return "Scan for networks";
+        case 12: return "Connect";
+        default: return {};
+        }
+    }
+    void on_hover(double x, double y) {
+        hx_ = x;
+        hy_ = y;
+        std::string tip;
+        if (x >= 0) {
+            int hi = hit_at(hits_, x, y);
+            if (hi >= 0) tip = button_tip(hits_[hi]);
+        }
+        if (tip == hover_tip_) return;
+        hover_tip_ = std::move(tip);
+        host_.redraw();
+    }
+
     void on_click(double x, double y, int btn) {
         int hi = hit_at(hits_, x, y);
         if (hi < 0) return;
@@ -476,6 +603,10 @@ private:
         }
         if (h.kind == 9) {
             set_dns(h.tag);
+            return;
+        }
+        if (h.kind == 12) {
+            submit_psk();
             return;
         }
         if (h.kind == 10 || btn == BTN_RIGHT) {
@@ -554,7 +685,7 @@ private:
         const int rh = ov::row_h(fs());
         double y = 14;
 
-        // ---- Hero --------------------------------------------------------
+        // ---- Hero: icon, name, phrase, icon actions, radio switch --------
         const char* ic =
             info_["type"] == "ethernet"
                 ? "\U000F1200"
@@ -562,29 +693,45 @@ private:
                                                                 ? info_["signal"].c_str()
                                                                 : "70"))
                                            : "\U000F092E");
-        cairo_set_font_size(cr, fs() + 8);
-        say(cr, 16, y + 16, ic, cfg.c_fg);
-        cairo_set_font_size(cr, fs());
-        say(cr, 52, y + 10, utf8_trunc(hero_title(), 22), cfg.c_fg);
+        cairo_set_font_size(cr, fs() + 10);
+        say(cr, 16, y + 18, ic, cfg.c_fg);
+        cairo_set_font_size(cr, fs() + 1);
+        say(cr, 52, y + 12, utf8_trunc(hero_title(), 28), cfg.c_fg);
         {
             std::string meta = hero_meta();
             std::transform(meta.begin(), meta.end(), meta.begin(),
                            [](unsigned char c) { return (char)std::toupper(c); });
             cairo_set_font_size(cr, std::max(10.0, fs() - 3));
-            say(cr, 52, y + 28, meta, cfg.c_dim);
+            say(cr, 52, y + 30, meta, cfg.c_dim);
             cairo_set_font_size(cr, fs());
         }
-        double ax = W() - 18;
-        auto hero_btn = [&](const char* label, int kind) {
-            double bw = tw(cr, label) + 14;
+        double ax = W() - 16;
+        auto icon_btn = [&](const char* glyph, int kind) {
+            const double bw = 28;
             ax -= bw;
             col(cr, cfg.c_ws_bg, 1);
-            rrect(cr, ax, y + 6, bw, 24, 6);
+            rrect(cr, ax, y + 6, bw, 26, 6);
             cairo_fill(cr);
-            say(cr, ax + 7, y + 18, label, cfg.c_fg);
-            hits_.push_back({ax, y + 6, bw, 24, -1, kind, {}});
+            cairo_set_font_size(cr, fs() + 2);
+            say(cr, ax + 6, y + 19, glyph, cfg.c_fg);
+            cairo_set_font_size(cr, fs());
+            hits_.push_back({ax, y + 6, bw, 26, -1, kind, {}});
             ax -= 8;
         };
+        {
+            const double bw = 40, bh = 22;
+            ax -= bw;
+            col(cr, wifi_on_ ? cfg.c_accent : cfg.c_ws_bg, 1);
+            rrect(cr, ax, y + 8, bw, bh, bh / 2);
+            cairo_fill(cr);
+            col(cr, cfg.c_bg, 1);
+            double kx = wifi_on_ ? ax + bw - bh + 2 : ax + 2;
+            cairo_arc(cr, kx + (bh - 4) / 2.0, y + 8 + bh / 2.0, (bh - 6) / 2.0,
+                      0, 6.28318530718);
+            cairo_fill(cr);
+            hits_.push_back({ax, y + 8, bw, bh, -1, 4, {}});
+            ax -= 8;
+        }
         {
             const char* scan_lbl = scanning_ ? "Scanning\u2026" : "Scan";
             double sbw = tw(cr, scan_lbl) + 16;
@@ -599,55 +746,43 @@ private:
                 hits_.push_back({ax, y + 6, sbw, 24, -1, 11, {}});
             ax -= 8;
         }
-        {
-            std::string tog = wifi_on_ ? "Wi-Fi On" : "Wi-Fi Off";
-            double bw = tw(cr, tog) + 16;
-            ax -= bw;
-            col(cr, wifi_on_ ? cfg.c_accent : cfg.c_ws_bg, 1);
-            rrect(cr, ax, y + 6, bw, 24, 6);
-            cairo_fill(cr);
-            say(cr, ax + 8, y + 18, tog,
-                wifi_on_ ? contrast_on(cfg.c_accent) : cfg.c_dim);
-            hits_.push_back({ax, y + 6, bw, 24, -1, 4, {}});
-            ax -= 8;
-        }
-        if (!info_["iface"].empty()) hero_btn("Speed", 6);
-        if (wifi_connected()) hero_btn("QR", 5);
-        y += 48;
+        if (!info_["iface"].empty()) icon_btn("\U000F04C5", 6);
+        if (wifi_connected()) icon_btn("\U000F0432", 5);
+        y += 52;
 
-        // ---- Stats (same grid as Quickshell: ping/loss, rx/tx, totals, IP) -
+        // ---- Stats: label | value | label | value, values right-aligned ---
         if (!info_["iface"].empty()) {
-            auto cell = [&](const char* lab, const std::string& val, bool urg) {
-                cairo_set_font_size(cr, std::max(10.0, fs() - 3));
-                say(cr, 18, y + 8, lab, cfg.c_dim);
+            auto pair = [&](double x, double w, const char* lab,
+                            const std::string& val, bool urg) {
+                std::string shown = val.empty() ? "--" : val;
                 cairo_set_font_size(cr, fs());
-                say(cr, 18, y + 24, val.empty() ? "--" : val,
-                    urg ? cfg.c_urgent : cfg.c_fg);
+                say(cr, x, y + 12, lab, cfg.c_dim);
+                double vw = tw(cr, shown);
+                say(cr, x + w - vw, y + 12, shown, urg ? cfg.c_urgent : cfg.c_fg);
             };
-            double colw = (W() - 36) / 2.0;
-            auto row2 = [&](const char* l1, const std::string& v1, bool u1,
+            double gap = 16;
+            double half = (W() - 36 - gap) / 2.0;
+            auto line = [&](const char* l1, const std::string& v1, bool u1,
                             const char* l2, const std::string& v2, bool u2) {
-                cairo_save(cr);
-                cell(l1, v1, u1);
-                cairo_translate(cr, colw, 0);
-                cell(l2, v2, u2);
-                cairo_restore(cr);
-                y += 36;
+                pair(18, half, l1, v1, u1);
+                pair(18 + half + gap, half, l2, v2, u2);
+                y += 24;
             };
-            row2("Ping", format_ping(inet_ping_, have_ping_),
+            line("Ping", format_ping(inet_ping_, have_ping_),
                  have_ping_ && pkt_loss_ > 0, "Packet Loss",
                  have_ping_ ? (std::to_string(pkt_loss_) + "%") : "--",
                  pkt_loss_ > 0);
-            row2("Receiving", have_xfer_ ? format_rate(down_rate_) : "--", false,
+            line("Receiving", have_xfer_ ? format_rate(down_rate_) : "--", false,
                  "Sending", have_xfer_ ? format_rate(up_rate_) : "--", false);
-            row2("Downloaded",
+            line("Downloaded",
                  have_xfer_ ? format_bytes(atof(info_["rx_bytes"].c_str())) : "--",
                  false, "Uploaded",
                  have_xfer_ ? format_bytes(atof(info_["tx_bytes"].c_str())) : "--",
                  false);
-            row2("IP Address", info_["ip"].empty() ? "--" : info_["ip"], false,
+            line("IP Address", info_["ip"].empty() ? "--" : info_["ip"], false,
                  "Gateway", info_["gateway"].empty() ? "--" : info_["gateway"],
                  false);
+            y += 6;
         }
 
         // ---- Band --------------------------------------------------------
@@ -688,14 +823,6 @@ private:
             y += 36;
         }
 
-        if (!psk_ssid_.empty()) {
-            say(cr, 18, y + 10, "Password for " + psk_ssid_, cfg.c_fg);
-            psk_.draw(cr, 18, y + 26, W() - 36, ov::search_h(fs()), "passphrase");
-            say(cr, 18, y + 26 + ov::search_h(fs()) + 16,
-                "Enter to connect   Esc to cancel", cfg.c_dim);
-            return;
-        }
-
         if (scanning_) {
             cairo_set_font_size(cr, std::max(10.0, fs() - 2));
             say(cr, 18, y + 10, "SCANNING WI-FI\u2026", cfg.c_accent);
@@ -729,31 +856,61 @@ private:
                 --i;
                 continue;
             }
-            double mid = y + rh / 2.0;
-            if (idx == sel_) {
-                col(cr, cfg.c_accent, 0.28);
-                rrect(cr, 10, y + 2, W() - 20, rh - 4, 6);
+            bool joining = !connecting_.empty() && n.ssid == connecting_;
+            bool failed  = n.ssid == failure_ssid_ && !failure_reason_.empty();
+            std::string st = joining ? "Connecting\u2026"
+                                     : (failed ? utf8_trunc(failure_reason_, 28)
+                                               : (n.in_use ? "Connected" : ""));
+            bool two = !st.empty();
+            double row_h = rh + (two ? 12 : 0);
+            double mid = y + (two ? rh * 0.42 : rh / 2.0);
+            bool can_forget = n.saved && !n.in_use;
+            bool show_forget = can_forget && idx == sel_;
+            if (idx == sel_ || joining) {
+                col(cr, n.in_use ? cfg.c_accent : cfg.c_ws_bg,
+                    n.in_use ? 0.35 : 1);
+                rrect(cr, 10, y + 1, W() - 20, row_h - 2, 6);
                 cairo_fill(cr);
             }
-            Color fg = idx == sel_ ? contrast_on(cfg.c_accent) : cfg.c_fg;
-            say(cr, 18, mid, wifi_icon(n.signal), n.in_use ? cfg.c_accent : fg);
-            std::string lab = utf8_trunc(n.ssid, 22);
-            say(cr, 44, mid, lab, n.in_use ? cfg.c_accent : fg);
-            std::string st = n.in_use ? "Connected" : (n.saved ? "" : "");
-            if (!is_open_sec(n.security)) {
-                say(cr, W() - 36, mid, "\U000F033E", cfg.c_dim); // lock
-                if (n.saved && !n.in_use)
-                    hits_.push_back(
-                        {W() - 48.0, y, 36, (double)rh, idx, 10, n.ssid});
+            Color icol = failed ? cfg.c_urgent
+                                : (joining || n.in_use ? cfg.c_accent : cfg.c_fg);
+            say(cr, 18, mid, wifi_icon(n.signal), icol);
+            say(cr, 44, mid, utf8_trunc(n.ssid, 24), cfg.c_fg);
+            if (two) {
+                cairo_set_font_size(cr, std::max(10.0, fs() - 3));
+                say(cr, 44, y + row_h - 8, st, failed ? cfg.c_urgent : cfg.c_dim);
+                cairo_set_font_size(cr, fs());
             }
-            if (!st.empty())
-                say(cr, W() - 18 - tw(cr, st) - (is_open_sec(n.security) ? 0 : 22),
-                    mid, st, cfg.c_dim);
-            hits_.push_back({10, y, W() - 56.0, (double)rh, idx, 0, n.ssid});
-            y += rh;
+            if (!is_open_sec(n.security) || can_forget) {
+                const char* glyph = show_forget ? "\U000F0159" : "\U000F033E";
+                say(cr, W() - 34, mid, glyph,
+                    show_forget ? cfg.c_urgent : cfg.c_dim);
+                if (can_forget)
+                    hits_.push_back(
+                        {W() - 48.0, y, 36, row_h, idx, 10, n.ssid});
+            }
+            hits_.push_back({10, y, W() - 56.0, row_h, idx, 0, n.ssid});
+            y += row_h;
+            if (!psk_ssid_.empty() && n.ssid == psk_ssid_) {
+                psk_.draw(cr, 44, y + 2, W() - 44 - 40, ov::search_h(fs()),
+                          "Passphrase");
+                say(cr, W() - 30, y + 2 + ov::search_h(fs()) / 2.0, "\U000F012C",
+                    psk_.text.empty() ? cfg.c_dim : cfg.c_accent);
+                hits_.push_back({W() - 40.0, y, 32, (double)ov::search_h(fs()), idx, 12,
+                                 n.ssid});
+                y += ov::search_h(fs()) + 8;
+            }
         }
         if (!filter_.empty())
             say(cr, 18, H() - 16, "/" + filter_, cfg.c_dim);
+        if (hx_ >= 0) {
+            int hi = hit_at(hits_, hx_, hy_);
+            if (hi >= 0) {
+                const Hit& h = hits_[hi];
+                ov::draw_button_tip(cr, W(), H(), fs(), button_tip(h), h.x, h.y,
+                                    h.w, h.h);
+            }
+        }
         (void)loading_;
     }
 };

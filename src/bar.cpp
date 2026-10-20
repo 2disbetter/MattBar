@@ -285,7 +285,9 @@ void Bar::on_kb_keymap(void* data, wl_keyboard*, uint32_t format, int32_t fd,
 
 void Bar::on_kb_enter(void* data, wl_keyboard*, uint32_t, wl_surface* surf,
                       wl_array*) {
-    static_cast<Bar*>(data)->kb_surface_ = surf;
+    auto* self = static_cast<Bar*>(data);
+    self->kb_surface_        = surf;
+    self->kb_nosurf_logged_  = false;
 }
 
 void Bar::on_kb_leave(void* data, wl_keyboard*, uint32_t, wl_surface* surf) {
@@ -297,7 +299,36 @@ void Bar::on_kb_leave(void* data, wl_keyboard*, uint32_t, wl_surface* surf) {
 void Bar::on_kb_key(void* data, wl_keyboard*, uint32_t, uint32_t, uint32_t key,
                     uint32_t state) {
     auto* self = static_cast<Bar*>(data);
-    if (!self->xkb_state_) return;
+    if (!self->xkb_state_) {
+        // After hibernate the compositor may re-bind the seat before it
+        // sends a keymap. Keep taking password keys with a default map
+        // until the real one arrives.
+        if (self->xkb_keymap_) {
+            self->xkb_state_ = xkb_state_new(self->xkb_keymap_);
+        } else {
+            if (!self->xkb_ctx_)
+                self->xkb_ctx_ = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+            if (self->xkb_ctx_) {
+                struct xkb_rule_names names = {};
+                xkb_keymap* km = xkb_keymap_new_from_names(
+                    self->xkb_ctx_, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+                if (km) {
+                    self->xkb_keymap_ = km;
+                    self->xkb_state_  = xkb_state_new(km);
+                    fprintf(stderr,
+                            "mattbar: lock: default keymap until compositor "
+                            "sends one\n");
+                }
+            }
+        }
+        if (!self->xkb_state_) {
+            if (self->seat_key_fallback_ && !self->kb_nokeymap_logged_) {
+                self->kb_nokeymap_logged_ = true;
+                fprintf(stderr, "mattbar: lock: drop key (no keymap)\n");
+            }
+            return;
+        }
+    }
     const xkb_keycode_t code = key + 8;
     const bool pressed = state == WL_KEYBOARD_KEY_STATE_PRESSED;
     xkb_state_update_key(self->xkb_state_, code,
@@ -345,10 +376,26 @@ void Bar::on_kb_repeat(void* data, wl_keyboard*, int32_t rate, int32_t delay) {
     if (delay > 0) self->kb_repeat_delay_ = delay;
 }
 
+void Bar::set_seat_key_fallback(std::function<void(const KeyEvent&)> f) {
+    seat_key_fallback_   = std::move(f);
+    kb_nosurf_logged_    = false;
+    kb_nokeymap_logged_  = false;
+}
+
 void Bar::deliver_key(const KeyEvent& ev) {
-    if (!kb_surface_) return;
-    auto it = extra_surfaces_.find(kb_surface_);
-    if (it != extra_surfaces_.end() && it->second.key) it->second.key(ev);
+    if (kb_surface_) {
+        auto it = extra_surfaces_.find(kb_surface_);
+        if (it != extra_surfaces_.end() && it->second.key) {
+            it->second.key(ev);
+            return;
+        }
+    }
+    if (!seat_key_fallback_) return;
+    if (!kb_surface_ && ev.pressed && !kb_nosurf_logged_) {
+        kb_nosurf_logged_ = true;
+        fprintf(stderr, "mattbar: lock: key with no focused surface\n");
+    }
+    seat_key_fallback_(ev);
 }
 
 void Bar::arm_key_repeat(bool on) {

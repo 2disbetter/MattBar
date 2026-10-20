@@ -83,6 +83,7 @@ int main(int argc, char** argv) {
     bar.add_module("update",     make_update_button());
     bar.add_module("agents",     make_agents());
     bar.add_module("localllm",   make_local_llm());
+    bar.add_module("bandwidth",  make_nethogs());
     bar.add_module("microphone", make_microphone());
     bar.add_module("screenrecord", make_screenrecord());
     bar.add_module("temp",       make_temp());

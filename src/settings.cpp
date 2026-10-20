@@ -531,7 +531,9 @@ void SettingsWindow::draw() {
         y += 26;
         y = hint(y, "screensaver and lock are Omarchy's idle.screensaver / idle.lock");
         y += 26;
-        y = hint(y, "display off matches Quickshell's 5 s blank; 0 keeps the panel lit");
+        y = hint(y, "after lock is due the saver stays lit for Keep display on after wake");
+        y += 26;
+        y = hint(y, "display off after lock is the short dim once the password field is up");
         y += 12;
         }
 
@@ -614,10 +616,9 @@ void SettingsWindow::draw() {
                         std::clamp(cfg.shell_network_font_size + d, 9.0, 22.0);
                 });
         y += 30;
-        checkbox(24, y, "Scan on open", &cfg.shell_wifi_scan_on_open);
-        y += 24;
-        y = hint(y, "off by default: use Scan in the panel. Radio On/Off "
-                    "kills the Wi-Fi radio");
+        y = hint(y, "opens with a scan only when nothing is connected");
+        y += 22;
+        y = hint(y, "the Scan button scans any time. The switch kills the radio");
         y += 36;
 
         section(y, "Bluetooth");
@@ -629,10 +630,9 @@ void SettingsWindow::draw() {
                         std::clamp(cfg.shell_bluetooth_font_size + d, 9.0, 22.0);
                 });
         y += 30;
-        checkbox(24, y, "Scan on open", &cfg.shell_bt_scan_on_open);
-        y += 24;
-        y = hint(y, "off by default: Scan in the panel is one-shot. Radio "
-                    "On/Off uses rfkill");
+        y = hint(y, "opens with a scan only when nothing is connected");
+        y += 22;
+        y = hint(y, "the Scan button scans any time. The switch uses rfkill");
         y += 36;
 
         section(y, "Display");
@@ -1037,7 +1037,7 @@ void SettingsWindow::draw() {
                         std::clamp(cfg.lock_wake_blank_s + d * 5, 0, 120);
                 });
         y += 24;
-        y = hint(y, "lock screen stays lit this long after suspend or hibernate");
+        y = hint(y, "lock screen after suspend/hibernate, and screensaver after lock is due");
         y += 26;
     }
     stepper(y, "Tray auto-collapse (ms)",
@@ -1818,6 +1818,37 @@ void SettingsWindow::draw() {
                    nullptr);
         y += 26;
     }
+    y += 36;
+    section(y, "Bandwidth");
+    y += 26;
+    text(24, y, "Tool", cfg.c_fg);
+    y += 28;
+    {
+        struct Tool {
+            const char* id;
+            const char* label;
+        } tools[] = {{"mattnhogs", "mattnhogs"}, {"nethogs", "nethogs"}};
+        double px = 24;
+        for (auto& t : tools) {
+            bool on = cfg.bandwidth_tool == t.id;
+            double bw = text_w(t.label) + 22, bh = 24;
+            col(cr, on ? cfg.c_accent : cfg.c_ws_bg, 1.0);
+            cairo_rectangle(cr, px, y - bh / 2, bw, bh);
+            cairo_fill(cr);
+            text(px + 11, y, t.label, on ? contrast_on(cfg.c_accent) : cfg.c_fg);
+            std::string id = t.id;
+            add_widget(px, y - bh / 2, bw, bh,
+                       [id, this] {
+                           cfg.bandwidth_tool = id;
+                           apply();
+                       },
+                       nullptr);
+            px += bw + 8;
+        }
+    }
+    y += 22;
+    y = hint(y, "per-process traffic. mattnhogs is installed on PATH; no path to set");
+    y += 26;
     } // TabModules (bar chips, first half)
 
     if (tab_ == TabNotify) {
@@ -2091,6 +2122,7 @@ void SettingsWindow::draw() {
         {"update", "Update", &cfg.show_update},
         {"agents", "AI agents", &cfg.show_agents},
         {"localllm", "Local LLM", &cfg.show_local_llm},
+        {"bandwidth", "Bandwidth", &cfg.show_bandwidth},
         {"screenrecord", "Rec light", &cfg.show_screenrecord},
         {"temp", "Temp", &cfg.show_temp},
         {"network", "Network", &cfg.show_network},

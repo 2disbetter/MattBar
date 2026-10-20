@@ -5248,6 +5248,7 @@ public:
     void refresh_check() {
         if (!check_.empty()) run_check();
     }
+    void launch() { launch_tracked(); }
     void clear_indicator() {
         check_cmd_.cancel();
         if (bar_) set_text(*bar_, "");
@@ -5348,9 +5349,13 @@ public:
         if (button == BTN_LEFT) {
             if (check_.empty()) {
                 spawn(live_click(click_));
+            } else if (auto* sh = mattbar_shell()) {
+                // Preview what would change. The panel's Update button is
+                // what actually starts the updater.
+                if (sh->is_open("mattbar.update")) sh->hide("mattbar.update");
+                else sh->summon("mattbar.update", "");
             } else {
-                launch_tracked(); // re-check the moment it exits
-                fast_until_ = now_s() + 1800; // plus a 30 min fast window
+                launch_tracked();
             }
         } else if (button == BTN_RIGHT) {
             spawn(rclick_);
@@ -5426,6 +5431,7 @@ private:
                                 : spawn_sh(pre + "sh -c " + sh_quote(click_), o);
         if (pid <= 0) return;
         child_ = pid;
+        fast_until_ = now_s() + 1800;
         std::weak_ptr<char> alive = alive_;
         watch_child(pid, [this, alive](int) {
             if (alive.expired()) return;
@@ -5468,6 +5474,9 @@ void update_refresh() {
 }
 void update_clear() {
     if (g_update) g_update->clear_indicator();
+}
+void update_launch() {
+    if (g_update) g_update->launch();
 }
 
 

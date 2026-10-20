@@ -52,6 +52,34 @@ inline void rrect(cairo_t* cr, double x, double y, double w, double h,
     cairo_arc(cr, x + r, y + r, r, M_PI, 1.5 * M_PI);
     cairo_close_path(cr);
 }
+// Small label under a button. Flips above the button when the panel
+// bottom is too close, and stays inside the card.
+inline void draw_button_tip(cairo_t* cr, int panel_w, int panel_h, double font,
+                            const std::string& text, double bx, double by,
+                            double bw, double bh) {
+    if (text.empty() || panel_w < 20 || panel_h < 20) return;
+    const double tfs = std::max(10.0, font - 2);
+    cairo_set_font_size(cr, tfs);
+    const double pad_x = 8, pad_y = 4;
+    const double twid = tw(cr, text);
+    const double w = twid + pad_x * 2;
+    const double h = tfs + pad_y * 2 + 2;
+    double x = bx + bw / 2.0 - w / 2.0;
+    double y = by + bh + 4;
+    if (y + h > panel_h - 4) y = by - h - 4;
+    if (x < 6) x = 6;
+    if (x + w > panel_w - 6) x = std::max(6.0, panel_w - 6.0 - w);
+    if (y < 4) y = 4;
+    col(cr, cfg.c_ws_bg, 1);
+    rrect(cr, x, y, w, h, 6);
+    cairo_fill_preserve(cr);
+    col(cr, cfg.c_fg, 0.28);
+    cairo_set_line_width(cr, 1);
+    cairo_stroke(cr);
+    say(cr, x + pad_x, y + h / 2.0, text, cfg.c_fg);
+    cairo_set_font_size(cr, font);
+}
+
 inline void panel_bg(cairo_t* cr, int w, int h) {
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
@@ -325,7 +353,7 @@ static const char* k_exclusive[] = {
     "omarchy.speedtest",   "omarchy.weather", "omarchy.agents",
     "omarchy.disk-speedtest", "omarchy.power", "omarchy.reminders",
     "omarchy.tailscale", "omarchy.dropbox", "omarchy.clock-timezone",
-    "mattbar.plugin-add", "mattbar.plugin-remove"};
+    "mattbar.plugin-add", "mattbar.plugin-remove", "mattbar.update"};
 
 inline void close_other_overlays(const char* keep) {
     auto* sh = mattbar_shell();

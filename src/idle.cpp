@@ -39,6 +39,7 @@ namespace {
 Bar* g_bar = nullptr;
 ext_idle_notification_v1* notif = nullptr;
 int  lock_fd = -1;
+int  blank_fd = -1;
 int  grace_fd = -1;
 int  stale_fd = -1;
 int  watch_fd = -1;
@@ -57,19 +58,18 @@ uint64_t last_launch_ms = 0;
 bool stay_awake = false;
 std::set<std::string> saver_addrs;
 constexpr const char* kSaverClass = "org.omarchy.screensaver";
-// Dismiss the saver after this much *moving* time (gaps reset the count).
-constexpr int kMoveNeedMs   = 1500;
+// One real move wakes. The first sample only records where the cursor is.
 constexpr int kMoveTickMs   = 50;
 constexpr int kMovePx       = 4;   // ignore trackpad/touchscreen jitter
-constexpr int kMoveStillMs  = 250; // stillness resets the accumulator
+constexpr int kMoveTeleport = 150; // one-sample jump is a modeset warp, not a hand
 constexpr int kRelaunchGapMs = 2000;
 constexpr int kRelaunchMax   = 3; // rapid deaths: stop looping
 int  relaunch_hits = 0;
-int  move_ms     = 0;
-int  still_ms    = 0;
 int  last_cx     = 0, last_cy = 0;
+int  move_hits  = 0;
 bool have_cursor = false;
 uint64_t saver_move_after = 0;
+bool     saver_keep_dark   = false;
 
 uint64_t idle_now_ms() {
     timespec ts;
@@ -149,9 +149,8 @@ void arm_move_watch(bool on) {
     }
     timerfd_settime(motion_fd, 0, &ts, nullptr);
     if (!on) {
-        move_ms      = 0;
-        still_ms     = 0;
-        have_cursor  = false;
+        have_cursor = false;
+        move_hits   = 0;
     }
 }
 
@@ -178,6 +177,16 @@ std::string hypr_cmd(const std::string& cmd) {
     while ((n = read(fd, buf, sizeof buf)) > 0) out.append(buf, (size_t)n);
     close(fd);
     return out;
+}
+
+bool panel_is_off() {
+    std::string j = hypr_cmd("j/monitors");
+    return j.find("\"dpmsStatus\": false") != std::string::npos ||
+           j.find("\"dpmsStatus\":false") != std::string::npos;
+}
+
+void dpms_off() {
+    hypr_cmd("dispatch hl.dsp.dpms({ action = \"disable\" })");
 }
 
 bool cursor_xy(int& x, int& y) {
@@ -289,6 +298,34 @@ void disarm_relaunch() {
     if (relaunch_fd < 0) return;
     itimerspec off{};
     timerfd_settime(relaunch_fd, 0, &off, nullptr);
+}
+
+void disarm_idle_blank() {
+    if (blank_fd < 0) return;
+    itimerspec off{};
+    timerfd_settime(blank_fd, 0, &off, nullptr);
+}
+
+int saver_lock_hold_s() {
+    // Same 30s "Keep display on after wake" hold the lock screen uses
+    // after suspend/hibernate. idle_blank_s (5s) is the short dim once
+    // the password field is actually up.
+    if (cfg.lock_wake_blank_s > 0) return cfg.lock_wake_blank_s;
+    return cfg.idle_blank_s;
+}
+
+void arm_idle_blank(bool announce = true) {
+    if (blank_fd < 0) return;
+    int hold = saver_lock_hold_s();
+    if (hold <= 0) {
+        disarm_idle_blank();
+        return;
+    }
+    itimerspec ts{};
+    ts.it_value.tv_sec = hold;
+    timerfd_settime(blank_fd, 0, &ts, nullptr);
+    if (announce)
+        fprintf(stderr, "mattbar: idle: display off in %ds then lock\n", hold);
 }
 
 std::string idle_wrap_dir() {
@@ -493,6 +530,9 @@ void launch_screensaver() {
         cmd = "omarchy-launch-screensaver";
     }
     last_launch_ms = idle_now_ms();
+    // MBDisSaver (or a previous idle blank) may already have the panel
+    // off. Mapping the screensaver otherwise wakes DPMS and shows it.
+    saver_keep_dark = panel_is_off();
     spawn_detached(cmd);
 }
 
@@ -503,14 +543,19 @@ void arm_fresh_from_now();
 void cancel_cycle(const char* why);
 void kill_screensaver_procs();
 
-void finish_lock_from_idle(const char* why) {
+void finish_lock_from_idle(const char* why, bool wake_panel = true) {
     fprintf(stderr, "mattbar: idle: locking (%s)\n", why ? why : "");
     saver_stopping = true;
     lock_pending   = false;
     disarm_relaunch();
+    disarm_idle_blank();
     stop_screensaver();
-    restore_pointer();
+    // restore_pointer runs omarchy-system-wake, which lights the panel.
+    // After idle-blank the lock is taken in the dark so a later wake
+    // shows the password field, not another pass through the saver.
+    if (wake_panel) restore_pointer();
     lock_now();
+    if (wake_panel) lock_hold_after_wake();
     cycle         = false;
     saver_started = false;
     saver_reset_windows();
@@ -555,7 +600,7 @@ void request_relaunch(const char* why) {
         return;
     if (saver_up()) return;
     if (lock_pending) {
-        finish_lock_from_idle(why);
+        finish_lock_from_idle(why, !lock_display_asleep());
         return;
     }
     uint64_t now = idle_now_ms();
@@ -730,6 +775,8 @@ void cancel_cycle(const char* why) {
     disarm_lock_timer();
     disarm_stale_timer();
     disarm_relaunch();
+    disarm_idle_blank();
+    lock_wake_now();
     arm_watch(false);
     arm_move_watch(false);
     arm_grace(0);
@@ -756,15 +803,15 @@ void dismiss_screensaver(const char* why) {
     if (pending && !stay_awake && !lock_is_locked()) {
         fprintf(stderr, "mattbar: idle: lock after screensaver dismiss\n");
         lock_now();
+        lock_hold_after_wake();
     }
 }
 
 void on_move_tick() {
     if (!cycle || !saver_started || !saver_up() ||
         idle_now_ms() < saver_move_after) {
-        move_ms     = 0;
-        still_ms    = 0;
         have_cursor = false;
+        move_hits   = 0;
         return;
     }
     int x = 0, y = 0;
@@ -780,19 +827,21 @@ void on_move_tick() {
     last_cy = y;
     if (dx < 0) dx = -dx;
     if (dy < 0) dy = -dy;
-    if (dx + dy >= kMovePx) {
-        move_ms += kMoveTickMs;
-        still_ms = 0;
-        if (move_ms >= kMoveNeedMs) {
-            fprintf(stderr, "mattbar: idle: screensaver dismissed by mouse "
-                            "(%dms of movement)\n",
-                    move_ms);
-            dismiss_screensaver("screensaver-mouse-move");
-        }
-    } else {
-        still_ms += kMoveTickMs;
-        if (still_ms >= kMoveStillMs) move_ms = 0;
+    // A modeset reports the cursor in a new place once. That is not a hand.
+    // A person produces a second moving sample on the next poll.
+    if (dx + dy >= kMoveTeleport) {
+        move_hits = 0;
+        return;
     }
+    if (dx + dy < kMovePx) {
+        move_hits = 0;
+        return;
+    }
+    if (++move_hits < 2) return;
+    fprintf(stderr, "mattbar: idle: screensaver dismissed by mouse\n");
+    dismiss_screensaver(lock_pending && lock_display_asleep()
+                            ? "screensaver-mouse-move-blanked"
+                            : "screensaver-mouse-move");
 }
 
 void start_cycle() {
@@ -888,6 +937,13 @@ void on_saver_opened(const std::string& addr) {
     disarm_relaunch();
     fprintf(stderr, "mattbar: idle: screensaver window %s (%zu)\n",
             addr.c_str(), saver_addrs.size());
+    if (saver_keep_dark) {
+        fprintf(stderr, "mattbar: idle: screensaver stays dark\n");
+        dpms_off();
+        // The Waveshare delivers the modeset pointer a few seconds late.
+        // Counting motion before that dismisses the saver and wakes the panel.
+        saver_move_after = idle_now_ms() + 6000;
+    }
 }
 
 void on_saver_closed(const std::string& addr) {
@@ -961,6 +1017,7 @@ void idle_init(Bar& bar) {
     idle_reset_session();
     restore_pointer();
     lock_fd    = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    blank_fd   = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     grace_fd   = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     stale_fd   = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     if (lock_fd >= 0)
@@ -980,6 +1037,7 @@ void idle_init(Bar& bar) {
                     fprintf(stderr,
                             "mattbar: idle: lock due; screensaver stays "
                             "until key or mouse\n");
+                    arm_idle_blank();
                     return;
                 }
                 fprintf(stderr, "mattbar: idle: lock timeout\n");
@@ -996,6 +1054,20 @@ void idle_init(Bar& bar) {
                 arm_grace(0);
             },
             "idle-lock");
+    if (blank_fd >= 0)
+        bar.add_fd(
+            blank_fd,
+            [](uint32_t) {
+                uint64_t x;
+                while (read(blank_fd, &x, sizeof x) > 0) {}
+                if (!cycle || !lock_pending || stay_awake || lock_is_locked())
+                    return;
+                fprintf(stderr,
+                        "mattbar: idle: blanking display; locking in the dark\n");
+                lock_blank_now();
+                finish_lock_from_idle("idle-blank", false);
+            },
+            "idle-blank");
     if (grace_fd >= 0)
         bar.add_fd(
             grace_fd,
@@ -1133,6 +1205,8 @@ void idle_reset_session() {
     disarm_lock_timer();
     disarm_stale_timer();
     disarm_relaunch();
+    disarm_idle_blank();
+    lock_wake_now();
     arm_watch(false);
     arm_move_watch(false);
     arm_grace(0);

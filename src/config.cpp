@@ -227,6 +227,11 @@ void Config::load() {
         else if (k == "bt_auto_heal")      bt_auto_heal = b();
         else if (k == "show_agents")       show_agents = b();
         else if (k == "show_local_llm")    show_local_llm = b();
+        else if (k == "show_nethogs" || k == "show_bandwidth")
+            show_bandwidth = b();
+        else if (k == "bandwidth_tool") {
+            if (v == "nethogs" || v == "mattnhogs") bandwidth_tool = v;
+        }
         else if (k == "local_llm_url")     local_llm_url = v;
         else if (k == "local_llm_chat_url") local_llm_chat_url = v;
         else if (k == "local_llm_start_cmd") local_llm_start_cmd = v;
@@ -506,6 +511,8 @@ void Config::save() const {
       << "bt_auto_heal = " << (bt_auto_heal ? "true" : "false") << "\n"
       << "show_agents = " << (show_agents ? "true" : "false") << "\n"
       << "show_local_llm = " << (show_local_llm ? "true" : "false") << "\n"
+      << "show_bandwidth = " << (show_bandwidth ? "true" : "false") << "\n"
+      << "bandwidth_tool = " << bandwidth_tool << "\n"
       << "local_llm_url = " << local_llm_url << "\n"
       << "local_llm_chat_url = " << local_llm_chat_url << "\n"
       << "local_llm_start_cmd = " << local_llm_start_cmd << "\n"
@@ -708,7 +715,7 @@ static const char* KNOWN_MODULES[] = {"omarchy",   "workspaces", "clock",
                                       "notifications",
                                       "power",
                                       "volume",    "battery",
-                                      "agents",    "localllm",
+                                      "agents",    "localllm",   "bandwidth",
                                       "microphone",
                                       "screenrecord",
                                       "kblayout", "activewindow",
@@ -850,6 +857,10 @@ void Config::layout_normalize() {
         std::vector<std::string> keep;
         bool ch = false;
         for (auto& id : v) {
+            if (id == "nethogs") {
+                id = "bandwidth";
+                ch = true;
+            }
             if (qs_is_module_id(id)) {
                 qs_plugin_set_shown(qs_plugin_id_of(id), true);
                 ch = true;
